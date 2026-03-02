@@ -1,0 +1,12 @@
+2
+Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON [[0, 1, null]]" pbc="F F F"
+O        0.00000000       0.00000000       0.00000000       0.00000000
+O        0.00000000       0.00000000       1.19614093       0.00000000
+2
+Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON []" pbc="F F F"
+O        0.00000000       0.00000000       0.00000000       0.00000000
+O        0.00000000       0.00000000       1.80000000       0.00000000
+2
+Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON []" pbc="F F F"
+O        0.00000000       0.00000000       0.00000000       0.00000000
+O        0.00000000       0.00000000       4.00000000       0.00000000

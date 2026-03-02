@@ -1,0 +1,32 @@
+{
+    "name" : "Water",
+    "description": "Bulk water proton transfer",
+    "version" : "1.0.0",
+    "author": "Lukas Kim",
+    "molecules": [
+        {"id" : 1, "path": "molecules/mol_01"},
+        {"id" : 2, "path": "molecules/mol_02"},
+        {"id" : 3, "path": "molecules/mol_03"}
+    ],
+    "reactions": [
+        {"id":  1, "path" : "reactions/rxn_01", "reactant_ids" : [7, 3], "product_ids" : [8, 2]},
+        {"id":  2, "path" : "reactions/rxn_02", "reactant_ids" : [7, 1], "product_ids" : [8, 3]},
+        {"id":  3, "path" : "reactions/rxn_03", "reactant_ids" : [1, 3], "product_ids" : [8, 4]},
+        {"id":  4, "path" : "reactions/rxn_04", "reactant_ids" : [3, 3], "product_ids" : [7, 4]},
+        {"id":  5, "path" : "reactions/rxn_05", "reactant_ids" : [1   ], "product_ids" : [8, 8]},
+        {"id":  6, "path" : "reactions/rxn_06", "reactant_ids" : [2   ], "product_ids" : [7, 7]},
+        {"id":  7, "path" : "reactions/rxn_07", "reactant_ids" : [3   ], "product_ids" : [7, 8]},
+        {"id":  8, "path" : "reactions/rxn_08", "reactant_ids" : [4   ], "product_ids" : [7, 3]},
+        {"id":  9, "path" : "reactions/rxn_09", "reactant_ids" : [5   ], "product_ids" : [2, 8]},
+        {"id": 10, "path" : "reactions/rxn_10", "reactant_ids" : [5, 8], "product_ids" : [1, 2]},
+        {"id": 11, "path" : "reactions/rxn_11", "reactant_ids" : [5, 8], "product_ids" : [3, 3]},
+        {"id": 12, "path" : "reactions/rxn_12", "reactant_ids" : [5, 7], "product_ids" : [2, 3]},
+        {"id": 13, "path" : "reactions/rxn_13", "reactant_ids" : [4, 2], "product_ids" : [5, 3]},
+        {"id": 14, "path" : "reactions/rxn_14", "reactant_ids" : [6, 2], "product_ids" : [5, 5]},
+        {"id": 15, "path" : "reactions/rxn_15", "reactant_ids" : [6   ], "product_ids" : [3, 3]},
+        {"id": 16, "path" : "reactions/rxn_16", "reactant_ids" : [4, 3], "product_ids" : [6, 8]},
+        {"id": 17, "path" : "reactions/rxn_17", "reactant_ids" : [5, 1], "product_ids" : [6, 8]},
+        {"id": 18, "path" : "reactions/rxn_18", "reactant_ids" : [6, 7], "product_ids" : [5, 3]},
+        {"id": 19, "path" : "reactions/rxn_19", "reactant_ids" : [6, 3], "product_ids" : [4, 5]}
+    ]
+}

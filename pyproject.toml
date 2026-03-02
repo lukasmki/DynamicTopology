@@ -1,0 +1,32 @@
+[project]
+name = "dynamictopology"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "lukasmki", email = "lukasarus@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "ase>=3.26.0",
+    "h5py>=3.15.1",
+    "molify>=0.2.1",
+    "networkx>=3.5",
+    "torch>=2.9.1",
+    "torchpose3d",
+]
+
+[project.scripts]
+dynamictopology = "dynamictopology:main"
+
+[build-system]
+requires = ["uv_build>=0.9.1,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+torchpose3d = { git = "https://github.com/lukasmki/torchpose3d.git" }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

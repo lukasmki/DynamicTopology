@@ -1,0 +1,41 @@
+{"type": "lennardjones", "atoms": {}, "kwargs": {"A": 0.312, "B": 0.7112800000000006}}
+{"type": "lennardjones", "atoms": {}, "kwargs": {"A": 0.312, "B": 0.7112800000000006}}
+{"type": "lennardjones", "atoms": {}, "kwargs": {"A": 0.0, "B": 0.0}}
+{"type": "lennardjones", "atoms": {}, "kwargs": {"A": 0.0, "B": 0.0}}
+{"type": "bond", "atoms": {"p1": 0, "p2": 1}, "kwargs": {"r0": 0.142088398, "k": 366464.762, "D": 366.0}}
+{"type": "bond", "atoms": {"p1": 0, "p2": 2}, "kwargs": {"r0": 0.096566477, "k": 420292.826, "D": 498.7}}
+{"type": "bond", "atoms": {"p1": 1, "p2": 3}, "kwargs": {"r0": 0.096566477, "k": 420292.826, "D": 498.7}}
+{"type": "angle", "atoms": {"p1": 0, "p2": 1, "p3": 3}, "kwargs": {"theta0": 1.78183281, "k": 484.590992}}
+{"type": "angle", "atoms": {"p1": 1, "p2": 0, "p3": 2}, "kwargs": {"theta0": 1.78183281, "k": 484.590992}}
+{"type": "bondbond", "atoms": {"p1": 0, "p2": 1, "p3": 0, "p4": 2}, "kwargs": {"r1_0": 0.142088398, "r2_0": 0.096566477, "k": 11779.044235}}
+{"type": "bondbond", "atoms": {"p1": 0, "p2": 1, "p3": 1, "p4": 3}, "kwargs": {"r1_0": 0.142088398, "r2_0": 0.096566477, "k": 11779.044235}}
+{"type": "bondangle", "atoms": {"p1": 0, "p2": 1, "p3": 3, "p4": 0, "p5": 1}, "kwargs": {"theta0": 1.78183281, "r0": 0.142088398, "k": -1875.0487443}}
+{"type": "bondangle", "atoms": {"p1": 0, "p2": 1, "p3": 3, "p4": 1, "p5": 3}, "kwargs": {"theta0": 1.78183281, "r0": 0.096566477, "k": -451.459254}}
+{"type": "bondangle", "atoms": {"p1": 1, "p2": 0, "p3": 2, "p4": 0, "p5": 1}, "kwargs": {"theta0": 1.78183281, "r0": 0.142088398, "k": -1875.0487443}}
+{"type": "bondangle", "atoms": {"p1": 1, "p2": 0, "p3": 2, "p4": 0, "p5": 2}, "kwargs": {"theta0": 1.78183281, "r0": 0.096566477, "k": -451.459254}}
+{"type": "angleangle", "atoms": {"p1": 1, "p2": 0, "p3": 2, "p4": 0, "p5": 1, "p6": 3}, "kwargs": {"theta1_0": 1.78183281, "theta2_0": 1.78183281, "k": 43.4271571}}
+{"type": "dihedralangle", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 0, "p6": 1, "p7": 3}, "kwargs": {"k": -0.0283596, "theta0": 1.78183281, "n": 4.0, "phi0": 3.14159265}}
+{"type": "dihedralangle", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 0, "p6": 1, "p7": 3}, "kwargs": {"k": -2.604118, "theta0": 1.78183281, "n": 3.0, "phi0": 0.0}}
+{"type": "dihedralangle", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 0, "p6": 1, "p7": 3}, "kwargs": {"k": -0.0, "theta0": 1.78183281, "n": 2.0, "phi0": 3.14159265}}
+{"type": "dihedralangle", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 0, "p6": 1, "p7": 3}, "kwargs": {"k": -0.0, "theta0": 1.78183281, "n": 1.0, "phi0": 0.0}}
+{"type": "dihedralangle", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 1, "p6": 0, "p7": 2}, "kwargs": {"k": -0.0283596, "theta0": 1.78183281, "n": 4.0, "phi0": 3.14159265}}
+{"type": "dihedralangle", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 1, "p6": 0, "p7": 2}, "kwargs": {"k": -2.604118, "theta0": 1.78183281, "n": 3.0, "phi0": 0.0}}
+{"type": "dihedralangle", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 1, "p6": 0, "p7": 2}, "kwargs": {"k": -0.0, "theta0": 1.78183281, "n": 2.0, "phi0": 3.14159265}}
+{"type": "dihedralangle", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 1, "p6": 0, "p7": 2}, "kwargs": {"k": -0.0, "theta0": 1.78183281, "n": 1.0, "phi0": 0.0}}
+{"type": "dihedralbond", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 0, "p6": 1}, "kwargs": {"k": 21.6867385, "r0": 0.1420884, "n": 4.0, "phi0": 3.14159265}}
+{"type": "dihedralbond", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 0, "p6": 1}, "kwargs": {"k": 0.0, "r0": 0.1420884, "n": 3.0, "phi0": 0.0}}
+{"type": "dihedralbond", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 0, "p6": 1}, "kwargs": {"k": 0.0, "r0": 0.1420884, "n": 2.0, "phi0": 3.14159265}}
+{"type": "dihedralbond", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 0, "p6": 1}, "kwargs": {"k": 0.0, "r0": 0.1420884, "n": 1.0, "phi0": 0.0}}
+{"type": "dihedralbond", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 0, "p6": 2}, "kwargs": {"k": -0.8967879, "r0": 0.09656648, "n": 4.0, "phi0": 3.14159265}}
+{"type": "dihedralbond", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 0, "p6": 2}, "kwargs": {"k": -0.0, "r0": 0.09656648, "n": 3.0, "phi0": 0.0}}
+{"type": "dihedralbond", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 0, "p6": 2}, "kwargs": {"k": -0.0, "r0": 0.09656648, "n": 2.0, "phi0": 3.14159265}}
+{"type": "dihedralbond", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 0, "p6": 2}, "kwargs": {"k": -0.0, "r0": 0.09656648, "n": 1.0, "phi0": 0.0}}
+{"type": "dihedralbond", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 1, "p6": 3}, "kwargs": {"k": -0.8967879, "r0": 0.09656648, "n": 4.0, "phi0": 3.14159265}}
+{"type": "dihedralbond", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 1, "p6": 3}, "kwargs": {"k": -0.0, "r0": 0.09656648, "n": 3.0, "phi0": 0.0}}
+{"type": "dihedralbond", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 1, "p6": 3}, "kwargs": {"k": -0.0, "r0": 0.09656648, "n": 2.0, "phi0": 3.14159265}}
+{"type": "dihedralbond", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3, "p5": 1, "p6": 3}, "kwargs": {"k": -0.0, "r0": 0.09656648, "n": 1.0, "phi0": 0.0}}
+{"type": "dihedralangleangle", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3}, "kwargs": {"k": -0.0, "theta0_1": 1.78183281, "theta0_2": 1.78183281, "n": 1.0, "phi0": 0.0}}
+{"type": "periodicdihedral", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3}, "kwargs": {"k": 0.5906952, "n": 4.0, "phi0": 3.14159265}}
+{"type": "periodicdihedral", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3}, "kwargs": {"k": 0.0, "n": 3.0, "phi0": 0.0}}
+{"type": "periodicdihedral", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3}, "kwargs": {"k": 0.0, "n": 2.0, "phi0": 3.14159265}}
+{"type": "periodicdihedral", "atoms": {"p1": 2, "p2": 0, "p3": 1, "p4": 3}, "kwargs": {"k": 0.0, "n": 1.0, "phi0": 0.0}}

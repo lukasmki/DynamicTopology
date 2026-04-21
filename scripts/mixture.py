@@ -13,9 +13,13 @@ def main():
     parser.add_argument(
         "-r", "--rnet", required=False, default="datasets/HCombustion/HCombustion.json"
     )
-    parser.add_argument("-x", "--ratio", default="1:1")
-    parser.add_argument("-n", "--number", type=int, default=100)
-    parser.add_argument("-d", "--density", type=float, default=30.0)
+    parser.add_argument("-x", "--ratio", help="H2 to O2 ratio", default="1:1")
+    parser.add_argument(
+        "-n", "--number", help="Total nsumber of H2/O2 molecules", type=int, default=100
+    )
+    parser.add_argument(
+        "-d", "--density", help="Target density in kg/m^3", type=float, default=30.0
+    )
     parser.add_argument("-o", "--output", default=sys.stdout)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()

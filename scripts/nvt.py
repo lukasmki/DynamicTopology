@@ -2,10 +2,10 @@ from pathlib import Path
 from argparse import ArgumentParser
 from ase import Atoms, io, units
 
-from ase.md import Langevin, VelocityVerlet
+from ase.md import Langevin
 
 from DynamicTopology.core import ReactionSet
-from DynamicTopology.ase import DynamicTopology
+from DynamicTopology.ase import DynamicTopology, EVB
 
 import torch
 
@@ -33,7 +33,8 @@ def main():
     assert isinstance(atoms, Atoms)
 
     reaction_set = ReactionSet(args.rnet)
-    atoms.calc = DynamicTopology(atoms, reaction_set)
+    # atoms.calc = DynamicTopology(atoms, reaction_set)
+    atoms.calc = EVB(atoms, reaction_set)
 
     def status(atoms: Atoms, stepnum: int):
         PE = float(atoms.get_potential_energy())

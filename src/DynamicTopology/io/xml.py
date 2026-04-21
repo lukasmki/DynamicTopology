@@ -54,7 +54,7 @@ def read_xmls(data: str) -> list[Term]:
                 if param_name is None:
                     # skip if not named
                     continue
-                parameter_map[f"param{i+1}"] = param_name
+                parameter_map[f"param{i + 1}"] = param_name
         else:
             pass
 

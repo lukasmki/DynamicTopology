@@ -1,3 +1,4 @@
+from DynamicTopology.evb import EVBSystem
 from typing import Any
 
 import numpy as np
@@ -34,6 +35,44 @@ class DynamicTopology(Calculator):
         self.system.update(topology=results["topology"])
 
         self.results: dict[str, np.ndarray] = {
-            "energy": results["energy"].detach().cpu().numpy(),
-            "forces": results["forces"].detach().cpu().numpy(),
+            "energy": results["energy"],
+            "forces": results["forces"],
+        }
+
+
+class EVB(Calculator):
+    implemented_properties: list[str] = ["energy", "forces"]
+
+    def __init__(
+        self,
+        atoms: Atoms,
+        reaction_set: ReactionSet,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        topology = Topology.from_atoms(atoms)
+
+        network = reaction_set.get_network(topology)
+        states = [state for subnet in network.states() for rxn_data, state in subnet]
+
+        for state in states:
+            terms = reaction_set.get_terms(state)
+            state.set_terms(terms)
+
+        self.system = EVBSystem(atoms, states=states)
+
+    def calculate(
+        self,
+        atoms: Atoms | None = None,
+        properties: list[str] = ["energy", "forces"],
+        system_changes: list[str] = all_changes,
+    ) -> None:
+        super().calculate(atoms, properties, system_changes)
+
+        self.system.update(atoms=atoms)
+        results: dict[str, Any] = self.system.calculate()
+
+        self.results: dict[str, np.ndarray] = {
+            "energy": results["energy"],
+            "forces": results["forces"],
         }

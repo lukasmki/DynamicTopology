@@ -1,12 +1,6 @@
 from molify import ase2networkx
 from argparse import ArgumentParser
-from pprint import pprint
 from ase import Atoms, io
-
-import matplotlib.pyplot as plt
-
-from DynamicTopology.core import ReactionSet
-from DynamicTopology.ase import DynamicTopology
 
 
 def main():

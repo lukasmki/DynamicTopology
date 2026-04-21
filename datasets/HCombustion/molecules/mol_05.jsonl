@@ -1,6 +1,6 @@
-{"type": "lennardjones", "atoms": {}, "kwargs": {"A": 0.296, "B": 0.71128}}
-{"type": "lennardjones", "atoms": {}, "kwargs": {"A": 0.296, "B": 0.71128}}
-{"type": "lennardjones", "atoms": {}, "kwargs": {"A": 0.0, "B": 0.0}}
+{"type": "atom", "atoms": {"p0": 0}, "kwargs": {"mu": 8.120335578918457, "eta": 3.7445240020751953, "soft_amp": 3.882110118865967, "soft_decay": 0.4358389973640442, "soft_scale": 0.17855200171470642}}
+{"type": "atom", "atoms": {"p0": 1}, "kwargs": {"mu": 8.120335578918457, "eta": 3.7445240020751953, "soft_amp": 3.882110118865967, "soft_decay": 0.4358389973640442, "soft_scale": 0.17855200171470642}}
+{"type": "atom", "atoms": {"p0": 2}, "kwargs": {"mu": 1.879652976989746, "eta": 7.284643173217773, "soft_amp": 2.0968151092529297, "soft_decay": 0.26886698603630066, "soft_scale": 0.18287299573421478}}
 {"type": "bond", "atoms": {"p1": 0, "p2": 1}, "kwargs": {"r0": 0.130221933, "k": 493904.04, "D": 205.0}}
 {"type": "bond", "atoms": {"p1": 0, "p2": 2}, "kwargs": {"r0": 0.098384567, "k": 349542.341, "D": 498.7}}
 {"type": "angle", "atoms": {"p1": 1, "p2": 0, "p3": 2}, "kwargs": {"theta0": 1.89294156, "k": 588.534154}}

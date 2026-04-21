@@ -1,20 +1,21 @@
 """System class definition"""
 
+from DynamicTopology.utils import log_debug
+
 import logging
 from typing import Any
 
 import numpy as np
-import torch as t
-from ase import Atoms, units
-from torch import Tensor
+from ase import Atoms
 
 from DynamicTopology.core.reaction import Reaction
 from DynamicTopology.core.reactionset import ReactionSet
 from DynamicTopology.core.topology import Topology
 from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.qforce import QForce
+from DynamicTopology.forcefield.acks2 import ACKS2
 
-logger: logging.Logger = logging.getLogger(name=__name__)
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class System:
@@ -31,6 +32,7 @@ class System:
         self.bimol_cutoff: int | float = bimol_cutoff
 
         self.bonded_ff = QForce()
+        self.nonbonded_ff = ACKS2()
         self.coupling = EVBCoupling()
 
     def __repr__(self) -> str:
@@ -42,93 +44,128 @@ class System:
         if topology is not None:
             self.topology = topology
 
-    def convert_to_tensors(self, term_dict: dict):
-        for term_type, param_dict in term_dict.items():
-            term_dict[term_type]["atoms"] = t.tensor(param_dict["atoms"])
-            for name, value in param_dict["kwargs"].items():
-                term_dict[term_type]["kwargs"][name] = t.tensor(value)
-
     def calculate_state(
-        self, pos: Tensor, pbc: Tensor, cell: Tensor, topology: Topology
-    ) -> Tensor:
+        self, pos, pbc, cell, topology: Topology
+    ) -> tuple[float, np.ndarray]:
         if len(topology.terms) == 0:
             terms = self.reaction_set.get_terms(topology)
             topology.set_terms(terms)
-        self.convert_to_tensors(topology.term_dict)
-        en = self.bonded_ff(pos, pbc, cell, topology.term_dict) * units.kJ / units.mol
-        return en
+        energy, forces = self.bonded_ff(pos, pbc, cell, topology.term_dict)
+        return energy, forces
 
     def calculate(self) -> dict[str, Any]:
-        # load the atoms as tensors
-        pos = t.tensor(self.atoms.positions)
-        pbc = t.tensor(self.atoms.pbc)
-        cell = t.tensor(np.array(self.atoms.cell))
-        pos.requires_grad_(True)
+        pos = self.atoms.positions
+        pbc = self.atoms.pbc
+        cell = self.atoms.cell
 
         # compute instantaneous reaction network for current topology
         network = self.reaction_set.get_network(self.topology, self.bimol_cutoff)
+        log_debug(logger, "Computed instantaneous reacton network")
 
-        # get parameters and compute couplings
+        # compute couplings
         for rxn in network.reactions():
             imol, jmol, rxn_data = rxn
             reaction: Reaction = rxn_data["reaction"]
             mapping: dict = rxn_data["mapping"]
-            self.convert_to_tensors(reaction.term_dict)
+
             reactant = pos[list(mapping.values())]
-            ensemble = t.stack([t.tensor(a.positions) for a in reaction.atoms])
-            e = (
-                self.coupling(reactant, pbc, cell, ensemble, reaction.term_dict)
-                * units.kJ
-                / units.mol
+            ensemble = np.stack([a.positions for a in reaction.atoms])
+            energy, forces = self.coupling(
+                reactant, pbc, cell, ensemble, reaction.term_dict
             )
-            rxn_data["coupling"] = e
+            # save for later
+            rxn_data["coupling_energy"] = energy
+            tmp = np.zeros_like(pos)
+            tmp[list(mapping.values()), :] = forces
+            rxn_data["coupling_forces"] = tmp
 
         # enumerate states
-        energy: Tensor = t.tensor(0.0)
-        logger.info(msg="Local EVB networks:")
-        states = network.states()
-        final_states = []
-        for i, subnet in enumerate(states):
-            logger.info(msg=f"subnet {i}, nstates = {len(subnet)}")
+        energy = 0.0
+        forces = np.zeros_like(pos)
 
-            if len(subnet) == 1:
+        log_debug(logger, "Local EVB subnets:")
+        final_states = []
+        for i, subnet in enumerate(network.states()):
+            nstates = len(subnet)
+            log_debug(logger, f"subnet {i}, nstates = {nstates}")
+
+            # if no reactions
+            if nstates == 1:
                 rxn_data, topo = subnet[0]
-                en = self.calculate_state(pos, pbc, cell, topo)
+                en, fr = self.calculate_state(pos, pbc, cell, topo)
                 energy += en
+                forces += fr
                 continue
 
-            # build evb hamiltonian
-            S: np.ndarray = np.empty(len(subnet), dtype=Topology)
-            ham = t.zeros((len(subnet), len(subnet)))
-            for j, state in enumerate(subnet):
-                rxn_data: dict = state[0]
-                topo: Topology = state[1]
-                ham[j, j] = self.calculate_state(pos, pbc, cell, topo)
+            # compute all states
+            state: np.ndarray = np.empty(nstates, dtype=Topology)
+            state_energy = np.zeros(nstates)
+            state_forces = np.zeros((nstates,) + pos.shape)
+            coupling_energy = np.zeros(nstates)
+            coupling_forces = np.zeros((nstates,) + pos.shape)
+            for j, (rxn_data, topo) in enumerate(subnet):
+                # log_debug(logger, f"  state {j}, topo = {topo}")
+                en, fr = self.calculate_state(pos, pbc, cell, topo)
+                state_energy[j] = en
+                state_forces[j] = fr
                 if rxn_data:
-                    ham[0, j] = rxn_data["coupling"]
-                    ham[j, 0] = ham[0, j]
-                S[j] = topo
+                    coupling_energy[j] = rxn_data["coupling_energy"]
+                    coupling_forces[j] = rxn_data["coupling_forces"]
+                state[j] = topo
 
-            # compute ground state energy using numerically stable eigvalsh
-            energy += t.linalg.eigvalsh(ham)[0]
+            # build evb hamiltonian
+            ham = np.zeros((nstates, nstates))
+            ham[np.diag_indices(nstates)] = state_energy
+            ham[0, 1:] = coupling_energy[1:]
+            ham[1:, 0] = coupling_energy[1:]
+
+            # and matrix of gradients
+            fham = np.zeros(
+                (
+                    nstates,
+                    nstates,
+                )
+                + pos.shape
+            )
+            fham[np.diag_indices(nstates)] = state_forces
+            fham[0, 1:] = coupling_forces[1:]
+            fham[1:, 0] = coupling_forces[1:]
+
+            # compute ground state energy
+            eigval, eigvec = np.linalg.eigh(ham)
+            statevec = eigvec[:, 0]
+
+            energy_gs = np.einsum("i,ij,j->", statevec.T, ham, statevec)
+            forces_gs = np.einsum("i,ijnd,j->nd", statevec.T, fham, statevec)
+
+            energy += energy_gs
+            forces += forces_gs
 
             # compute eigenvectors with numpy for state change
-            val, vec = np.linalg.eigh(ham.detach().cpu().numpy())
-            statew = vec[:, 0] * vec[:, 0]
-            wi = np.where((statew > 0.9))
-
+            statevecsq = statevec * statevec
+            # log_debug(
+            #     logger, f"statevec {statevecsq}, statevec sum {np.sum(statevecsq)}"
+            # )
+            # print(statevecsq)
+            wi = np.where((statevecsq > 0.9))
             # choose the primary state for reaction subnet
-            if len(S[wi]) == 0:
-                final_states.append(S[0])
+            if len(state[wi]) == 0:
+                final_states.append(state[0])
             else:
-                final_states.append(S[wi][0])
+                final_states.append(state[wi][0])
+
+        # compute topology independent nonbonded
+        terms = self.reaction_set.get_terms(self.topology)
+        self.topology.set_terms(terms)
+        en_nb, fr_nb = self.nonbonded_ff(pos, pbc, cell, self.topology.term_dict)
+        # energy += en_nb
+        # forces += fr_nb
 
         # combine subnet topologies
         new_topo: Topology = Topology.from_molecules(final_states, remap=False)
         assert isinstance(new_topo, Topology)
         new_topo.set_atoms(self.atoms)
 
-        forces: Tensor = -t.autograd.grad(energy, pos, t.ones_like(energy))[0]
         results: dict[str, Any] = {
             "energy": energy,
             "forces": forces,

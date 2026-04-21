@@ -3,7 +3,6 @@ from typing import Any
 from DynamicTopology.core import Topology
 from ase import Atoms
 
-import torch as t
 import numpy as np
 
 
@@ -35,39 +34,54 @@ class EVBSystem:
         Returns:
             results (dict[str, Any]): energy, forces, statevec EVB state vector
         """
-        pos = t.tensor(self.atoms.positions)
-        pbc = t.tensor(self.atoms.pbc)
-        cell = t.tensor(np.array(self.atoms.cell))
-        pos.requires_grad_(True)
+        pos = self.atoms.positions
+        pbc = self.atoms.pbc
+        cell = self.atoms.cell
 
         # EVB hamiltonian
-        ham = t.zeros((len(self.states), len(self.states)))
+        nstates = len(self.states)
+        ham = np.zeros((nstates, nstates))
+        state_forces = np.zeros((nstates,) + pos.shape)
 
         # fill diagonal
         for i, istate in enumerate(self.states):
             if not istate.term_dict:
-                # print(f"State {i} has no terms")
                 continue
-            ham[i, i] = self.bonded_ff(pos, pbc, cell, istate.term_dict)
+            en, fr = self.bonded_ff(pos, pbc, cell, istate.term_dict)
+            ham[i, i] = en
+            state_forces[i] = fr
 
         # fill off-diagonal
-        for i, istate in enumerate(self.states):
-            for j, jstate in enumerate(self.states[i + 1 :]):
-                # compute state coupling
-                ham[i, j] = t.sqrt((1 + self.hardness) * ham[i, i] * ham[j, j])
-                ham[j, i] = ham[i, j]
+        fham = np.zeros((nstates, nstates) + pos.shape)
+        fham[np.diag_indices(nstates)] = state_forces
 
-        # compute energy/forces with torch
-        energy: t.Tensor = t.linalg.eigvalsh(ham)[0]
-        forces: t.Tensor = -t.autograd.grad(energy, pos, t.ones_like(energy))[0]
+        for i in range(nstates):
+            for j in range(i + 1, nstates):
+                hii, hjj = ham[i, i], ham[j, j]
+                hij = np.sqrt((1 + self.hardness) * hii * hjj)
+                ham[i, j] = hij
+                ham[j, i] = hij
 
-        # compute state vector with numpy
-        val, vec = np.linalg.eigh(ham.detach().cpu().numpy())
-        statevec = vec[:, 0] * vec[:, 0]
+                # gradient of H_ij = sqrt((1+h)*H_ii*H_jj) via chain rule
+                if hii != 0.0 and hjj != 0.0:
+                    fij = (hij / (2 * hii)) * state_forces[i] + (
+                        hij / (2 * hjj)
+                    ) * state_forces[j]
+                else:
+                    fij = np.zeros_like(pos)
+                fham[i, j] = fij
+                fham[j, i] = fij
+
+        # compute ground state energy and forces via Hellmann-Feynman
+        eigval, eigvec = np.linalg.eigh(ham)
+        statevec = eigvec[:, 0]
+
+        energy = np.einsum("i,ij,j->", statevec, ham, statevec)
+        forces = np.einsum("i,ijnd,j->nd", statevec, fham, statevec)
 
         results: dict[str, Any] = {
             "energy": energy,
             "forces": forces,
-            "statevec": statevec,
+            "statevec": statevec * statevec,
         }
         return results

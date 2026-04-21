@@ -4,7 +4,7 @@ from DynamicTopology.io.xml import read_xml
 
 
 def test_read_params_xml():
-    ff_path = Path("tests/ff").resolve()
+    ff_path = Path("tests/data").resolve()
     for file in ff_path.iterdir():
         if file.suffix != ".xml":
             continue
@@ -12,7 +12,7 @@ def test_read_params_xml():
 
 
 def test_read_params_jsonl():
-    ff_path = Path("tests/ff").resolve()
+    ff_path = Path("tests/data").resolve()
     for file in ff_path.iterdir():
         if file.suffix != ".jsonl":
             continue

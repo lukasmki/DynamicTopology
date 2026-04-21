@@ -1,3 +1,4 @@
+import numpy as np
 from ase import Atoms
 
 from copy import deepcopy
@@ -13,7 +14,7 @@ class Reaction:
         self,
         reactants: Topology,
         products: Topology,
-        atoms: Atoms | list[Atoms] | None = None,
+        atoms: Atoms | list[Atoms],
         terms: list[Term] | None = None,
     ):
         self.reactants: Topology = reactants
@@ -49,6 +50,13 @@ class Reaction:
                 }
                 for k, v in term["kwargs"].items():
                     self.term_dict[term_type]["kwargs"][k] = [v]
+
+        # convert to numpy
+        for term_type, term_data in self.term_dict.items():
+            term_data["atoms"] = np.array(term_data["atoms"])
+            for arg, vals in term_data["kwargs"].items():
+                term_data["kwargs"][arg] = np.array(vals)
+
         return terms
 
     def get_mapping(self, reactants: Topology) -> dict:

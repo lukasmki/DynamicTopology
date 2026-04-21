@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 import sys
 import numpy as np
@@ -26,7 +27,9 @@ class ReactionSet:
     }
 
     def __init__(self, path: str | Path | None = None):
-        self.data = self.default_data.copy()
+        self.data = deepcopy(self.default_data)
+        self._term_cache: dict[tuple[str, frozenset], list] = {}
+        self._bimol_hash_cache: dict[frozenset, str] = {}
         if path:
             self.load(path)
 
@@ -140,7 +143,14 @@ class ReactionSet:
                 all_terms.extend(mol.terms)
                 continue
 
-            mol_data: Topology = self.get_molecule(mol)
+            mol_hash = mol.hash()
+            cache_key = (mol_hash, frozenset(mol.graph.nodes()))
+
+            if cache_key in self._term_cache:
+                all_terms.extend(self._term_cache[cache_key])
+                continue
+
+            mol_data: Topology = self.data["molecules"].get(mol_hash)
             if mol_data is None:
                 raise ValueError(f"Molecule {mol} not found in ReactionSet")
 
@@ -151,19 +161,35 @@ class ReactionSet:
                 node_match=lambda a, b: a["atomic_number"] == b["atomic_number"],
             ).match()
             mol_map = next(matcher)
-
-            # reindex terms
-            for term in mol_data.terms:
-                for k, v in term["atoms"].items():
-                    term["atoms"][k] = mol_map[v]
-            all_terms.extend(mol_data.terms)
             del matcher
+
+            # build new term dicts with remapped indices — do not mutate mol_data
+            remapped: list[Term] = [
+                {
+                    "type": term["type"],
+                    "atoms": {k: mol_map[v] for k, v in term["atoms"].items()},
+                    "kwargs": term["kwargs"],
+                }
+                for term in mol_data.terms
+            ]
+
+            self._term_cache[cache_key] = remapped
+            all_terms.extend(remapped)
         return all_terms
 
     def get_network(self, topology: Topology, bimol_cutoff=4.0) -> ReactionNetwork:
         graph = nx.MultiGraph()
 
-        for i, (imol, iatoms) in enumerate(topology.molecules(return_atoms=True)):
+        # Pre-collect once to avoid O(N²) Atoms slicing inside the inner loop
+        mol_list: list[tuple[Topology, any]] = list(
+            topology.molecules(return_atoms=True)
+        )
+
+        cell = topology.atoms.cell
+        pbc = topology.atoms.pbc
+        inv_cell = np.linalg.inv(cell) if np.any(pbc) else None
+
+        for i, (imol, iatoms) in enumerate(mol_list):
             graph.add_node(i, molecule=imol)
             imol_data: list[Reaction] = list(self.get_reactions(reactants=imol))
 
@@ -171,26 +197,33 @@ class ReactionSet:
             for rxn in imol_data:
                 mol_map = rxn.get_mapping(imol)
                 graph.add_edge(i, i, reaction=rxn, mapping=mol_map)
-                # print(i, i, rxn, mol_map)
 
-            for j, (jmol, jatoms) in enumerate(topology.molecules(return_atoms=True)):
-                if j >= i:
-                    continue
+            for j, (jmol, jatoms) in enumerate(mol_list[:i]):
                 # neighbor check
                 dv = iatoms.positions[:, None, :] - jatoms.positions[None, :, :]
-                if topology.atoms.cell:
-                    df = dv @ np.linalg.inv(topology.atoms.cell)
-                    dv = (
-                        dv
-                        - (topology.atoms.pbc * np.floor(df + 0.5))
-                        @ topology.atoms.cell
-                    )
+                if inv_cell is not None:
+                    df = dv @ inv_cell
+                    dv = dv - (pbc * np.floor(df + 0.5)) @ cell
                 rmin = np.sqrt(np.sum(dv * dv, -1).min())
                 if rmin > bimol_cutoff:
                     continue
 
+                # cache combined topology hash to avoid repeated nx.union + WL hash
+                pair_key = frozenset({imol.hash(), jmol.hash()})
+                if pair_key not in self._bimol_hash_cache:
+                    ijmol = Topology.from_molecules([imol, jmol], False)
+                    self._bimol_hash_cache[pair_key] = ijmol.hash()
+                combined_hash = self._bimol_hash_cache[pair_key]
+
+                ijmol_data: list[Reaction] = list(
+                    self.data["reactions"].get(combined_hash, [])
+                )
+
+                if not ijmol_data:
+                    continue
+
+                # need the combined topology object for get_mapping
                 ijmol = Topology.from_molecules([imol, jmol], False)
-                ijmol_data: list[Reaction] = list(self.get_reactions(reactants=ijmol))
 
                 # reindex reactions to global indices
                 for rxn in ijmol_data:

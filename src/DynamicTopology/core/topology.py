@@ -1,3 +1,4 @@
+import numpy as np
 from typing import Self, Iterable, Any
 from copy import deepcopy
 import networkx as nx
@@ -15,20 +16,30 @@ class Topology:
         terms: list[Term] | None = None,
     ):
         self.graph: nx.Graph = graph
-        self.atoms: Atoms = self.set_atoms(atoms) if atoms else None
-        self.term_dict: dict[str, Any] = {}
-        self.terms: list[Term] = self.set_terms(terms) if terms else []
+        self._hash: str | None = None
+        self._molecules: list[frozenset] | None = None
+        self.atoms: Atoms | None = self.set_atoms(atoms) if atoms else None
+        self.terms: list[Term] = terms if terms is not None else []
+        self.term_dict: dict[str, Any] = (
+            self.set_terms(terms) if terms is not None else {}
+        )
 
     def __repr__(self):
         return f"Topology(graph={str(self.graph)}, {self.atoms=})"
 
     def hash(self) -> str:
-        return nx.weisfeiler_lehman_graph_hash(self.graph, node_attr="atomic_number")
+        if self._hash is None:
+            self._hash = nx.weisfeiler_lehman_graph_hash(
+                self.graph, node_attr="atomic_number"
+            )
+        return self._hash
 
     def molecules(
         self, return_atoms=False
     ) -> Iterable[tuple[Self, Atoms]] | Iterable[Self]:
-        for subidx in nx.connected_components(self.graph):
+        if self._molecules is None:
+            self._molecules = list(nx.connected_components(self.graph))
+        for subidx in self._molecules:
             # yield subgraphs with global node indices
             # subgraphs connectivity can't be changed but attrs can
             subgraph = self.graph.subgraph(subidx)
@@ -39,39 +50,49 @@ class Topology:
                 yield Topology(graph=subgraph)
 
     def set_atoms(self, atoms: Atoms) -> Atoms:
+        self._hash = None
+        self._molecules = None
         self.atoms = atoms
         self.graph.add_nodes_from(
             [(a.index, {"atomic_number": a.number, "symbol": a.symbol}) for a in atoms]
         )
         return atoms
 
-    def set_terms(self, terms: list[Term]) -> list[Term]:
+    def set_terms(self, terms: list[Term]) -> dict[str, Any]:
         self.terms = terms
-        # structure into lists for later
-        self.term_dict = {}
+        # structure into arrays for later
+        term_dict = {}
         for term in terms:
             term_type = term["type"]
-            if term_type in self.term_dict:
-                self.term_dict[term_type]["atoms"].append(tuple(term["atoms"].values()))
+            if term_type in term_dict:
+                term_dict[term_type]["atoms"].append(tuple(term["atoms"].values()))
                 for k, v in term["kwargs"].items():
-                    self.term_dict[term_type]["kwargs"][k].append(v)
+                    term_dict[term_type]["kwargs"][k].append(v)
             else:
-                self.term_dict[term_type] = {
+                term_dict[term_type] = {
                     "atoms": [tuple(term["atoms"].values())],
                     "kwargs": {},
                 }
                 for k, v in term["kwargs"].items():
-                    self.term_dict[term_type]["kwargs"][k] = [v]
-        return terms
+                    term_dict[term_type]["kwargs"][k] = [v]
 
-    def copy(self) -> Self:
-        graph: nx.Graph = deepcopy(self.graph)
+        # convert to numpy
+        for term_type, term_data in term_dict.items():
+            term_data["atoms"] = np.array(term_data["atoms"])
+            for arg, vals in term_data["kwargs"].items():
+                term_data["kwargs"][arg] = np.array(vals)
+
+        self.term_dict = term_dict
+        return term_dict
+
+    def copy(self) -> "Topology":
+        graph: nx.Graph = self.graph.copy()
         atoms = self.atoms.copy() if self.atoms else None
-        terms = deepcopy(self.terms) if self.terms else []
+        terms = list(self.terms) if self.terms else []
         return self.__class__(graph, atoms, terms)
 
     @classmethod
-    def from_atoms(cls, atoms: Atoms):
+    def from_atoms(cls, atoms: Atoms) -> "Topology":
         graph = ase2networkx(atoms, False)
         for _, node_data in graph.nodes(data=True):
             node_data.pop("position", None)
@@ -79,13 +100,15 @@ class Topology:
         return cls(graph, atoms)
 
     @classmethod
-    def from_molecules(cls, molecules: list[Self], remap=True) -> Self:
+    def from_molecules(
+        cls, molecules: list["Topology"], remap=True, copy=False
+    ) -> "Topology":
         """
         If remap is false, returns only a merger of the graphs. it will attempt to
-        perform a disjoint union of the molecules and will throw an error if there are index overlaps.
+        perform a disjoint union of the molecules and will raise an error if there are index overlaps.
         """
-        copy_atoms: bool = all(m.atoms is not None for m in molecules)
-        copy_terms: bool = any(len(m.terms) > 0 for m in molecules)
+        copy_atoms: bool = copy and all(m.atoms is not None for m in molecules)
+        copy_terms: bool = copy and any(len(m.terms) > 0 for m in molecules)
         graph: nx.Graph = molecules[0].graph.copy()
         if remap:
             # reindex to be first molecule in topology
@@ -121,7 +144,7 @@ class Topology:
             return cls(graph, None, None)
 
     @classmethod
-    def from_terms(cls, terms: list[Term], atoms: Atoms | None = None) -> Self:
+    def from_terms(cls, terms: list[Term], atoms: Atoms | None = None) -> "Topology":
         bonds: list[tuple[int, int]] = []
         for term in terms:
             if term["type"] == "bond":

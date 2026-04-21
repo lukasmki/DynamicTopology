@@ -1,41 +1,53 @@
+import numpy as np
 from typing import Callable
-
-import torch as t
-import torch.nn as nn
-from torchpose3d import Superpose3D
+from superpose3d import Superpose3D
 
 
-class EVBCoupling(nn.Module):
+class EVBCoupling:
     def __init__(self):
-        super().__init__()
+        pass
 
-    def forward(
+    def __call__(
         self,
-        pos: t.Tensor,
-        pbc: t.Tensor,
-        cell: t.Tensor,
-        ensemble: t.Tensor,
+        pos: np.ndarray,
+        pbc: np.ndarray,
+        cell: np.ndarray,
+        ensemble: np.ndarray,
         term_dict: dict,
-    ):
-        if t.any(pbc):  # unwrap coordinates
-            frac = pos @ t.inverse(cell)
-            diffs = t.diff(frac, dim=0)
+    ) -> tuple[float, np.ndarray]:
+        if np.any(pbc):  # unwrap coordinates
+            frac = pos @ np.linalg.inv(cell)
+            diffs = np.diff(frac, axis=0)
             shift = diffs.round()
-            frac[1:] = frac[0] + t.cumsum(diffs - shift, 0)
+            frac[1:] = frac[0] + np.cumsum(diffs - shift, 0)
             pos = frac @ cell
 
-        e = t.tensor(0.0)
+        e, f = 0.0, np.zeros_like(pos)
         for term_type, param_dict in term_dict.items():
             fn: Callable | None = getattr(self, f"compute_{term_type}", None)
             if fn is None:
                 continue
-            e += fn(pos, ensemble, param_dict["atoms"], **param_dict["kwargs"])
-        return e
+            de, df = fn(pos, ensemble, param_dict["atoms"], **param_dict["kwargs"])
+            e += de
+            f += df
+        return e, f
 
     def compute_rmsd(self, pos, ensemble, atoms, A, a):
-        r = t.zeros(ensemble.size(0))
-        for i in range(ensemble.size(0)):
-            results = Superpose3D(pos, ensemble[i])
-            r[i] = results["RMSD"]
-        e = A * t.exp(-a * r**2)
-        return t.sum(e)
+        rmsd = np.zeros(len(ensemble))
+        drmsd = np.zeros((len(ensemble),) + pos.shape)
+        for i in range(len(ensemble)):
+            _, R, T, S = Superpose3D(ensemble[i], pos)
+            ppos = S * np.einsum("ij,jk->ik", pos, R.T) + T[None, :]
+
+            distsq = np.sum(np.square(ensemble[i] - ppos), -1)
+            rmsd[i] = np.sqrt(np.mean(distsq))
+            # d(rmsd)/d(pos) = (1/(n*rmsd)) * (ppos - ensemble) @ (S*R)
+            drmsd[i] = (
+                (1.0 / (rmsd[i] + np.finfo(np.float64).eps))
+                / len(distsq)
+                * (ppos - ensemble[i])
+                @ (S * R)
+            )
+        e = A * np.exp(-a * rmsd**2)
+        f = -1 * e * -a * 2 * rmsd * drmsd
+        return np.mean(e), np.mean(f, 0)

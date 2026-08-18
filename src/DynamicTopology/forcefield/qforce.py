@@ -45,21 +45,40 @@ class QForce:
         """
         np.add.at(f, atoms_col, grad)
 
+    # def compute_bond(self, vecs, atoms, D, r0, k):
+    #     """Morse potential"""
+    #     v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3)  vec from atom0->atom1
+    #     r = np.sqrt(np.sum(v * v, -1))  # (n,)
+    #     dr = r - r0
+    #     al = np.sqrt(k / (2 * D))
+    #     exp_term = np.exp(-al * dr)  # (n,)
+    #     e = D * (1 - exp_term) ** 2 - D
+    #     e_tot = np.sum(e)
+
+    #     # dE/dr  =  2*D*(1 - exp)*al*exp
+    #     de_dr = 2 * D * (1 - exp_term) * al * exp_term  # (n,)
+    #     # dE/d(pos_atom0)  =  (dE/dr) * (d r / d v) * (d v / d pos_atom0)
+    #     #   v = pos_atom0 - pos_atom1  =>  dv/d(pos_atom0) = +1, dv/d(pos_atom1) = -1
+    #     #   dr/dv = v/r
+    #     dv = (de_dr / r)[:, None] * v  # (n, 3)  force direction
+
+    #     n_atoms = vecs.shape[0]
+    #     f = np.zeros((n_atoms, 3))
+    #     # F = -dE/d(pos)
+    #     np.add.at(f, atoms[:, 0], dv)  # atom0:  v points away from atom1
+    #     np.add.at(f, atoms[:, 1], -dv)  # atom1
+    #     return e_tot, f
+
     def compute_bond(self, vecs, atoms, D, r0, k):
-        """Morse potential"""
+        """Harmonic potential"""
         v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3)  vec from atom0->atom1
         r = np.sqrt(np.sum(v * v, -1))  # (n,)
         dr = r - r0
         al = np.sqrt(k / (2 * D))
-        exp_term = np.exp(-al * dr)  # (n,)
-        e = D * (1 - exp_term) ** 2 - D
+        e = 0.5 * k * dr * dr
         e_tot = np.sum(e)
 
-        # dE/dr  =  2*D*(1 - exp)*al*exp
-        de_dr = 2 * D * (1 - exp_term) * al * exp_term  # (n,)
-        # dE/d(pos_atom0)  =  (dE/dr) * (d r / d v) * (d v / d pos_atom0)
-        #   v = pos_atom0 - pos_atom1  =>  dv/d(pos_atom0) = +1, dv/d(pos_atom1) = -1
-        #   dr/dv = v/r
+        de_dr = k * dr  # (n,)
         dv = (de_dr / r)[:, None] * v  # (n, 3)  force direction
 
         n_atoms = vecs.shape[0]

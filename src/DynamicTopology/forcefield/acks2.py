@@ -1,11 +1,10 @@
-from ase.data.g2_2 import s
 from ase import units
 from scipy.special import erf
 import numpy as np
 
 
 class ACKS2:
-    CCOUL = 14.4
+    CCOUL = 14.4  # eV
 
     def __init__(self):
         self.Q = None
@@ -58,19 +57,17 @@ class ACKS2:
     def compute_coulomb(self, Q, rij, vecs, indices):
         qiqj = Q[:, None] * Q[None, :]
         qiqj[np.diag_indices(len(Q))] = 0.0
-        e = self.CCOUL * qiqj / (rij + np.finfo(np.float64).eps)
+        r = rij + np.finfo(np.float64).eps
+        kernel = erf(2 * rij) / r
+        e = self.CCOUL * qiqj * kernel
         e[indices, indices] = 0.0  # zero the diagonal
         e_tot = 0.5 * np.sum(e) * units.eV
 
         # forces: F_i = CCOUL * sum_j qi*qj * (pos_i-pos_j)/rij^3
         # The energy 0.5-factor cancels because both e[i,j] and e[j,i] contribute to dE/d(pos_i)
-        nij = vecs[indices] / (rij[:, :, None] + np.finfo(np.float64).eps)
-        f = (
-            nij
-            * self.CCOUL
-            * qiqj[:, :, None]
-            / (rij[:, :, None] + np.finfo(np.float64).eps) ** 2
-        )
+        dkernel_dr = (4 / np.sqrt(np.pi)) * np.exp(-4 * rij**2) / r - kernel / r
+        nij = vecs[indices] / (r[:, :, None])
+        f = -nij * self.CCOUL * qiqj[:, :, None] * dkernel_dr[:, :, None]
         f_tot = np.sum(f, 1) * units.eV / units.Angstrom
         return e_tot, f_tot
 

@@ -120,13 +120,7 @@ class System:
             ham[1:, 0] = coupling_energy[1:]
 
             # and matrix of gradients
-            fham = np.zeros(
-                (
-                    nstates,
-                    nstates,
-                )
-                + pos.shape
-            )
+            fham = np.zeros((nstates, nstates) + pos.shape)
             fham[np.diag_indices(nstates)] = state_forces
             fham[0, 1:] = coupling_forces[1:]
             fham[1:, 0] = coupling_forces[1:]
@@ -135,8 +129,8 @@ class System:
             eigval, eigvec = np.linalg.eigh(ham)
             statevec = eigvec[:, 0]
 
-            energy_gs = np.einsum("i,ij,j->", statevec.T, ham, statevec)
-            forces_gs = np.einsum("i,ijnd,j->nd", statevec.T, fham, statevec)
+            energy_gs = np.einsum("i,ij,j->", statevec, ham, statevec)
+            forces_gs = np.einsum("i,ijnd,j->nd", statevec, fham, statevec)
 
             energy += energy_gs
             forces += forces_gs
@@ -146,7 +140,6 @@ class System:
             # log_debug(
             #     logger, f"statevec {statevecsq}, statevec sum {np.sum(statevecsq)}"
             # )
-            # print(statevecsq)
             wi = np.where((statevecsq > 0.9))
             # choose the primary state for reaction subnet
             if len(state[wi]) == 0:
@@ -154,7 +147,7 @@ class System:
             else:
                 final_states.append(state[wi][0])
 
-        # compute topology independent nonbonded
+        # compute topology-independent nonbonded interactions
         terms = self.reaction_set.get_terms(self.topology)
         self.topology.set_terms(terms)
         en_nb, fr_nb = self.nonbonded_ff(pos, pbc, cell, self.topology.term_dict)
@@ -162,8 +155,7 @@ class System:
         # forces += fr_nb
 
         # combine subnet topologies
-        new_topo: Topology = Topology.from_molecules(final_states, remap=False)
-        assert isinstance(new_topo, Topology)
+        new_topo = Topology.from_molecules(final_states, remap=False)
         new_topo.set_atoms(self.atoms)
 
         results: dict[str, Any] = {

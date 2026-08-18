@@ -8,7 +8,7 @@ import numpy as np
 
 class EVBSystem:
     def __init__(self, atoms: Atoms, states: list[Topology], hardness: float = 0.95):
-        """High level API for running multi-state EVB calculations
+        r"""High level API for running multi-state EVB calculations
 
         Args:
             atoms (Atoms): ASE atoms object
@@ -58,15 +58,17 @@ class EVBSystem:
         for i in range(nstates):
             for j in range(i + 1, nstates):
                 hii, hjj = ham[i, i], ham[j, j]
-                hij = np.sqrt((1 + self.hardness) * hii * hjj)
+                hprod = (1 + self.hardness) * hii * hjj
+                hij = np.sqrt(np.abs(hprod))
                 ham[i, j] = hij
                 ham[j, i] = hij
 
                 # gradient of H_ij = sqrt((1+h)*H_ii*H_jj) via chain rule
                 if hii != 0.0 and hjj != 0.0:
-                    fij = (hij / (2 * hii)) * state_forces[i] + (
-                        hij / (2 * hjj)
-                    ) * state_forces[j]
+                    fij = (
+                        np.sign(hprod) * (hij / (2 * hii)) * state_forces[i]
+                        + (hij / (2 * hjj)) * state_forces[j]
+                    )
                 else:
                     fij = np.zeros_like(pos)
                 fham[i, j] = fij

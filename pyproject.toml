@@ -1,5 +1,5 @@
 [project]
-name = "dynamictopology"
+name = "DynamicTopology"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -18,11 +18,14 @@ dependencies = [
 ]
 
 [project.scripts]
-dynamictopology = "dynamictopology:main"
+dt = "DynamicTopology:main"
 
 [build-system]
 requires = ["uv_build>=0.9.1,<0.10.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "DynamicTopology"
 
 [tool.uv.sources]
 torchpose3d = { git = "https://github.com/lukasmki/torchpose3d.git" }

@@ -1,3 +1,4 @@
+from DynamicTopology.forcefield.acks2 import ACKS2
 from DynamicTopology.forcefield.qforce import QForce
 from typing import Any
 from DynamicTopology.core import Topology
@@ -21,6 +22,7 @@ class EVBSystem:
         self.states: list[Topology] = states
 
         self.hardness: float = hardness
+        self.nonbonded_ff = ACKS2()
         self.bonded_ff = QForce()
 
     def update(self, atoms: Atoms | None = None):
@@ -48,8 +50,9 @@ class EVBSystem:
             if not istate.term_dict:
                 continue
             en, fr = self.bonded_ff(pos, pbc, cell, istate.term_dict)
-            ham[i, i] = en
-            state_forces[i] = fr
+            en_nb, fr_nb = self.nonbonded_ff(pos, pbc, cell, istate.term_dict)
+            ham[i, i] = en + en_nb
+            state_forces[i] = fr + fr_nb
 
         # fill off-diagonal
         fham = np.zeros((nstates, nstates) + pos.shape)
@@ -74,9 +77,10 @@ class EVBSystem:
                 fham[i, j] = fij
                 fham[j, i] = fij
 
-        # compute ground state energy and forces via Hellmann-Feynman
+        # compute ground state energy and forces
         eigval, eigvec = np.linalg.eigh(ham)
         statevec = eigvec[:, 0]
+        statevecsq = statevec * statevec
 
         energy = np.einsum("i,ij,j->", statevec, ham, statevec)
         forces = np.einsum("i,ijnd,j->nd", statevec, fham, statevec)
@@ -84,6 +88,6 @@ class EVBSystem:
         results: dict[str, Any] = {
             "energy": energy,
             "forces": forces,
-            "statevec": statevec * statevec,
+            "statevec": statevecsq,
         }
         return results

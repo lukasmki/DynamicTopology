@@ -95,6 +95,7 @@ class System:
                 en, fr = self.calculate_state(pos, pbc, cell, topo)
                 energy += en
                 forces += fr
+                final_states.append(topo)
                 continue
 
             # compute all states
@@ -151,8 +152,8 @@ class System:
         terms = self.reaction_set.get_terms(self.topology)
         self.topology.set_terms(terms)
         en_nb, fr_nb = self.nonbonded_ff(pos, pbc, cell, self.topology.term_dict)
-        # energy += en_nb
-        # forces += fr_nb
+        energy += en_nb
+        forces += fr_nb
 
         # combine subnet topologies
         new_topo = Topology.from_molecules(final_states, remap=False)

@@ -3,6 +3,7 @@ from pathlib import Path
 from argparse import ArgumentParser
 from ase import Atoms, io, units
 
+from ase.constraints import FixCom
 from ase.md.velocitydistribution import thermalize_momenta
 from ase.md import Langevin
 
@@ -41,11 +42,12 @@ def main():
 
     dyn = Langevin(
         atoms,
-        timestep=1.0 * units.fs,
+        timestep=0.5 * units.fs,
         temperature_K=2000,
         friction=0.01 / units.fs,
         fixcm=False,
     )
+    atoms.set_constraint(FixCom())
     dyn.attach(status, 1, atoms, dyn)
     dyn.attach(io.write, 5, args.output, atoms, append=True)
     dyn.run(steps=2000)

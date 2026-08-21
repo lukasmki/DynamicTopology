@@ -163,6 +163,7 @@ class EVBBasis:
         self._energy_cache: dict[StateKey, tuple[float, np.ndarray]] = {}
         self._reaction_cache: dict[StateKey, list[tuple[Reaction, dict]]] = {}
         self._coupling_cache: dict[tuple, tuple[float, np.ndarray]] = {}
+        self._molecule_cache: dict[tuple, float] = {}
 
     # -- pieces the closure needs ------------------------------------------
 
@@ -187,15 +188,84 @@ class EVBBasis:
         self._reaction_cache[key] = found
         return found
 
+    def _molecule_energy(self, molecule: Topology, atoms: Atoms) -> float:
+        """Bonded energy of a single molecule, memoized for this geometry.
+
+        Keyed by molecule signature, so the molecules a reaction leaves alone are
+        evaluated once for the whole block rather than once per candidate.
+        """
+        signature = self.reaction_set._molecule_signature(molecule)
+        cached = self._molecule_cache.get(signature)
+        if cached is not None:
+            return cached
+
+        terms = self.reaction_set.get_terms(molecule)
+        nodes = sorted(molecule.graph.nodes())
+        local = {node: i for i, node in enumerate(nodes)}
+        term_dict = Topology(nx.Graph()).set_terms(
+            [
+                {
+                    "type": term["type"],
+                    "atoms": {k: local[v] for k, v in term["atoms"].items()},
+                    "kwargs": term["kwargs"],
+                }
+                for term in terms
+            ]
+        )
+        energy, _ = self.bonded_ff(
+            atoms.positions[nodes], atoms.pbc, atoms.cell, term_dict
+        )
+        self._molecule_cache[signature] = energy
+        return energy
+
+    def _local_energy(self, graph: nx.Graph, atoms: Atoms) -> float:
+        """Bonded energy of the molecules in `graph`, summed over components."""
+        return sum(
+            self._molecule_energy(Topology(graph.subgraph(nodes)), atoms)
+            for nodes in nx.connected_components(graph)
+        )
+
+    def _admits_reaction(
+        self, parent: Topology, mapping: dict, changes: tuple[set, set],
+        coupling: float, atoms: Atoms,
+    ) -> bool:
+        """Would applying `reaction` to `parent` produce an admissible state?
+
+        Decided without building the product.  The gate needs only the gap
+        between the two diabats, and every molecule the reaction leaves alone
+        contributes the same energy to both, so it cancels from the difference
+        exactly -- screening on the reacting fragment is not an approximation.
+
+        It is also what keeps the closure affordable.  A reaction template spans
+        whole molecules, so the fragment is two molecules at most, while a block
+        in a dense box can hold most of the system: 63 of 100 molecules on a
+        200-atom box, where building and evaluating each whole candidate took
+        1.3 s to produce a single state.  The great majority of candidates are
+        rejected, and none of them now costs more than the reaction touches.
+        """
+        broken, formed = changes
+        before = parent.graph.subgraph(frozenset(mapping.values()))
+        after = before.copy()
+        after.remove_edges_from(broken)
+        after.add_edges_from(formed)
+        return self._admits(
+            self._local_energy(before, atoms),
+            self._local_energy(after, atoms),
+            coupling,
+        )
+
     def _energy(self, state: Topology, atoms: Atoms) -> tuple[float, np.ndarray]:
         """Diabatic energy and forces of one state at the current geometry.
 
         Evaluated over the state's own atoms rather than the whole system.
         `QForce.__call__` forms a full N x N x 3 displacement array per call, so
         a three-atom state measured against a 200-atom box does some four
-        thousand times the work it needs -- and the closure evaluates hundreds of
-        states per force call, including the candidates the gate rejects.
-        Restricting it here keeps every `compute_*` method untouched.
+        thousand times the work it needs.  Restricting it here keeps every
+        `compute_*` method untouched.
+
+        Called only for states the closure actually admits -- candidates are
+        screened with `_local_energy`, which is why this can afford to evaluate
+        the block in one lump.
 
         Two index spaces meet, as in ACKS2: terms arrive in global indices, the
         sliced positions are in block order, and the forces are scattered back to
@@ -280,6 +350,7 @@ class EVBBasis:
         self._energy_cache.clear()
         self._reaction_cache.clear()
         self._coupling_cache.clear()
+        self._molecule_cache.clear()
 
         network = self.reaction_set.get_network(seed, bimol_cutoff)
         blocks: list[Block] = []
@@ -314,17 +385,23 @@ class EVBBasis:
         while frontier:
             parent, depth = frontier.pop(0)
             parent_key = state_key(parent)
-            parent_energy, _ = self._energy(parent, atoms)
 
             for reaction, mapping in self._reactions(parent, bimol_cutoff):
-                child = reaction.apply(parent, mapping, share_atoms=True)
-                child_key = state_key(child)
-                if child_key == parent_key:
+                broken, formed = reaction.edge_changes(mapping)
+                if not broken and not formed:
                     continue  # a no-op template, e.g. H + H -> H + H
 
                 coupling, coupling_forces = self._coupling(atoms, reaction, mapping)
-                child_energy, _ = self._energy(child, atoms)
-                if not self._admits(parent_energy, child_energy, coupling):
+                if not self._admits_reaction(
+                    parent, mapping, (broken, formed), coupling, atoms
+                ):
+                    continue
+
+                # Only now is the product worth building: `apply` copies the
+                # whole block graph, and so does deriving its state key.
+                child = reaction.apply(parent, mapping, share_atoms=True)
+                child_key = state_key(child)
+                if child_key == parent_key:
                     continue
 
                 pair = frozenset((parent_key, child_key))

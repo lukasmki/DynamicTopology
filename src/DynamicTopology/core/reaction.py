@@ -94,6 +94,18 @@ class Reaction:
         """
         return list(self._matcher(reactants).isomorphisms_iter())
 
+    def edge_changes(self, mapping: dict[int, int]) -> tuple[set, set]:
+        """(broken, formed) bonds this reaction makes, in live indices.
+
+        Depends only on the templates and the mapping, never on the topology
+        being acted upon, so a caller screening many candidates can rewire a
+        small fragment with this instead of copying a whole block through
+        `apply`.
+        """
+        R = nx.relabel_nodes(self.reactants.graph, mapping)
+        P = nx.relabel_nodes(self.products.graph, mapping)
+        return R.edges - P.edges, P.edges - R.edges
+
     def apply(
         self, topology: Topology, mapping: dict[int, int], share_atoms: bool = False
     ):
@@ -104,10 +116,7 @@ class Reaction:
         at one fixed geometry can avoid copying the `Atoms` each time.
         """
         new_topology = topology.copy(share_atoms=share_atoms)
-        R = nx.relabel_nodes(self.reactants.graph, mapping)
-        P = nx.relabel_nodes(self.products.graph, mapping)
-        broken = R.edges - P.edges
-        formed = P.edges - R.edges
+        broken, formed = self.edge_changes(mapping)
         new_topology.graph.remove_edges_from(broken)
         new_topology.graph.add_edges_from(formed)
         # The product is bonded differently from the reactant, so the reactant's

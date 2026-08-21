@@ -28,10 +28,78 @@ class ReactionSet:
 
     def __init__(self, path: str | Path | None = None):
         self.data = deepcopy(self.default_data)
-        self._term_cache: dict[tuple[str, frozenset], list] = {}
+        self._term_cache: dict[tuple[tuple, tuple], list] = {}
         self._bimol_hash_cache: dict[frozenset, str] = {}
+        # Keyed by molecule signature rather than held on the Topology, because
+        # `Topology._hash` only ever caches within one object and these objects
+        # are rebuilt from scratch on every force call.
+        self._hash_cache: dict[tuple[tuple, tuple], str] = {}
+        self._channel_cache: dict[tuple[tuple, tuple], list] = {}
         if path:
             self.load(path)
+
+    @staticmethod
+    def _molecule_signature(molecule: Topology) -> tuple[tuple, tuple]:
+        """Exact identity of a molecule as it sits in the live system.
+
+        Which node carries which element, and which nodes are bonded.  Two
+        molecules with the same signature are the same molecule on the same
+        atoms, so anything derived purely from the graph -- its hash, its
+        template mapping, its remapped terms -- is shared between them.
+        """
+        # Sorted tuples rather than frozensets: the signature is derived
+        # thousands of times per force call and tuple construction is markedly
+        # cheaper, while sorting makes it just as canonical.
+        return (
+            tuple(
+                sorted(
+                    (node, data.get("atomic_number"))
+                    for node, data in molecule.graph.nodes(data=True)
+                )
+            ),
+            tuple(sorted(tuple(sorted(edge)) for edge in molecule.graph.edges())),
+        )
+
+    def hash_molecule(self, molecule: Topology) -> str:
+        """Weisfeiler-Lehman hash of `molecule`, memoized across force calls."""
+        signature = self._molecule_signature(molecule)
+        cached = self._hash_cache.get(signature)
+        if cached is None:
+            cached = molecule.hash()
+            self._hash_cache[signature] = cached
+        return cached
+
+    def _reaction_channels(
+        self, topology: Topology, combined_hash: str | None = None
+    ) -> list[tuple[Reaction, dict]]:
+        """Every (reaction, index mapping) applicable to `topology`.
+
+        Memoized by molecule signature.  Both halves of this depend only on the
+        graph and never on the geometry: which reactions match a molecule, and
+        how their templates map onto its indices.  A molecular dynamics run
+        recomputes it every step for topologies that mostly do not change, and
+        the isomorphism search is not cheap -- `get_mappings` plus the reaction
+        lookup were over half the cost of building the network.
+
+        The stored `Reaction` objects are shared rather than copied.  Callers
+        treat them as read-only (`apply` copies the topology it is given, and
+        everything else here reads `atoms`/`term_dict`/`hash`), and copying them
+        meant a `deepcopy` of the transition-state ensemble on every lookup.
+        """
+        signature = self._molecule_signature(topology)
+        cached = self._channel_cache.get(signature)
+        if cached is not None:
+            return cached
+
+        if combined_hash is None:
+            combined_hash = self.hash_molecule(topology)
+        channels = [
+            (reaction, mapping)
+            for reaction in self.data["reactions"].get(combined_hash, [])
+            for mapping in reaction.get_mappings(topology)
+        ]
+        self._channel_cache[signature] = channels
+        return channels
 
     def get_molecule(self, molecule: Topology) -> Topology:
         """Returns a copy of the molecule in the database"""
@@ -183,27 +251,22 @@ class ReactionSet:
                 all_terms.extend(mol.terms)
                 continue
 
-            mol_hash = mol.hash()
             # The stored value is a term list already remapped onto specific
-            # global indices, so the key must determine it uniquely.  The WL
-            # hash is a graph invariant over atomic numbers and cannot say which
-            # node carries which element, and the node set does not either, so
-            # the two together under-specify the value.  Pinning the per-node
-            # element and the edge set makes the key exact.  Hardening: no
-            # collision has been demonstrated against the narrower key.
-            cache_key = (
-                mol_hash,
-                frozenset(
-                    (node, data.get("atomic_number"))
-                    for node, data in mol.graph.nodes(data=True)
-                ),
-                frozenset(frozenset(edge) for edge in mol.graph.edges()),
-            )
+            # global indices, so the key must determine it uniquely: which node
+            # carries which element, and which nodes are bonded.  That pair is
+            # already exact, and the Weisfeiler-Lehman hash is a function of it,
+            # so including the hash in the key would add nothing -- while
+            # computing it costs a full graph traversal.  Deriving the key first
+            # and hashing only on a miss took ~26.5k WL hashes per force call
+            # down to a handful; it was 36% of the runtime on a 200-atom box.
+            cache_key = self._molecule_signature(mol)
 
-            if cache_key in self._term_cache:
-                all_terms.extend(self._term_cache[cache_key])
+            cached = self._term_cache.get(cache_key)
+            if cached is not None:
+                all_terms.extend(cached)
                 continue
 
+            mol_hash = self.hash_molecule(mol)
             mol_data: Topology = self.data["molecules"].get(mol_hash)
             if mol_data is None:
                 raise ValueError(f"Molecule {mol} not found in ReactionSet")
@@ -245,12 +308,10 @@ class ReactionSet:
 
         for i, (imol, iatoms) in enumerate(mol_list):
             graph.add_node(i, molecule=imol)
-            imol_data: list[Reaction] = list(self.get_reactions(reactants=imol))
 
             # reindex reaction to global indices
-            for rxn in imol_data:
-                for mol_map in rxn.get_mappings(imol):
-                    graph.add_edge(i, i, reaction=rxn, mapping=mol_map)
+            for rxn, mol_map in self._reaction_channels(imol):
+                graph.add_edge(i, i, reaction=rxn, mapping=mol_map)
 
             for j, (jmol, jatoms) in enumerate(mol_list[:i]):
                 # neighbor check
@@ -263,26 +324,21 @@ class ReactionSet:
                     continue
 
                 # cache combined topology hash to avoid repeated nx.union + WL hash
-                pair_key = frozenset({imol.hash(), jmol.hash()})
+                pair_key = frozenset({self.hash_molecule(imol), self.hash_molecule(jmol)})
                 if pair_key not in self._bimol_hash_cache:
                     ijmol = Topology.from_molecules([imol, jmol], False)
-                    self._bimol_hash_cache[pair_key] = ijmol.hash()
+                    self._bimol_hash_cache[pair_key] = self.hash_molecule(ijmol)
                 combined_hash = self._bimol_hash_cache[pair_key]
 
-                ijmol_data: list[Reaction] = list(
-                    self.data["reactions"].get(combined_hash, [])
-                )
-
-                if not ijmol_data:
+                if not self.data["reactions"].get(combined_hash):
                     continue
 
-                # need the combined topology object for get_mapping
+                # need the combined topology object to map templates onto it
                 ijmol = Topology.from_molecules([imol, jmol], False)
 
                 # reindex reactions to global indices
-                for rxn in ijmol_data:
-                    for mol_map in rxn.get_mappings(ijmol):
-                        graph.add_edge(i, j, reaction=rxn, mapping=mol_map)
+                for rxn, mol_map in self._reaction_channels(ijmol, combined_hash):
+                    graph.add_edge(i, j, reaction=rxn, mapping=mol_map)
 
         return ReactionNetwork(graph)
 

@@ -1,12 +1,12 @@
 2
-Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON []" pbc="F F F"
+Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON [[0, 1, null]]" method=wb97x_v/cc-pvtz charge=0 spin=0 energy=-4.670132907941491 pbc="F F F"
 H        0.00000000       0.00000000       0.00000000       0.00000000
 H        0.00000000       0.00000000       0.74451338       0.00000000
 2
-Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON []" pbc="F F F"
+Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON []" method=wb97x_v/cc-pvtz charge=0 spin=0 energy=-1.465784120064311 pbc="F F F"
 H        0.00000000       0.00000000       0.00000000       0.00000000
 H        0.00000000       0.00000000       1.50000000       0.00000000
 2
-Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON []" pbc="F F F"
+Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON []" method=wb97x_v/cc-pvtz charge=0 spin=0 energy=0.000000000 pbc="F F F"
 H        0.00000000       0.00000000       0.00000000       0.00000000
 H        0.00000000       0.00000000       3.00000000       0.00000000

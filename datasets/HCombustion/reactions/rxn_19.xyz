@@ -1,5 +1,5 @@
 6
-Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON [[0, 1, null], [0, 3, null], [1, 2, null], [4, 5, null]]" pbc="F F F"
+Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON [[0, 1, null], [0, 3, null], [1, 2, null], [4, 5, null]]" method=wb97x_v/cc-pvtz charge=0 spin=1 energy=-16.473368429141928 pbc="F F F"
 O       -0.66828882      -0.85978714       0.22736137       0.00000000
 O       -1.03292528       0.52749418       0.16872109       0.00000000
 H       -1.68261467       0.51061341      -0.54307461       0.00000000
@@ -7,7 +7,7 @@ H        0.29332787      -0.78236635       0.11744845       0.00000000
 O        1.93043661       0.30172635      -0.21416580       0.00000000
 H        1.32435632       1.05648028      -0.34538419       0.00000000
 6
-Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON [[0, 1, null], [0, 3, null], [1, 2, null], [4, 5, null]]" pbc="F F F"
+Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON [[0, 1, null], [0, 3, null], [1, 2, null], [4, 5, null]]" method=wb97x_v/cc-pvtz charge=0 spin=1 energy=-16.395183974884713 pbc="F F F"
 O       -0.49416875      -0.74652289      -0.02793707       0.00000000
 O       -1.22238372       0.37430107       0.29037048       0.00000000
 H       -1.69978042       0.54280029      -0.53306482       0.00000000
@@ -15,7 +15,7 @@ H        0.56325614      -0.44859763       0.23523889       0.00000000
 O        1.62637057       0.07029454      -0.12658889       0.00000000
 H        1.39099786       0.96188585      -0.42711225       0.00000000
 6
-Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON [[0, 1, null], [1, 2, null], [3, 4, null], [4, 5, null]]" pbc="F F F"
+Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON [[0, 1, null], [1, 2, null], [3, 4, null], [4, 5, null]]" method=wb97x_v/cc-pvtz charge=0 spin=1 energy=-17.761208061977452 pbc="F F F"
 O       -0.98021315      -0.87449992       0.00625696       0.00000000
 O       -1.24967185       0.40791994       0.12160790       0.00000000
 H       -1.98507986       0.57255319      -0.49310562       0.00000000

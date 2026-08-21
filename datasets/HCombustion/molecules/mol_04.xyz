@@ -1,5 +1,5 @@
 3
-Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON [[0, 1, null], [0, 2, null]]" pbc="F F F"
+Properties=species:S:1:pos:R:3:initial_charges:R:1 connectivity="_JSON [[0, 1, null], [0, 2, null]]" method=wb97x_v/cc-pvtz charge=0 spin=0 energy=-9.873492241766135 pbc="F F F"
 O        0.00000000      -0.00000000       0.11700000       0.00000000
 H       -0.76300000      -0.00000000      -0.46800000       0.00000000
 H        0.76300000       0.00000000      -0.46800000       0.00000000

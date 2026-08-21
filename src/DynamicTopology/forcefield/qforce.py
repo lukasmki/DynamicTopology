@@ -4,8 +4,30 @@ from typing import Callable
 
 
 class QForce:
-    def __init__(self):
-        pass
+    """Bonded force field.  Works internally in nm and kJ/mol, converts to ASE
+    units (eV, Angstrom) at the end of `__call__`; the per-term `compute_*`
+    methods return unconverted values.
+
+    `bond_form` selects the bond functional form:
+
+      "morse"      D*(1 - exp(-a*dr))**2 - D,  a = sqrt(k/2D)
+      "harmonic"   0.5*k*dr**2
+
+    Morse is the default and is required for reactive work.  It is bounded
+    above by its dissociation asymptote, so a product state whose newly formed
+    bond is still several Angstrom long costs at most D rather than the
+    unbounded 0.5*k*dr**2 that the harmonic form charges; and its well depth
+    places bound and dissociated topologies on a physically ordered scale
+    instead of leaving bond breaking free.  The harmonic form is retained for
+    non-reactive use and for comparison.
+    """
+
+    def __init__(self, bond_form: str = "morse"):
+        if bond_form not in ("morse", "harmonic"):
+            raise ValueError(
+                f"bond_form must be 'morse' or 'harmonic', got {bond_form!r}"
+            )
+        self.bond_form: str = bond_form
 
     def __call__(
         self, pos: np.ndarray, pbc: np.ndarray, cell: np.ndarray, term_dict: dict
@@ -45,36 +67,43 @@ class QForce:
         """
         np.add.at(f, atoms_col, grad)
 
-    # def compute_bond(self, vecs, atoms, D, r0, k):
-    #     """Morse potential"""
-    #     v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3)  vec from atom0->atom1
-    #     r = np.sqrt(np.sum(v * v, -1))  # (n,)
-    #     dr = r - r0
-    #     al = np.sqrt(k / (2 * D))
-    #     exp_term = np.exp(-al * dr)  # (n,)
-    #     e = D * (1 - exp_term) ** 2 - D
-    #     e_tot = np.sum(e)
-
-    #     # dE/dr  =  2*D*(1 - exp)*al*exp
-    #     de_dr = 2 * D * (1 - exp_term) * al * exp_term  # (n,)
-    #     # dE/d(pos_atom0)  =  (dE/dr) * (d r / d v) * (d v / d pos_atom0)
-    #     #   v = pos_atom0 - pos_atom1  =>  dv/d(pos_atom0) = +1, dv/d(pos_atom1) = -1
-    #     #   dr/dv = v/r
-    #     dv = (de_dr / r)[:, None] * v  # (n, 3)  force direction
-
-    #     n_atoms = vecs.shape[0]
-    #     f = np.zeros((n_atoms, 3))
-    #     # F = -dE/d(pos)
-    #     np.add.at(f, atoms[:, 0], dv)  # atom0:  v points away from atom1
-    #     np.add.at(f, atoms[:, 1], -dv)  # atom1
-    #     return e_tot, f
-
     def compute_bond(self, vecs, atoms, D, r0, k):
-        """Harmonic potential"""
+        if self.bond_form == "morse":
+            return self._bond_morse(vecs, atoms, D, r0, k)
+        return self._bond_harmonic(vecs, atoms, D, r0, k)
+
+    def _bond_morse(self, vecs, atoms, D, r0, k):
+        """Morse potential, E = D*(1 - exp(-a*dr))**2 - D.
+
+        The -D offset puts the dissociated limit at zero, so a topology's
+        energy carries the depth of the bonds it contains and breaking a bond
+        costs +D rather than nothing.
+        """
         v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3)  vec from atom0->atom1
         r = np.sqrt(np.sum(v * v, -1))  # (n,)
         dr = r - r0
-        al = np.sqrt(k / (2 * D))
+        al = np.sqrt(k / (2 * D))  # (n,)  1/nm
+        exp_term = np.exp(-al * dr)  # (n,)
+        e = D * (1 - exp_term) ** 2 - D
+        e_tot = np.sum(e)
+
+        # dE/dr  =  2*D*(1 - exp)*al*exp
+        de_dr = 2 * D * (1 - exp_term) * al * exp_term  # (n,)
+        # dr/dv = v/r,  v = pos_atom1 - pos_atom0
+        dv = (de_dr / r)[:, None] * v  # (n, 3)
+
+        n_atoms = vecs.shape[0]
+        f = np.zeros((n_atoms, 3))
+        # F = -dE/d(pos)
+        np.add.at(f, atoms[:, 0], dv)
+        np.add.at(f, atoms[:, 1], -dv)
+        return e_tot, f
+
+    def _bond_harmonic(self, vecs, atoms, D, r0, k):
+        """Harmonic potential, E = 0.5*k*dr**2.  `D` is unused."""
+        v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3)  vec from atom0->atom1
+        r = np.sqrt(np.sum(v * v, -1))  # (n,)
+        dr = r - r0
         e = 0.5 * k * dr * dr
         e_tot = np.sum(e)
 
@@ -87,6 +116,20 @@ class QForce:
         np.add.at(f, atoms[:, 0], dv)  # atom0:  v points away from atom1
         np.add.at(f, atoms[:, 1], -dv)  # atom1
         return e_tot, f
+
+    def compute_reference(self, vecs, atoms, E0):
+        """Constant per-molecule reference energy (the EVB alpha shift).
+
+        Geometry-independent, so it contributes no force.  It exists to put
+        different bonding topologies on a common absolute energy scale: without
+        it the diabatic energies are each measured from their own minimum and
+        are not comparable, which makes every EVB eigenvalue meaningless.
+
+        Set by ReactionSet at load time as the residual between the template's
+        reference atomization energy and the depth its Morse bonds already
+        supply, so it is small and Morse carries the physics.
+        """
+        return np.sum(E0), np.zeros((vecs.shape[0], 3))
 
     def compute_angle(self, vecs, atoms, theta0, k):
         va = vecs[atoms[:, 0], atoms[:, 1]]  # (n, 3)

@@ -32,7 +32,29 @@ class DynamicTopology(Calculator):
 
         self.system.update(atoms=atoms)
         results: dict[str, Any] = self.system.calculate()
+
+        previous = self.system.topology
+        previous_edges = (
+            frozenset(frozenset(edge) for edge in previous.graph.edges())
+            if self.system.topology is not None
+            else None
+        )
+        current_edges = (
+            frozenset(frozenset(edge) for edge in results["topology"].graph.edges())
+            if results["topology"] is not None
+            else None
+        )
+        self.topology_changed: bool = previous_edges != current_edges
         self.system.update(topology=results["topology"])
+
+        # Not in implemented_properties: these are diagnostics, not ASE
+        # properties, and are read off the calculator directly.
+        self.diagnostics: dict[str, Any] = {
+            "energy_bonded": results["energy_bonded"],
+            "energy_nonbonded": results["energy_nonbonded"],
+            "blocks": results["blocks"],
+            "topology_changed": self.topology_changed,
+        }
 
         self.results: dict[str, np.ndarray] = {
             "energy": results["energy"],

@@ -59,24 +59,63 @@ class Reaction:
 
         return terms
 
-    def get_mapping(self, reactants: Topology) -> dict:
-        matcher = nx.isomorphism.GraphMatcher(
+    def _matcher(self, reactants: Topology):
+        return nx.isomorphism.GraphMatcher(
             self.reactants.graph,
             reactants.graph,
             node_match=lambda a, b: a["atomic_number"] == b["atomic_number"],
-        ).match()
-        mol_map = next(matcher)
-        return mol_map
+        )
 
-    def apply(self, topology: Topology, mapping: dict[int, int]):
-        """Applies this reaction to topology and returns a new topology"""
-        new_topology = topology.copy()
+    def get_mapping(self, reactants: Topology) -> dict:
+        """One mapping of the template onto `reactants`.
+
+        Kept for callers that only need some valid correspondence.  Prefer
+        `get_mappings` anywhere the choice is observable -- see its docstring.
+        """
+        return next(self._matcher(reactants).isomorphisms_iter())
+
+    def get_mappings(self, reactants: Topology) -> list[dict]:
+        """Every distinct way the template maps onto `reactants`.
+
+        Symmetry-equivalent atoms admit several isomorphisms: H2O has two ways
+        to be the reactant of `H2O -> HO + H`, one per O-H bond, and
+        `O2 + H2 -> HO2 + H` has four.  Taking only the first makes the choice
+        depend on the order nodes happen to be stored in, which breaks
+        permutation invariance of the surface -- the energy may coincide by
+        symmetry while the forces land on different atoms -- and silently
+        discards the channel that is geometrically active whenever the arbitrary
+        pick is the wrong one.
+
+        Returned in a deterministic order.  Channels leading to the same product
+        topology are still distinct here because they differ in which atoms
+        correspond to which transition-state reference positions, and so carry
+        different couplings; collapsing them is the caller's job, once those
+        couplings are known.
+        """
+        return list(self._matcher(reactants).isomorphisms_iter())
+
+    def apply(
+        self, topology: Topology, mapping: dict[int, int], share_atoms: bool = False
+    ):
+        """Applies this reaction to topology and returns a new topology.
+
+        `share_atoms` is forwarded to `Topology.copy`: the product describes the
+        same nuclei at the same positions, so a caller enumerating many products
+        at one fixed geometry can avoid copying the `Atoms` each time.
+        """
+        new_topology = topology.copy(share_atoms=share_atoms)
         R = nx.relabel_nodes(self.reactants.graph, mapping)
         P = nx.relabel_nodes(self.products.graph, mapping)
         broken = R.edges - P.edges
         formed = P.edges - R.edges
         new_topology.graph.remove_edges_from(broken)
         new_topology.graph.add_edges_from(formed)
+        # The product is bonded differently from the reactant, so the reactant's
+        # terms do not describe it.  `Topology.copy` carries terms across, and a
+        # caller that looks them up lazily ("fetch only if empty") would then
+        # silently evaluate the reactant's energy at the product's topology --
+        # every state in a block coming out at the same energy.
+        new_topology.set_terms([])
         return new_topology
 
     def copy(self) -> Self:

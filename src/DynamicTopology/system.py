@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 from ase import Atoms
 
-from DynamicTopology.core.reaction import Reaction
+from DynamicTopology.basis import Block, EVBBasis
 from DynamicTopology.core.reactionset import ReactionSet
 from DynamicTopology.core.topology import Topology
 from DynamicTopology.forcefield.coupling import EVBCoupling
@@ -16,6 +16,12 @@ from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.acks2 import ACKS2
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+# How much more ground-state weight a state needs before it takes over as the
+# topology carried to the next step.  The basis is seed-independent, so the
+# pivot no longer affects the energy and this is only here to stop the label
+# thrashing between near-degenerate states in the trajectory log.
+PIVOT_HYSTERESIS: float = 0.1
 
 
 class System:
@@ -34,6 +40,7 @@ class System:
         self.bonded_ff = QForce()
         self.nonbonded_ff = ACKS2()
         self.coupling = EVBCoupling()
+        self.basis = EVBBasis(reaction_set, self.bonded_ff, self.coupling)
 
     def __repr__(self) -> str:
         return f"System( {repr(self.atoms)}, {repr(self.topology)} )"
@@ -44,109 +51,83 @@ class System:
         if topology is not None:
             self.topology = topology
 
-    def calculate_state(
-        self, pos, pbc, cell, topology: Topology
-    ) -> tuple[float, np.ndarray]:
-        if len(topology.terms) == 0:
-            terms = self.reaction_set.get_terms(topology)
-            topology.set_terms(terms)
-        energy, forces = self.bonded_ff(pos, pbc, cell, topology.term_dict)
-        return energy, forces
+    @staticmethod
+    def _pivot(weights: np.ndarray, incumbent: int) -> int:
+        """Which state's topology to carry into the next step.
+
+        The dominant diabat, with a margin against the state already held.  The
+        old rule asked for a weight above 0.9, which a star Hamiltonian with
+        near-degenerate diagonals can never produce -- its ground state is
+        (|0> - |u>)/sqrt(2), pinning the pivot weight at exactly 1/2 however
+        strong the coupling.  With every off-diagonal filled the weights are
+        free to concentrate, so the dominant state is a meaningful choice again.
+        """
+        best = int(np.argmax(weights))
+        if best == incumbent:
+            return incumbent
+        if weights[best] - weights[incumbent] > PIVOT_HYSTERESIS:
+            return best
+        return incumbent
 
     def calculate(self) -> dict[str, Any]:
         pos = self.atoms.positions
         pbc = self.atoms.pbc
         cell = self.atoms.cell
 
-        # compute instantaneous reaction network for current topology
-        network = self.reaction_set.get_network(self.topology, self.bimol_cutoff)
-        log_debug(logger, "Computed instantaneous reacton network")
+        # Close the diabatic basis around the current geometry.  The result does
+        # not depend on which topology is passed as the seed; see basis.py.
+        evb_blocks: list[Block] = self.basis.build(
+            self.atoms, self.topology, self.bimol_cutoff
+        )
+        log_debug(logger, f"Closed {len(evb_blocks)} EVB blocks")
 
-        # compute couplings
-        for rxn in network.reactions():
-            imol, jmol, rxn_data = rxn
-            reaction: Reaction = rxn_data["reaction"]
-            mapping: dict = rxn_data["mapping"]
-
-            reactant = pos[list(mapping.values())]
-            ensemble = np.stack([a.positions for a in reaction.atoms])
-            energy, forces = self.coupling(
-                reactant, pbc, cell, ensemble, reaction.term_dict
-            )
-            # save for later
-            rxn_data["coupling_energy"] = energy
-            tmp = np.zeros_like(pos)
-            tmp[list(mapping.values()), :] = forces
-            rxn_data["coupling_forces"] = tmp
-
-        # enumerate states
         energy = 0.0
         forces = np.zeros_like(pos)
+        final_states: list[Topology] = []
+        blocks: list[dict[str, Any]] = []
 
-        log_debug(logger, "Local EVB subnets:")
-        final_states = []
-        for i, subnet in enumerate(network.states()):
-            nstates = len(subnet)
-            log_debug(logger, f"subnet {i}, nstates = {nstates}")
+        for i, block in enumerate(evb_blocks):
+            log_debug(logger, f"block {i}, nstates = {block.nstates}")
 
-            # if no reactions
-            if nstates == 1:
-                rxn_data, topo = subnet[0]
-                en, fr = self.calculate_state(pos, pbc, cell, topo)
-                energy += en
-                forces += fr
-                final_states.append(topo)
-                continue
-
-            # compute all states
-            state: np.ndarray = np.empty(nstates, dtype=Topology)
-            state_energy = np.zeros(nstates)
-            state_forces = np.zeros((nstates,) + pos.shape)
-            coupling_energy = np.zeros(nstates)
-            coupling_forces = np.zeros((nstates,) + pos.shape)
-            for j, (rxn_data, topo) in enumerate(subnet):
-                # log_debug(logger, f"  state {j}, topo = {topo}")
-                en, fr = self.calculate_state(pos, pbc, cell, topo)
-                state_energy[j] = en
-                state_forces[j] = fr
-                if rxn_data:
-                    coupling_energy[j] = rxn_data["coupling_energy"]
-                    coupling_forces[j] = rxn_data["coupling_forces"]
-                state[j] = topo
-
-            # build evb hamiltonian
-            ham = np.zeros((nstates, nstates))
-            ham[np.diag_indices(nstates)] = state_energy
-            ham[0, 1:] = coupling_energy[1:]
-            ham[1:, 0] = coupling_energy[1:]
-
-            # and matrix of gradients
-            fham = np.zeros((nstates, nstates) + pos.shape)
-            fham[np.diag_indices(nstates)] = state_forces
-            fham[0, 1:] = coupling_forces[1:]
-            fham[1:, 0] = coupling_forces[1:]
-
-            # compute ground state energy
-            eigval, eigvec = np.linalg.eigh(ham)
-            statevec = eigvec[:, 0]
-
-            energy_gs = np.einsum("i,ij,j->", statevec, ham, statevec)
-            forces_gs = np.einsum("i,ijnd,j->nd", statevec, fham, statevec)
-
-            energy += energy_gs
-            forces += forces_gs
-
-            # compute eigenvectors with numpy for state change
-            statevecsq = statevec * statevec
-            # log_debug(
-            #     logger, f"statevec {statevecsq}, statevec sum {np.sum(statevecsq)}"
-            # )
-            wi = np.where((statevecsq > 0.9))
-            # choose the primary state for reaction subnet
-            if len(state[wi]) == 0:
-                final_states.append(state[0])
+            if block.nstates == 1:
+                energy += block.energies[0]
+                forces += block.forces[0]
+                final_states.append(block.states[0])
+                weights = np.ones(1)
+                pivot = 0
+                gap = np.inf
+                block_energy = float(block.energies[0])
             else:
-                final_states.append(state[wi][0])
+                ham, fham = block.hamiltonian()
+                eigval, eigvec = np.linalg.eigh(ham)
+                statevec = eigvec[:, 0]
+
+                energy_gs = np.einsum("i,ij,j->", statevec, ham, statevec)
+                forces_gs = np.einsum("i,ijnd,j->nd", statevec, fham, statevec)
+                energy += energy_gs
+                forces += forces_gs
+
+                weights = statevec * statevec
+                pivot = self._pivot(weights, block.seed_index)
+                final_states.append(block.states[pivot])
+                gap = float(eigval[1] - eigval[0])
+                block_energy = float(energy_gs)
+
+            blocks.append(
+                {
+                    "nstates": block.nstates,
+                    "weights": weights,
+                    "gap": gap,
+                    "pivot": pivot,
+                    "energy": block_energy,
+                    "basis_size": block.nstates,
+                    "depth": block.depth,
+                    "capped": block.capped,
+                    "placeholder_channels": block.placeholder_channels,
+                }
+            )
+
+        energy_bonded = energy
 
         # compute topology-independent nonbonded interactions
         terms = self.reaction_set.get_terms(self.topology)
@@ -155,7 +136,7 @@ class System:
         energy += en_nb
         forces += fr_nb
 
-        # combine subnet topologies
+        # combine block topologies
         new_topo = Topology.from_molecules(final_states, remap=False)
         new_topo.set_atoms(self.atoms)
 
@@ -163,6 +144,9 @@ class System:
             "energy": energy,
             "forces": forces,
             "topology": new_topo,
+            "energy_bonded": energy_bonded,
+            "energy_nonbonded": en_nb,
+            "blocks": blocks,
         }
 
         return results

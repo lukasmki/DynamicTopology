@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import networkx as nx
-from ase import Atoms, io
+from ase import Atoms, io, units
 from ase.io.formats import ioformats
 
 from .reaction import Reaction
@@ -80,6 +80,46 @@ class ReactionSet:
                 for rxn in rxn_list:
                     yield rxn.copy()
 
+    @staticmethod
+    def _reference_term(atoms: Atoms, terms: list[Term]) -> Term | None:
+        """Constant shift putting this template on the reference energy scale.
+
+        Diabatic states are compared by their absolute energies, so every
+        bonding topology has to be measured from the same zero.  The dataset
+        supplies that zero: `scripts/compute.py` writes an atomization energy
+        per template (eV, referenced to free atoms, hence exactly 0 for a free
+        atom).  Morse bonds already account for -sum(D) of it at the minimum,
+        so the part the force field cannot reproduce is the residual
+
+            E0 = E_atomization + sum(D)
+
+        which is what gets stored.  Morse therefore carries the physics and the
+        shift only corrects for q-force having fitted each bond locally rather
+        than to the molecule's total atomization energy -- a residual of a few
+        tenths of an eV for most templates here, but +2.59 eV for H2O2, which
+        is worth knowing about rather than silently absorbing.
+
+        Returns None for a template with no reference energy, so datasets whose
+        energies have not been computed yet keep loading unchanged (they simply
+        keep the old, uncalibrated behaviour).
+        """
+        if atoms.calc is None:
+            return None
+        try:
+            e_atomization = atoms.get_potential_energy()  # eV
+        except (RuntimeError, AttributeError):
+            return None
+
+        sum_d = sum(  # kJ/mol
+            term["kwargs"]["D"] for term in terms if term["type"] == "bond"
+        )
+        e0 = e_atomization / (units.kJ / units.mol) + sum_d  # kJ/mol
+
+        # Anchored on atom 0 purely so the term has an index to be remapped
+        # through when the template is matched onto the live system; the energy
+        # belongs to the molecule as a whole and contributes no force.
+        return {"type": "reference", "atoms": {"a1": 0}, "kwargs": {"E0": e0}}
+
     def add_molecule(self, molid: int, molecule: Topology) -> None:
         molecule_hash = molecule.hash()
         if molecule_hash in self.data["molecules"]:
@@ -144,7 +184,21 @@ class ReactionSet:
                 continue
 
             mol_hash = mol.hash()
-            cache_key = (mol_hash, frozenset(mol.graph.nodes()))
+            # The stored value is a term list already remapped onto specific
+            # global indices, so the key must determine it uniquely.  The WL
+            # hash is a graph invariant over atomic numbers and cannot say which
+            # node carries which element, and the node set does not either, so
+            # the two together under-specify the value.  Pinning the per-node
+            # element and the edge set makes the key exact.  Hardening: no
+            # collision has been demonstrated against the narrower key.
+            cache_key = (
+                mol_hash,
+                frozenset(
+                    (node, data.get("atomic_number"))
+                    for node, data in mol.graph.nodes(data=True)
+                ),
+                frozenset(frozenset(edge) for edge in mol.graph.edges()),
+            )
 
             if cache_key in self._term_cache:
                 all_terms.extend(self._term_cache[cache_key])
@@ -195,8 +249,8 @@ class ReactionSet:
 
             # reindex reaction to global indices
             for rxn in imol_data:
-                mol_map = rxn.get_mapping(imol)
-                graph.add_edge(i, i, reaction=rxn, mapping=mol_map)
+                for mol_map in rxn.get_mappings(imol):
+                    graph.add_edge(i, i, reaction=rxn, mapping=mol_map)
 
             for j, (jmol, jatoms) in enumerate(mol_list[:i]):
                 # neighbor check
@@ -227,8 +281,8 @@ class ReactionSet:
 
                 # reindex reactions to global indices
                 for rxn in ijmol_data:
-                    mol_map = rxn.get_mapping(ijmol)
-                    graph.add_edge(i, j, reaction=rxn, mapping=mol_map)
+                    for mol_map in rxn.get_mappings(ijmol):
+                        graph.add_edge(i, j, reaction=rxn, mapping=mol_map)
 
         return ReactionNetwork(graph)
 
@@ -256,6 +310,14 @@ class ReactionSet:
                     terms: list[Term] = [json.loads(term) for term in fp.readlines()]
 
                 assert isinstance(atoms, Atoms)
+                # A template that already states its shift keeps it.  Templates
+                # whose Morse depths have been fitted to carry the atomization
+                # energy state it as zero, and synthesizing another one here
+                # would count the same energy twice.
+                if not any(term["type"] == "reference" for term in terms):
+                    reference = self._reference_term(atoms, terms)
+                    if reference is not None:
+                        terms = terms + [reference]
                 molecule = Topology.from_terms(terms, atoms)
                 self.add_molecule(mol["id"], molecule)
 

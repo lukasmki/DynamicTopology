@@ -50,12 +50,34 @@ class Topology:
                 yield Topology(graph=subgraph)
 
     def set_atoms(self, atoms: Atoms) -> Atoms:
+        """Attach `atoms` and make the graph span all of them.
+
+        Every atom becomes a node, so this is the whole-system operation: it
+        says "this topology describes exactly these atoms".  For a topology that
+        covers only part of a system -- a molecule, or one EVB block -- use
+        `attach_atoms` instead.
+        """
         self._hash = None
         self._molecules = None
         self.atoms = atoms
         self.graph.add_nodes_from(
             [(a.index, {"atomic_number": a.number, "symbol": a.symbol}) for a in atoms]
         )
+        return atoms
+
+    def attach_atoms(self, atoms: Atoms) -> Atoms:
+        """Attach `atoms` as the coordinate source without changing the nodes.
+
+        Node indices are global throughout the codebase, so a subgraph spanning
+        part of a system still indexes into the *full* `Atoms` -- that is what
+        makes `molecules()` and the term remapping work.  Giving such a subgraph
+        its coordinates therefore must not touch the node set, or the block
+        silently grows to the whole system.  `set_atoms` does exactly that and is
+        the right call only when the graph is meant to span every atom.
+        """
+        self._hash = None
+        self._molecules = None
+        self.atoms = atoms
         return atoms
 
     def set_terms(self, terms: list[Term]) -> dict[str, Any]:
@@ -85,11 +107,25 @@ class Topology:
         self.term_dict = term_dict
         return term_dict
 
-    def copy(self) -> "Topology":
+    def copy(self, share_atoms: bool = False) -> "Topology":
+        """Copy the graph and terms.
+
+        `share_atoms` hands the copy the same `Atoms` object instead of a
+        duplicate.  Safe -- and much cheaper -- whenever the geometry is held
+        fixed while many topologies over it are enumerated, which is the case
+        throughout a single force evaluation.
+        """
         graph: nx.Graph = self.graph.copy()
-        atoms = self.atoms.copy() if self.atoms else None
         terms = list(self.terms) if self.terms else []
-        return self.__class__(graph, atoms, terms)
+        if self.atoms is None:
+            return self.__class__(graph, None, terms)
+        if share_atoms:
+            # Bypass __init__'s set_atoms: it would add every atom as a node,
+            # which turns a block-restricted graph into a whole-system one.
+            new = self.__class__(graph, None, terms)
+            new.attach_atoms(self.atoms)
+            return new
+        return self.__class__(graph, self.atoms.copy(), terms)
 
     @classmethod
     def from_atoms(cls, atoms: Atoms) -> "Topology":

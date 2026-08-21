@@ -176,6 +176,50 @@ class TestGetTermsTopology:
         assert 0 not in all_indices
         assert 1 not in all_indices
 
+    def test_cache_is_not_polluted_by_other_fragments(self):
+        """Warming the cache with other fragments must not change an answer.
+
+        The cache key has to identify a fragment exactly, because the terms it
+        stores have already been remapped onto specific global indices.  The
+        Weisfeiler-Lehman hash is a graph invariant taken over atomic numbers,
+        so it cannot by itself tell which node carries which element.
+
+        A fresh ReactionSet is the ground truth: nothing has been cached, so no
+        lookup can be wrong.  Any warmed instance must agree with it.  This
+        passes against the narrower (hash, node set) key as well -- it is a
+        standing invariant rather than a reproduction of a known failure.
+        """
+        from ase import io
+
+        frames = io.read("datasets/HCombustion/reactions/rxn_11.xyz", index=":")
+        target = frames[0].copy()
+        target.calc = None
+        target.positions = frames[len(frames) // 2].positions
+
+        def terms_for(reaction_set):
+            topology = Topology.from_atoms(target)
+            return sorted(
+                (t["type"], tuple(sorted(t["atoms"].items())), tuple(sorted(t["kwargs"])))
+                + tuple(round(float(v), 8) for _, v in sorted(t["kwargs"].items()))
+                for t in reaction_set.get_terms_topology(topology)
+            )
+
+        reference = terms_for(ReactionSet(RSET_PATH))
+
+        warmed = ReactionSet(RSET_PATH)
+        for index in range(1, 11):
+            other = io.read(
+                "datasets/HCombustion/reactions/rxn_%02d.xyz" % index, index=":"
+            )
+            middle = other[len(other) // 2].positions
+            for side in (0, -1):
+                probe = other[side].copy()
+                probe.calc = None
+                probe.positions = middle
+                warmed.get_terms_topology(Topology.from_atoms(probe))
+
+        assert terms_for(warmed) == reference
+
     def test_idempotent(self, reaction_set):
         """Two calls with the same topology return identical terms."""
         topo = make_disjoint_topology(make_h2_topology(5, 7), make_h2_topology(10, 15))

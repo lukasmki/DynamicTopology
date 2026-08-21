@@ -6,6 +6,9 @@ forces computed by central finite differences of the energy.
 """
 
 import numpy as np
+import pytest
+from ase import units
+
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.acks2 import ACKS2
 from DynamicTopology.forcefield.coupling import EVBCoupling
@@ -118,9 +121,50 @@ class TestQForceGradients:
         )
 
     def test_bond(self):
-        """Morse bond potential between two atoms."""
+        """Morse bond potential between two atoms (the default form)."""
         td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0])
         self._check(POS_2, td)
+
+    def test_bond_harmonic(self):
+        """Harmonic bond potential, the alternative form selected on QForce."""
+        td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0])
+        qf = QForce(bond_form="harmonic")
+
+        def energy_fn(p):
+            return qf(p, PBC, CELL, td)[0]
+
+        _, f_analytical = qf(POS_2, PBC, CELL, td)
+        np.testing.assert_allclose(
+            f_analytical,
+            finite_difference_forces(energy_fn, POS_2),
+            atol=1e-3,
+            rtol=1e-3,
+            err_msg="Force mismatch for harmonic bond",
+        )
+
+    def test_bond_forms_differ(self):
+        """Guard against the two bond forms silently being the same function.
+
+        Morse must be bounded by its dissociation asymptote where harmonic is
+        not; that difference is the whole reason the reactive path needs Morse.
+        """
+        td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0])
+        stretched = np.array([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]])
+        e_morse = QForce(bond_form="morse")(stretched, PBC, CELL, td)[0]
+        e_harm = QForce(bond_form="harmonic")(stretched, PBC, CELL, td)[0]
+        assert e_morse < e_harm, (
+            f"Morse ({e_morse:.3f} eV) should saturate well below harmonic "
+            f"({e_harm:.3f} eV) at a badly stretched bond"
+        )
+        # Morse is bounded above by its asymptote, which sits at +D over the well.
+        assert e_morse <= 0.0
+
+    def test_reference(self):
+        """Constant per-molecule reference shift contributes energy but no force."""
+        td = make_term("reference", [[0]], E0=[-1234.5])
+        energy, forces = self.qf(POS_3, PBC, CELL, td)
+        assert energy == pytest.approx(-1234.5 * (units.kJ / units.mol))
+        np.testing.assert_allclose(forces, np.zeros_like(POS_3), atol=0.0)
 
     def test_angle(self):
         """Harmonic angle (in cosine)."""
@@ -244,21 +288,51 @@ class TestACKS2Gradients:
         """
         indices = self._TERM_DICT["atom"]["atoms"][:, 0]
         params = self._TERM_DICT["atom"]["kwargs"]
+        sub = np.ix_(indices, indices)
 
         # Solve charges at reference geometry
-        vecs_ref = POS_H2O2[:, None, :] - POS_H2O2[None, :, :]
-        rij_ref = np.sqrt(np.sum(vecs_ref[indices] * vecs_ref[indices], -1))
-        Q = self.acks2.compute_charges(rij_ref, params, indices)
+        vecs_ref = (POS_H2O2[:, None, :] - POS_H2O2[None, :, :])[sub]
+        rij_ref = np.sqrt(np.sum(vecs_ref * vecs_ref, -1))
+        Q = self.acks2.compute_charges(rij_ref, params)
 
         def energy_fn(p):
-            v = p[:, None, :] - p[None, :, :]
-            r = np.sqrt(np.sum(v[indices] * v[indices], -1))
-            e, _ = self.acks2.compute_coulomb(Q, r, v, indices)
+            v = (p[:, None, :] - p[None, :, :])[sub]
+            r = np.sqrt(np.sum(v * v, -1))
+            e, _ = self.acks2.compute_coulomb(Q, r, v)
             return e
 
-        _, f_analytical = self.acks2.compute_coulomb(Q, rij_ref, vecs_ref, indices)
+        _, f_analytical = self.acks2.compute_coulomb(Q, rij_ref, vecs_ref)
         f_fd = finite_difference_forces(energy_fn, POS_H2O2)
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_invariant_under_atom_relabeling(self, seed):
+        """Relabeling atoms must not change the energy, only permute the forces.
+
+        The per-atom parameters arrive in term order while positions and forces
+        are in global order.  When the two coincide -- as in every other test
+        here -- an index-space mix-up is invisible, so this drives them apart on
+        purpose.  Both the parameters and the term's atom indices are permuted
+        together, so the physical system is identical throughout.
+        """
+        permutation = np.random.default_rng(seed).permutation(len(POS_H2O2))
+        params = self._TERM_DICT["atom"]["kwargs"]
+
+        reference_e, reference_f = ACKS2()(
+            POS_H2O2, PBC, CELL, self._TERM_DICT
+        )
+
+        # Same molecule, atoms listed in a different order.
+        permuted_term_dict = {
+            "atom": {
+                "atoms": np.array([[i] for i in permutation]),
+                "kwargs": {k: v[permutation] for k, v in params.items()},
+            }
+        }
+        energy, forces = ACKS2()(POS_H2O2, PBC, CELL, permuted_term_dict)
+
+        assert energy == pytest.approx(reference_e, abs=1e-10)
+        np.testing.assert_allclose(forces, reference_f, atol=1e-10)
 
 
 # ---------------------------------------------------------------------------

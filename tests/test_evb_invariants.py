@@ -36,11 +36,18 @@ those numbers are what makes a regression recognisable rather than just red.
 
 import numpy as np
 import pytest
-from ase import Atoms
 
 from DynamicTopology.basis import state_key
 from DynamicTopology.core import ReactionSet, Topology
 from DynamicTopology.system import System
+
+from geometry import (
+    REACTION,
+    REACTION_PATH_RAMP,
+    REACTION_PATH_TS,
+    reaction_path,
+    with_spectator,
+)
 
 
 RSET_PATH = "datasets/HCombustion/HCombustion.json"
@@ -69,24 +76,6 @@ def templates(reaction_set):
     }
 
 
-def build(templates, specs, cell=CELL):
-    """Place molecule templates along x at the given x offsets.
-
-    `specs` is a list of (formula, x).  Molecules are centred on their own
-    centroid so the offset is the centroid position, and the y/z placement puts
-    everything on a single axis through the middle of the box.
-    """
-    atoms = Atoms(cell=np.eye(3) * cell, pbc=False)
-    for formula, x in specs:
-        mol = templates[formula].atoms.copy()
-        mol.positions -= mol.positions.mean(0)
-        mol.positions += np.array([x, cell / 2, cell / 2])
-        atoms += mol
-    atoms.set_cell(np.eye(3) * cell)
-    atoms.set_pbc(False)
-    return atoms
-
-
 def calculate(atoms, reaction_set, topology=None):
     """Single point at a fixed geometry, optionally seeded with a given topology."""
     if topology is None:
@@ -94,10 +83,16 @@ def calculate(atoms, reaction_set, topology=None):
     return System(atoms, topology, reaction_set).calculate()
 
 
-# H2O + HO at contact.  Chosen because it perceives the expected bonds, forms a
-# single subnetwork, and offers 4 diabatic states -- a 2-state star is
-# pivot-invariant by construction, so a 2-state case would pass test 1 vacuously.
-REACTIVE_PAIR = [("H2O", 6.0), ("HO", 8.6)]
+def reactive(t=REACTION_PATH_TS):
+    """A geometry on `rxn_16`'s path, which is where a multi-state basis lives.
+
+    Two equilibrium templates placed near each other no longer mix at all --
+    that is what a fitted coupling width means -- so these tests take their
+    geometry from a reaction path instead.  See `tests/geometry.py`.  At the
+    transition state the block holds three states; a 2-state star is
+    pivot-invariant by construction and would pass test 1 vacuously.
+    """
+    return reaction_path(REACTION, t, CELL)
 
 
 def basis_seeds(atoms, reaction_set):
@@ -138,8 +133,8 @@ class TestPivotInvariance:
     same diabatic energy.
     """
 
-    def test_energy_is_independent_of_pivot(self, reaction_set, templates):
-        atoms = build(templates, REACTIVE_PAIR)
+    def test_energy_is_independent_of_pivot(self, reaction_set):
+        atoms = reactive()
         reference = calculate(atoms, reaction_set)["energy"]
 
         for i, seed in enumerate(basis_seeds(atoms, reaction_set)):
@@ -149,8 +144,8 @@ class TestPivotInvariance:
                 f"{energy - reference:+.4f} eV at an unchanged geometry"
             )
 
-    def test_forces_are_independent_of_pivot(self, reaction_set, templates):
-        atoms = build(templates, REACTIVE_PAIR)
+    def test_forces_are_independent_of_pivot(self, reaction_set):
+        atoms = reactive()
         reference = calculate(atoms, reaction_set)["forces"]
 
         for i, seed in enumerate(basis_seeds(atoms, reaction_set)):
@@ -160,14 +155,14 @@ class TestPivotInvariance:
                 f"{np.abs(forces - reference).max():.4f} eV/A"
             )
 
-    def test_basis_is_not_truncated(self, reaction_set, templates):
+    def test_basis_is_not_truncated(self, reaction_set):
         """The two tests above are only meaningful on a converged basis.
 
         `max_states` / `max_depth` truncate in breadth-first order, which depends
         on the seed, so a capped basis is seed-dependent again and could make the
         invariance pass or fail for reasons unrelated to the formalism.
         """
-        atoms = build(templates, REACTIVE_PAIR)
+        atoms = reactive()
         for i, seed in enumerate(basis_seeds(atoms, reaction_set)):
             blocks = calculate(atoms, reaction_set, seed)["blocks"]
             for j, block in enumerate(blocks):
@@ -176,7 +171,41 @@ class TestPivotInvariance:
                     f"{block['basis_size']} states / depth {block['depth']}"
                 )
 
-    def test_nonbonded_is_independent_of_pivot(self, reaction_set, templates):
+    def test_invariance_holds_with_a_channel_mid_ramp(self, reaction_set):
+        """The switching weight has to be seed-independent too, not just the set.
+
+        The gate admits a connected component, which is why membership does not
+        depend on the seed.  The weight is a second thing every seed has to agree
+        on, and it would not be enough for it to be merely close: it multiplies a
+        coupling, so a seed-dependent weight is a seed-dependent energy.  It is
+        symmetric in the two diabats by the same argument as the gate, so the
+        agreement here is exact rather than approximate -- measured at 0.0 eV
+        and 6.7e-16 eV/A across the three seeds, which all report the same
+        `min_switch` of 0.278165 to the last digit.
+        """
+        atoms = reactive(REACTION_PATH_RAMP)
+        reference = calculate(atoms, reaction_set)
+        weight = min(block["min_switch"] for block in reference["blocks"])
+        assert 0.0 < weight < 1.0, (
+            f"no channel is inside the admission ramp (min_switch = {weight}); "
+            "this geometry no longer exercises the switch"
+        )
+
+        for i, seed in enumerate(basis_seeds(atoms, reaction_set)):
+            results = calculate(atoms, reaction_set, seed)
+            assert results["energy"] == pytest.approx(
+                reference["energy"], abs=ENERGY_TOL
+            ), (
+                f"seeding from state {i} changed the energy by "
+                f"{results['energy'] - reference['energy']:+.4e} eV with a "
+                "channel mid-ramp"
+            )
+            assert np.abs(results["forces"] - reference["forces"]).max() < FORCE_TOL
+            assert min(b["min_switch"] for b in results["blocks"]) == pytest.approx(
+                weight, abs=1e-12
+            ), f"seeding from state {i} changed the switching weight itself"
+
+    def test_nonbonded_is_independent_of_pivot(self, reaction_set):
         """ACKS2 is evaluated once, outside the EVB, from the current topology.
 
         That is only pivot-independent because its `atom` parameters happen to
@@ -187,7 +216,7 @@ class TestPivotInvariance:
         holding the moment a template carries topology-specific charges.  Pinned
         separately so that if it breaks it is not mistaken for a basis defect.
         """
-        atoms = build(templates, REACTIVE_PAIR)
+        atoms = reactive()
         reference = calculate(atoms, reaction_set)["energy_nonbonded"]
 
         for i, seed in enumerate(basis_seeds(atoms, reaction_set)):
@@ -202,9 +231,9 @@ class TestPivotInvariance:
 class TestBasisClosure:
     """Properties of the closure itself, independent of what it is used for."""
 
-    def test_every_state_generates_the_same_basis(self, reaction_set, templates):
+    def test_every_state_generates_the_same_basis(self, reaction_set):
         """The admitted set is a connected component, so any member generates it."""
-        atoms = build(templates, REACTIVE_PAIR)
+        atoms = reactive()
         system = System(atoms, Topology.from_atoms(atoms), reaction_set)
         reference = system.basis.build(atoms, system.topology, BIMOL_CUTOFF)[0]
         expected = {state_key(state) for state in reference.states}
@@ -217,29 +246,46 @@ class TestBasisClosure:
                 f"{len(expected)} of the basis it belongs to"
             )
 
-    def test_admission_is_symmetric(self, reaction_set, templates):
+    def test_admission_is_symmetric(self, reaction_set):
         """The gate cannot prefer one direction, or reachability is directional.
 
         This is the whole invariance argument in one assertion: the admitted set
         is the seed's connected component only if the edge relation is
         undirected.
+
+        Asserted on the switching *weight*, not on the admit/reject decision.
+        The gate is a ramp, so the coupling a channel actually carries has to be
+        symmetric too -- two seeds that agree on which states exist but disagree
+        on how strongly they couple still give different energies.  Exact
+        equality rather than a tolerance: `hypot` and `abs` are both even in the
+        half gap, so there is nothing to round.
         """
-        atoms = build(templates, REACTIVE_PAIR)
+        atoms = reactive()
         system = System(atoms, Topology.from_atoms(atoms), reaction_set)
-        gate = system.basis._admits
+        gate = system.basis._switch
 
         rng = np.random.default_rng(0)
+        ramping = 0
         for _ in range(200):
             a, b = rng.normal(0.0, 5.0, size=2)
             coupling = rng.normal(0.0, 2.0)
-            assert gate(a, b, coupling) == gate(b, a, coupling)
+            weight = gate(a, b, coupling)
+            assert weight == gate(b, a, coupling)
             # Sign of the coupling is a phase choice and must not matter either.
-            assert gate(a, b, coupling) == gate(a, b, -coupling)
+            assert weight == gate(a, b, -coupling)
+            ramping += 0.0 < weight < 1.0
+
+        # Drawn from a distribution that straddles the threshold, so the ramp
+        # itself is covered rather than only its two flat ends.
+        assert ramping > 0, (
+            "no sampled pair landed inside the admission ramp; the symmetry of "
+            "the switching weight is untested"
+        )
 
     def test_hamiltonian_is_symmetric_and_couples_beyond_the_seed(
         self, reaction_set, templates
     ):
-        atoms = build(templates, REACTIVE_PAIR)
+        atoms = reactive()
         system = System(atoms, Topology.from_atoms(atoms), reaction_set)
         block = system.basis.build(atoms, system.topology, BIMOL_CUTOFF)[0]
         ham, _ = block.hamiltonian()
@@ -276,20 +322,21 @@ class TestCutoffContinuity:
     def test_energy_is_continuous_across_the_bimolecular_cutoff(
         self, reaction_set, templates
     ):
-        # A spectator O2 is walked away from a reactive H2O+HO pair.  Below the
-        # cutoff it joins their subnetwork and its dissociation channel enters
-        # the same matrix; above it, it becomes an independent subnetwork.  The
+        # A spectator O2 is walked away from a reacting fragment.  Below the
+        # cutoff it joins that subnetwork and its dissociation channel enters the
+        # same matrix; above it, it becomes an independent subnetwork.  The
         # geometry change per step is negligible either side of the boundary.
+        reacting = reactive()
         energies, separations = [], []
         for dx in np.arange(3.80, 4.35, 0.05):
-            atoms = build(templates, REACTIVE_PAIR + [("O2", 8.6 + dx)])
+            atoms = with_spectator(reacting, templates["O2"].atoms, dx)
             energies.append(calculate(atoms, reaction_set)["energy"])
             positions = atoms.positions
             separations.append(
                 min(
                     np.linalg.norm(positions[i] - positions[j])
-                    for i in (3, 4)  # HO
-                    for j in (5, 6)  # O2
+                    for i in range(len(reacting))
+                    for j in range(len(reacting), len(atoms))
                 )
             )
         energies = np.array(energies)
@@ -318,8 +365,8 @@ class TestPermutationInvariance:
     # reaction channel (H2O's two O-H bonds), matching in energy by symmetry
     # while putting the forces on different atoms.  Was 5.04 eV / 5.29 eV/A.
     @pytest.mark.parametrize("seed", [0, 1, 2, 3])
-    def test_relabeling_atoms_changes_nothing(self, reaction_set, templates, seed):
-        atoms = build(templates, REACTIVE_PAIR)
+    def test_relabeling_atoms_changes_nothing(self, reaction_set, seed):
+        atoms = reactive()
         reference = calculate(atoms, reaction_set)
 
         permutation = np.random.default_rng(seed).permutation(len(atoms))

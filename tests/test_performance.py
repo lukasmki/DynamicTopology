@@ -6,7 +6,7 @@ values the calculator produced *before* any of the optimization work, recorded
 to full precision:
 
   - Screening reaction candidates on the reacting fragment rather than the whole
-    block (`EVBBasis._admits_reaction`) is exact because the molecules a reaction
+    block (`EVBBasis._channel_weight`) is exact because the molecules a reaction
     leaves alone contribute equally to both diabats and cancel from the gap.
   - Deriving the term cache key before hashing (`ReactionSet.get_terms_topology`)
     is exact because the Weisfeiler-Lehman hash is a function of the signature
@@ -42,18 +42,32 @@ from DynamicTopology.system import System
 
 RSET_PATH = "datasets/HCombustion/HCombustion.json"
 
-# (energy, energy_bonded, energy_nonbonded) in eV, and the largest block, as
-# produced before the optimization work.
+# (energy, energy_bonded, energy_nonbonded) in eV, and the number of blocks.
+#
+# Regenerated deliberately when the bond parameters were refitted against a
+# corrected energy zero (`fit.dissociation` -- the depths had been solved so that
+# `E_QForce = E_atomization` while the calculator reports `E_QForce + E_ACKS2`,
+# double-counting the nonbonded term) and gained the Morse shape parameter `c`.
+# The bonded parameters themselves moved, so the surface is *supposed* to move
+# and no optimization argument applies -- unlike every other reason this
+# fingerprint could shift, which is what it exists to catch.
+#
+# What did *not* move is worth more than what did.  The block counts are
+# identical (87, 28), the nonbonded energies are identical to the last digit,
+# and the total moved by only 0.011 eV across 200 atoms -- because the refit
+# preserves every template's energy at its own geometry *exactly*, and this box
+# is near equilibrium.  A refit that had actually broken something would not
+# land within 2e-5 of the old number by accident.
 REFERENCE = {
     "tests/data/mix-n100-d30.xyz": (
-        -506.80083474578123,
-        -506.8421507032254,
+        -507.9134879573974,
+        -507.9548039148416,
         0.04131595744415656,
         87,
     ),
     "tests/data/mix-n100-d250.xyz": (
-        -505.9819399952007,
-        -506.83834905014635,
+        -507.09060866657546,
+        -507.9470177215211,
         0.8564090549456548,
         28,
     ),
@@ -134,25 +148,29 @@ def _compare_screen_against_full(reaction_set, atoms, limit=400):
             if state_key(child) == state_key(parent):
                 continue
             child_energy, _ = basis._energy(child, atoms)
-            coupling, _ = basis._coupling(atoms, reaction, mapping)
+            coupling, coupling_forces = basis._coupling(atoms, reaction, mapping)
 
-            screened = basis._admits_reaction(
-                parent, mapping, (broken, formed), coupling, atoms
+            screened, _ = basis._channel_weight(
+                parent, mapping, (broken, formed), coupling, coupling_forces, atoms
             )
-            exact = basis._admits(parent_energy, child_energy, coupling)
-            assert screened == exact, (
+            exact = basis._switch(parent_energy, child_energy, coupling)
+            # The switching weight, not just the admit/reject decision: the
+            # cancellation claim is about the gap itself, and a screen that got
+            # the gap slightly wrong would still round to the same boolean
+            # everywhere except within `eps` of the threshold.
+            assert screened == pytest.approx(exact, abs=1e-9), (
                 f"screen and full evaluation disagree for {reaction.equation()}: "
                 f"screened={screened}, exact={exact}"
             )
-            admitted += screened
-            rejected += not screened
+            admitted += screened > 0.0
+            rejected += screened <= 0.0
             if admitted + rejected >= limit:
                 return admitted, rejected
     return admitted, rejected
 
 
 def test_screening_agrees_with_whole_state_evaluation(reaction_set):
-    """`_admits_reaction` must decide exactly what full evaluation would.
+    """`_channel_weight` must decide exactly what full evaluation would.
 
     The screen drops the spectator molecules from both diabats on the grounds
     that they cancel.  This checks that claim directly against the difference of
@@ -160,12 +178,14 @@ def test_screening_agrees_with_whole_state_evaluation(reaction_set):
 
     Both outcomes have to be covered.  At equilibrium geometries the gate
     rejects every channel -- correctly, nothing is reacting -- so a test run only
-    there would pass against an `_admits_reaction` that always returned False.
+    there would pass against a `_channel_weight` that always returned zero.
     The stretched case below exists to exercise the admitting branch.
     """
     atoms = io.read("tests/data/mix-n100-d250.xyz")
     admitted, rejected = _compare_screen_against_full(reaction_set, atoms)
-    assert rejected > 0, "no channels were rejected; the test is not exercising the gate"
+    assert rejected > 0, (
+        "no channels were rejected; the test is not exercising the gate"
+    )
     assert admitted == 0, (
         f"{admitted} channels admitted at equilibrium geometries, where the "
         "fitted coupling widths should quench every reaction"

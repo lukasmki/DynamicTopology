@@ -13,6 +13,8 @@ from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.acks2 import ACKS2
 from DynamicTopology.forcefield.coupling import EVBCoupling
 
+from geometry import REACTION, REACTION_PATH_RAMP, reaction_path
+
 
 # Finite difference step (Angstrom)
 DELTA = 1e-4
@@ -124,6 +126,35 @@ class TestQForceGradients:
         """Morse bond potential between two atoms (the default form)."""
         td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0])
         self._check(POS_2, td)
+
+    @pytest.mark.parametrize("c", [1.0, 4.0, -1.5])
+    def test_bond_morse_shape(self, c):
+        """The Hulburt-Hirschfelder term `c` on the stretched branch.
+
+        `POS_2` sits near `r0`, which is exactly where the correction and its
+        first two derivatives vanish -- a gradient checked only there would pass
+        against an implementation that computed the term wrongly, or not at all.
+        So this walks out along the stretch, through the peak of `s**3 exp(-2s)`
+        at `s = 1.5` and past it, and back onto the compressed branch where the
+        term is clamped off.
+        """
+        td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0], c=[c])
+        al = np.sqrt(251200.0 / (2 * 436.0))
+        for s in (-1.0, 0.0, 0.5, 1.5, 3.0, 6.0):
+            pos = np.array([[0.0, 0.0, 0.0], [0.07772 + s / al, 0.0, 0.0]])
+            self._check(pos, td)
+
+    def test_bond_morse_shape_is_off_by_default(self):
+        """A term file with no `c` must read as exactly the old Morse."""
+        kwargs = dict(r0=[0.07772], k=[251200.0], D=[436.0])
+        plain = make_term("bond", [[0, 1]], **kwargs)
+        zeroed = make_term("bond", [[0, 1]], c=[0.0], **kwargs)
+        qf = QForce()
+        for offset in (-0.02, 0.0, 0.05, 0.2):
+            pos = np.array([[0.0, 0.0, 0.0], [0.07772 + offset, 0.0, 0.0]])
+            assert qf(pos, PBC, CELL, plain)[0] == pytest.approx(
+                qf(pos, PBC, CELL, zeroed)[0], abs=1e-12
+            )
 
     def test_bond_harmonic(self):
         """Harmonic bond potential, the alternative form selected on QForce."""
@@ -254,14 +285,15 @@ class TestQForceGradients:
 
 
 class TestACKS2Gradients:
-    """Verify ACKS2 Coulomb forces against central finite differences.
+    """Verify ACKS2 forces against central finite differences.
 
-    Note: ACKS2 forces are computed under a frozen-charge approximation.
-    Charges Q are re-solved at each MD step, but the analytical gradient
-    treats Q as fixed (dQ/dr = 0).  Finite differences re-solve Q at each
-    perturbed geometry, so they include the charge-response contribution.
-    A failing test indicates that the charge-response term is non-negligible
-    for the chosen geometry and parameters.
+    Two different things are checked here and the distinction matters.
+    `test_coulomb_forces` freezes Q on both sides, so it tests only the Coulomb
+    force formula in isolation -- by construction it cannot see whether the
+    charge response is handled, and for a long time it passed while
+    `ACKS2.__call__` was not conservative at all.  `test_call_forces` is the one
+    that covers the real calculator: it perturbs the geometry and lets the
+    charges re-solve, exactly as they do along a trajectory.
     """
 
     acks2 = ACKS2()
@@ -284,7 +316,7 @@ class TestACKS2Gradients:
         Charges Q are solved once at the reference geometry and held fixed for
         both the analytical forces and the finite-difference energy perturbations.
         This isolates the Coulomb force formula from the charge-response (dQ/dr)
-        contribution that would appear if charges were re-solved at each step.
+        contribution, which `test_call_forces` covers instead.
         """
         indices = self._TERM_DICT["atom"]["atoms"][:, 0]
         params = self._TERM_DICT["atom"]["kwargs"]
@@ -305,6 +337,36 @@ class TestACKS2Gradients:
         f_fd = finite_difference_forces(energy_fn, POS_H2O2)
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-3, rtol=1e-3)
 
+    @pytest.mark.parametrize(
+        "positions", [POS_2, POS_3, POS_4, POS_H2O2], ids=["n2", "n3", "n4", "h2o2"]
+    )
+    def test_call_forces(self, positions):
+        """The full calculator must be conservative, charge response included.
+
+        Unlike `test_coulomb_forces`, the charges are *not* frozen: every
+        finite-difference displacement re-solves them, which is what happens
+        between MD steps.  The gap between the two is the dQ/dr term, and it is
+        large -- dropping it moves the H2O force by ~1 eV/A and makes NVE energy
+        drift by hundreds of percent (see test_energy_conservation.py).
+        """
+        params = self._TERM_DICT["atom"]["kwargs"]
+        term_dict = {
+            "atom": {
+                "atoms": np.array([[i] for i in range(len(positions))]),
+                "kwargs": {k: v[: len(positions)] for k, v in params.items()},
+            }
+        }
+        acks2 = ACKS2()
+
+        def energy_fn(p):
+            # A fresh instance per call: the cache keys on positions, and
+            # reusing one here would be testing the cache, not the gradient.
+            return ACKS2()(p, PBC, CELL, term_dict)[0]
+
+        _, f_analytical = acks2(positions, PBC, CELL, term_dict)
+        f_fd = finite_difference_forces(energy_fn, positions)
+        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
+
     @pytest.mark.parametrize("seed", [0, 1, 2])
     def test_invariant_under_atom_relabeling(self, seed):
         """Relabeling atoms must not change the energy, only permute the forces.
@@ -318,9 +380,7 @@ class TestACKS2Gradients:
         permutation = np.random.default_rng(seed).permutation(len(POS_H2O2))
         params = self._TERM_DICT["atom"]["kwargs"]
 
-        reference_e, reference_f = ACKS2()(
-            POS_H2O2, PBC, CELL, self._TERM_DICT
-        )
+        reference_e, reference_f = ACKS2()(POS_H2O2, PBC, CELL, self._TERM_DICT)
 
         # Same molecule, atoms listed in a different order.
         permuted_term_dict = {
@@ -372,3 +432,61 @@ class TestEVBCouplingGradients:
         _, f_analytical = self.coupling(pos, PBC, CELL, ensemble, td)
         f_fd = finite_difference_forces(energy_fn, pos)
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-3, rtol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# The assembled surface
+# ---------------------------------------------------------------------------
+
+RSET_PATH = "datasets/HCombustion/HCombustion.json"
+SYSTEM_CELL = 60.0  # cubic box edge, Angstrom; large enough that nothing wraps
+
+
+class TestSystemGradients:
+    """Finite differences through the whole force call, not one term at a time.
+
+    Everything above tests a `compute_*` method in isolation, which leaves the
+    assembly untested: the EVB ground state, the Hellmann-Feynman contraction,
+    and -- the reason this class exists -- the switching weight `EVBBasis` puts
+    on a coupling as a state enters the basis.  That weight depends on the
+    geometry through the diabatic gap, so it carries a force of its own, and
+    nothing else here would notice if it were dropped.
+    """
+
+    @pytest.fixture(scope="class")
+    def reaction_set(self):
+        from DynamicTopology.core import ReactionSet
+
+        return ReactionSet(RSET_PATH)
+
+    def _calculate(self, atoms, reaction_set):
+        from DynamicTopology.core import Topology
+        from DynamicTopology.system import System
+
+        return System(atoms, Topology.from_atoms(atoms), reaction_set).calculate()
+
+    def test_forces_inside_the_admission_ramp(self, reaction_set):
+        """F = -dE/dr with a channel switching on.
+
+        The tolerance is set by what the missing term actually costs: with
+        `_channel_weight` stubbed to return no gradient the error is 6.0e-03,
+        while the correct forces agree to 1.7e-08.  Anything in between would
+        make this pass on a broken implementation.
+        """
+        atoms = reaction_path(REACTION, REACTION_PATH_RAMP, SYSTEM_CELL)
+        results = self._calculate(atoms, reaction_set)
+
+        weight = min(block["min_switch"] for block in results["blocks"])
+        assert 0.0 < weight < 1.0, (
+            f"no channel is inside the admission ramp (min_switch = {weight}); "
+            "the switch's gradient is not being exercised and this test is "
+            "vacuous"
+        )
+
+        def energy_fn(positions):
+            perturbed = atoms.copy()
+            perturbed.positions = positions
+            return self._calculate(perturbed, reaction_set)["energy"]
+
+        f_fd = finite_difference_forces(energy_fn, atoms.positions, delta=1e-5)
+        np.testing.assert_allclose(results["forces"], f_fd, atol=1e-7, rtol=1e-5)

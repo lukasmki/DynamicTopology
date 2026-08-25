@@ -1,10 +1,25 @@
-from molify import ase2networkx
+#!/usr/bin/env python3
+"""Plot energies, temperature and species counts from a trajectory.
+
+The species panel reads each frame's stored `connectivity`, which
+`scripts/nvt.py` now writes from the calculator's live topology.  It used to
+call `ase2networkx(frame, True)` and re-perceive the bonding from geometry,
+which was wrong twice over: molify's default cutoff is 1.2 * (r_cov + r_cov),
+putting H-H at 0.7440 A against an 0.7445 A bond, so every H2 in the box was
+counted as two free H atoms; and re-perceiving discards the EVB's own answer in
+favour of a geometric guess about it.  `Topology.from_atoms` carries the
+corrected `BOND_SCALE` and prefers stored connectivity, so it is the one path
+worth using.
+"""
+
 from argparse import ArgumentParser
 from ase import Atoms, io
 
 import networkx as nx
 
 import matplotlib.pyplot as plt
+
+from DynamicTopology.core.topology import Topology
 
 
 def main():
@@ -31,11 +46,10 @@ def main():
         PE.append(frame.get_potential_energy())
         KE.append(frame.get_kinetic_energy())
 
-        graph = ase2networkx(frame, True)
+        graph = Topology.from_atoms(frame).graph
         counts: dict[str, int] = {}
         for component in nx.connected_components(graph):
-            indices = [graph.nodes[n]["original_index"] for n in component]
-            formula = frame[indices].get_chemical_formula()
+            formula = frame[sorted(component)].get_chemical_formula()
             counts[formula] = counts.get(formula, 0) + 1
         SPECIES_COUNTS.append(counts)
 

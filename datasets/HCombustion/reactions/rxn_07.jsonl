@@ -1,1 +1,1 @@
-{"type": "rmsd", "atoms": {"p1": 0, "p2": 1}, "kwargs": {"A": -10.0, "a": 70.12768640897059}, "provenance": "placeholder"}
+{"type": "rmsd", "atoms": {"p1": 0, "p2": 1}, "kwargs": {"A": -0.1914328775215051, "a": 40.008134854881206}, "provenance": "fitted"}

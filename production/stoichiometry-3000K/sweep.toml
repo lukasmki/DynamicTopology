@@ -1,0 +1,34 @@
+# H2/O2 stoichiometry sweep at fixed temperature.
+#
+# The one variable is composition.  Everything else is pinned here so that a run
+# is fully described by its index into this file, and `run_one.py` writes the
+# resolved parameters into each output directory as `config.json`.
+
+[sweep]
+name = "stoichiometry-3000K"
+# H2:O2.  2:1 is stoichiometric for 2 H2 + O2 -> 2 H2O; the ladder runs from
+# oxygen-rich through to hydrogen-rich either side of it.
+ratios = ["1:2", "1:1", "2:1", "4:1", "8:1"]
+# Replicates.  Reaction onset is stochastic, so a single trajectory per
+# composition would not distinguish a composition effect from a lucky start.
+seeds = [1, 2, 3, 4, 5]
+
+[system]
+molecules = 100
+# Cubic edge in Angstrom -- *number* density, held fixed.  At a fixed mass
+# density instead, this ladder would run from a 24.4 A box to a 15.2 A one,
+# because O2 is 16x heavier than H2; collision rates would then track
+# composition and confound the only variable being swept.  Matches the existing
+# 1:1 box, so the 1:1 column is comparable with earlier work.
+box = 22.44
+rnet = "datasets/HCombustion/HCombustion.json"
+
+[md]
+temperature = 3000.0  # K
+# 0.25 fs, not the script default of 0.5.  The refit took the H-H stretch to
+# 5282 cm^-1 (a 6.3 fs period), which is ~13 steps per period at 0.5 fs -- an
+# acceptable margin at 2000 K and not one worth spending at 3000 K.
+timestep = 0.25       # fs
+friction = 0.01       # 1/fs
+steps = 400000        # 100 ps at 0.25 fs
+interval = 100        # a frame every 25 fs -> 4000 frames per run

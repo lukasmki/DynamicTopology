@@ -1,0 +1,14 @@
+# Trajectories are large -- a 4000-frame 200-atom run is ~130 MB, and there are
+# 25 of them -- and every run is reproducible from sweep.toml plus its seed,
+# which is the point of seeding them. Keep the recipe in git, not the output.
+output/*/traj.xyz
+output/*/slurm-*.out
+output/slurm-*.out
+
+# `config.json` and `log.jsonl` are small and are the actual result, so they are
+# NOT ignored: `scripts/analyze.py` reads only those two.
+#
+# `inputs/` is likewise tracked. `molify.pack` is deterministic given its seed
+# (pinned to 42 by scripts/mixture.py), so the boxes are regenerable -- but they
+# are the starting points every number in the sweep descends from, and they are
+# a few kB each.

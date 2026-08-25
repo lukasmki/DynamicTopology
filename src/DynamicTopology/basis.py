@@ -22,6 +22,36 @@ stabilization is quadratic in `V` when the diabats are well separated (so a larg
 coupling between distant diabats moves nothing) and linear when they are
 degenerate (so a small coupling between crossing diabats moves everything).
 
+**Why the gate is a ramp and not a step.**  The ground state of a two-level
+block is exactly `min(diabats) - stab`, so dropping a state costs precisely
+`stab` and a hard threshold moves the energy discontinuously by up to `eps` every
+time one crosses it.  That is not a small effect where it matters: it made `eps`
+an accuracy knob on energy conservation rather than on basis size, and an NVE run
+of a single H2O drifted by one `eps` per admission event, dt-independently.  So
+the coupling is scaled by a switching function that rises from zero at `stab =
+eps` to one at `stab = eps + switch_width`.  A state arrives decoupled,
+contributing nothing, and gains its coupling smoothly; `Block.min_switch` reports
+how far into a ramp a block currently sits.
+
+The ramp runs *upward* from `eps`, so the admitted set is exactly what the hard
+gate admitted -- widening downward would enlarge every basis, and `max_states`
+already binds on a hot box.  What it costs is that the energy the truncation
+discards is bounded by `eps + switch_width` rather than by `eps`.
+`switch_width = 0` restores the step exactly.
+
+Two discontinuities the switch does *not* remove, both recorded here because they
+look like the same bug and are not:
+
+  - `stab` has a kink at `dH = 0` (`|dH|` does), and the switch's slope amplifies
+    it by `1/switch_width`.  It can only bite where a pair is near-degenerate
+    *and* inside the ramp, which needs `|V| <= eps + switch_width` -- an
+    essentially uncoupled degeneracy.  Softening `|dH|` to `hypot(dH, delta)`
+    removes it if it is ever measured firing.
+  - A state whose diabatic energy is *below* the current ground state changes it
+    by `H_parent - H_child` on entry, not by `stab`.  That jump comes from the
+    diagonal, and scaling `V` cannot touch it.  The gate excludes such a state
+    whenever `|V| < sqrt(2*|dH|*eps)`, so it is reachable in principle.
+
 **Why the result does not depend on where you start.**  The criterion is
 symmetric under exchanging parent and child -- `dH` changes sign, `dH**2` and
 `|dH|` do not -- so the admitted set is exactly the connected component of the
@@ -75,6 +105,21 @@ def state_key(topology: Topology) -> StateKey:
     )
 
 
+def _smoothstep(t: float) -> float:
+    """Quintic ramp on [0, 1], flat to second order at both ends.
+
+    C2 rather than the cheaper C1 cubic: the first derivative is what the forces
+    are, so a discontinuous *second* derivative is the coarsest thing that still
+    leaves the force smooth.
+    """
+    return t * t * t * (t * (6.0 * t - 15.0) + 10.0)
+
+
+def _smoothstep_slope(t: float) -> float:
+    """d/dt of `_smoothstep`.  Zero at t = 0 and t = 1, which is the point."""
+    return 30.0 * t * t * (t - 1.0) * (t - 1.0)
+
+
 def _canonical(key: StateKey) -> tuple:
     """Sortable form of a state key, so basis ordering is reproducible."""
     nodes, edges = key
@@ -115,6 +160,11 @@ class Block:
     seed_index: int
     depth: int
     capped: bool
+    # Smallest switching weight on any coupling in this block, so a caller can
+    # see whether the surface is currently inside a ramp.  1.0 means every
+    # channel is at full strength, which is also what a single-state block
+    # reports: there is nothing to switch.
+    min_switch: float = 1.0
     placeholder_channels: list[str] = field(default_factory=list)
 
     @property
@@ -144,13 +194,19 @@ class EVBBasis:
         bonded_ff,
         coupling_ff,
         eps: float = 1e-3,
-        max_states: int = 32,
+        max_states: int = 64,
         max_depth: int | None = None,
+        switch_width: float | None = None,
     ):
         self.reaction_set = reaction_set
         self.bonded_ff = bonded_ff
         self.coupling_ff = coupling_ff
         self.eps = eps
+        # Width of the admission ramp, defaulting to one `eps`: a channel is
+        # decoupled at `stab = eps` and at full strength at `stab = 2*eps`.
+        # Zero collapses the ramp back to the hard threshold, which is how the
+        # discontinuity it exists to remove can be reproduced on demand.
+        self.switch_width = eps if switch_width is None else switch_width
         self.max_states = max_states
         # Breadth-first depth is always below the basis size, so `max_states` is
         # the cap that binds and `max_depth` is off by default.  A small depth
@@ -163,7 +219,10 @@ class EVBBasis:
         self._energy_cache: dict[StateKey, tuple[float, np.ndarray]] = {}
         self._reaction_cache: dict[StateKey, list[tuple[Reaction, dict]]] = {}
         self._coupling_cache: dict[tuple, tuple[float, np.ndarray]] = {}
-        self._molecule_cache: dict[tuple, float] = {}
+        # (energy, nodes, forces over those nodes).  The forces are the ones the
+        # bonded force field already returned and this used to discard; keeping
+        # them costs no extra evaluation and is what the switch's gradient needs.
+        self._molecule_cache: dict[tuple, tuple[float, list[int], np.ndarray]] = {}
 
     # -- pieces the closure needs ------------------------------------------
 
@@ -182,17 +241,22 @@ class EVBBasis:
 
         network = self.reaction_set.get_network(state, bimol_cutoff)
         found = [
-            (data["reaction"], data["mapping"])
-            for _, _, data in network.reactions()
+            (data["reaction"], data["mapping"]) for _, _, data in network.reactions()
         ]
         self._reaction_cache[key] = found
         return found
 
-    def _molecule_energy(self, molecule: Topology, atoms: Atoms) -> float:
-        """Bonded energy of a single molecule, memoized for this geometry.
+    def _molecule_terms(
+        self, molecule: Topology, atoms: Atoms
+    ) -> tuple[float, list[int], np.ndarray]:
+        """Bonded energy and forces of a single molecule, memoized for this geometry.
 
         Keyed by molecule signature, so the molecules a reaction leaves alone are
-        evaluated once for the whole block rather than once per candidate.
+        evaluated once for the whole block rather than once per candidate.  The
+        forces are returned in the molecule's own node order, not scattered:
+        almost every caller only wants the energy, and scattering into a
+        system-sized array for each of the thousands of screening calls per step
+        would cost more than the evaluation.
         """
         signature = self.reaction_set._molecule_signature(molecule)
         cached = self._molecule_cache.get(signature)
@@ -212,11 +276,15 @@ class EVBBasis:
                 for term in terms
             ]
         )
-        energy, _ = self.bonded_ff(
+        energy, local_forces = self.bonded_ff(
             atoms.positions[nodes], atoms.pbc, atoms.cell, term_dict
         )
-        self._molecule_cache[signature] = energy
-        return energy
+        result = (energy, nodes, local_forces)
+        self._molecule_cache[signature] = result
+        return result
+
+    def _molecule_energy(self, molecule: Topology, atoms: Atoms) -> float:
+        return self._molecule_terms(molecule, atoms)[0]
 
     def _local_energy(self, graph: nx.Graph, atoms: Atoms) -> float:
         """Bonded energy of the molecules in `graph`, summed over components."""
@@ -225,16 +293,44 @@ class EVBBasis:
             for nodes in nx.connected_components(graph)
         )
 
-    def _admits_reaction(
-        self, parent: Topology, mapping: dict, changes: tuple[set, set],
-        coupling: float, atoms: Atoms,
-    ) -> bool:
-        """Would applying `reaction` to `parent` produce an admissible state?
+    def _local_forces(self, graph: nx.Graph, atoms: Atoms) -> np.ndarray:
+        """Bonded forces of the molecules in `graph`, in global atom order.
+
+        The counterpart of `_local_energy`, and taken only on the paths that
+        need a gradient of the gap -- i.e. only for a channel sitting strictly
+        inside the admission ramp.  Everything it reads is already in the
+        molecule cache from the corresponding `_local_energy` call.
+        """
+        forces = np.zeros_like(atoms.positions)
+        for nodes in nx.connected_components(graph):
+            _, mol_nodes, local_forces = self._molecule_terms(
+                Topology(graph.subgraph(nodes)), atoms
+            )
+            forces[mol_nodes] += local_forces
+        return forces
+
+    def _channel_weight(
+        self,
+        parent: Topology,
+        mapping: dict,
+        changes: tuple[set, set],
+        coupling: float,
+        coupling_forces: np.ndarray,
+        atoms: Atoms,
+    ) -> tuple[float, np.ndarray | None]:
+        """How strongly this channel couples, and the gradient of that weight.
+
+        Returns `(weight, d weight / d r)`, with the gradient `None` wherever the
+        weight is exactly 0 or 1 -- the switching function is flat at both ends,
+        so outside the ramp there is no extra force term and no need for the
+        fragment forces that computing one would cost.  A weight of 0 means the
+        channel is not admitted at all.
 
         Decided without building the product.  The gate needs only the gap
         between the two diabats, and every molecule the reaction leaves alone
         contributes the same energy to both, so it cancels from the difference
-        exactly -- screening on the reacting fragment is not an approximation.
+        exactly -- screening on the reacting fragment is not an approximation,
+        and neither is differentiating it.
 
         It is also what keeps the closure affordable.  A reaction template spans
         whole molecules, so the fragment is two molecules at most, while a block
@@ -248,11 +344,32 @@ class EVBBasis:
         after = before.copy()
         after.remove_edges_from(broken)
         after.add_edges_from(formed)
-        return self._admits(
-            self._local_energy(before, atoms),
-            self._local_energy(after, atoms),
-            coupling,
+
+        energy_before = self._local_energy(before, atoms)
+        energy_after = self._local_energy(after, atoms)
+        weight = self._switch(energy_before, energy_after, coupling)
+        if weight <= 0.0 or weight >= 1.0:
+            return weight, None
+
+        # d(weight)/dr = S'(t)/width * d(stab)/dr, with
+        #   stab = hypot(h, V) - |h|,  h = (E_after - E_before) / 2
+        # so the chain rule needs the gap's gradient as well as the coupling's.
+        # Forces are -dE/dr, hence the sign flips below.
+        half_gap = 0.5 * (energy_after - energy_before)
+        hyp = float(np.hypot(half_gap, coupling))
+        stabilization = hyp - abs(half_gap)
+        slope = (
+            _smoothstep_slope((stabilization - self.eps) / self.switch_width)
+            / self.switch_width
         )
+
+        dgap = 0.5 * (
+            self._local_forces(before, atoms) - self._local_forces(after, atoms)
+        )
+        dstabilization = (half_gap / hyp - np.sign(half_gap)) * dgap + (
+            coupling / hyp
+        ) * -coupling_forces
+        return weight, slope * dstabilization
 
     def _energy(self, state: Topology, atoms: Atoms) -> tuple[float, np.ndarray]:
         """Diabatic energy and forces of one state at the current geometry.
@@ -335,11 +452,35 @@ class EVBBasis:
         self._coupling_cache[cache_key] = result
         return result
 
-    def _admits(self, parent_energy: float, child_energy: float, coupling: float) -> bool:
-        """Does mixing these two diabats lower the energy by more than `eps`?"""
+    def _switch(
+        self, parent_energy: float, child_energy: float, coupling: float
+    ) -> float:
+        """Weight in [0, 1] this channel's coupling carries in the Hamiltonian.
+
+        Zero where mixing the two diabats lowers the energy by less than `eps`,
+        one where it lowers it by more than `eps + switch_width`, and a quintic
+        ramp between -- so a state joins the basis decoupled and gains its
+        coupling smoothly instead of arriving at full strength.
+
+        Symmetric under exchanging the two diabats and under the sign of the
+        coupling, exactly rather than to a tolerance: `hypot` and `abs` are both
+        even in the half gap.  That symmetry is the whole invariance argument --
+        the admitted set is the seed's connected component only if the edge
+        relation is undirected.
+        """
         half_gap = 0.5 * (child_energy - parent_energy)
         stabilization = float(np.hypot(half_gap, coupling)) - abs(half_gap)
-        return stabilization > self.eps
+        if stabilization <= self.eps:
+            return 0.0
+        if self.switch_width <= 0.0 or stabilization >= self.eps + self.switch_width:
+            return 1.0
+        return _smoothstep((stabilization - self.eps) / self.switch_width)
+
+    def _admits(
+        self, parent_energy: float, child_energy: float, coupling: float
+    ) -> bool:
+        """Does mixing these two diabats lower the energy by more than `eps`?"""
+        return self._switch(parent_energy, child_energy, coupling) > 0.0
 
     # -- the closure --------------------------------------------------------
 
@@ -377,7 +518,7 @@ class EVBBasis:
         # equivalent routes, so keep the most strongly coupled representative --
         # choosing on the coupling rather than on enumeration order is what makes
         # the choice independent of how the atoms happen to be labelled.
-        edges: dict[frozenset, tuple[float, np.ndarray]] = {}
+        edges: dict[frozenset, tuple[float, np.ndarray, float]] = {}
         placeholders: dict[str, None] = {}
         capped = False
 
@@ -392,10 +533,19 @@ class EVBBasis:
                     continue  # a no-op template, e.g. H + H -> H + H
 
                 coupling, coupling_forces = self._coupling(atoms, reaction, mapping)
-                if not self._admits_reaction(
-                    parent, mapping, (broken, formed), coupling, atoms
-                ):
+                weight, dweight = self._channel_weight(
+                    parent, mapping, (broken, formed), coupling, coupling_forces, atoms
+                )
+                if weight <= 0.0:
                     continue
+
+                # V_eff = weight * V, so the force picks up the switch's own
+                # gradient.  Dropping that term would leave the forces
+                # inconsistent with the energy wherever a channel is ramping.
+                value = weight * coupling
+                gradient = weight * coupling_forces
+                if dweight is not None:
+                    gradient = gradient - coupling * dweight
 
                 # Only now is the product worth building: `apply` copies the
                 # whole block graph, and so does deriving its state key.
@@ -406,8 +556,11 @@ class EVBBasis:
 
                 pair = frozenset((parent_key, child_key))
                 previous = edges.get(pair)
-                if previous is None or abs(coupling) > abs(previous[0]):
-                    edges[pair] = (coupling, coupling_forces)
+                # Compared on the switched coupling, since that is what enters
+                # the matrix: a route with the larger raw coupling but a smaller
+                # weight is the weaker one.
+                if previous is None or abs(value) > abs(previous[0]):
+                    edges[pair] = (value, gradient, weight)
                 if _is_placeholder(reaction):
                     placeholders[reaction.equation()] = None
 
@@ -445,13 +598,15 @@ class EVBBasis:
 
         couplings = np.zeros((nstates, nstates))
         coupling_forces = np.zeros((nstates, nstates) + atoms.positions.shape)
-        for pair, (value, gradient) in edges.items():
+        min_switch = 1.0
+        for pair, (value, gradient, weight) in edges.items():
             keys = tuple(pair)
             if len(keys) != 2 or any(key not in index for key in keys):
                 continue  # an edge to a state the caps refused
             i, j = index[keys[0]], index[keys[1]]
             couplings[i, j] = couplings[j, i] = value
             coupling_forces[i, j] = coupling_forces[j, i] = gradient
+            min_switch = min(min_switch, weight)
 
         return Block(
             states=states,
@@ -462,5 +617,6 @@ class EVBBasis:
             seed_index=index[seed_key],
             depth=max(depths.values()),
             capped=capped,
+            min_switch=min_switch,
             placeholder_channels=sorted(placeholders),
         )

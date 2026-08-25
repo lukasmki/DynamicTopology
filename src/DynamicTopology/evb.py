@@ -45,14 +45,18 @@ class EVBSystem:
         ham = np.zeros((nstates, nstates))
         state_forces = np.zeros((nstates,) + pos.shape)
 
-        # fill diagonal
+        # Fill the diagonal with bonded energies only.  Electrostatics are
+        # topology-independent, so they are the same number for every state;
+        # adding them here would still change the result, because the coupling
+        # sqrt((1+h)*H_ii*H_jj) is nonlinear in the diagonal and a common shift
+        # does not pass through it.  They are added once, outside the
+        # Hamiltonian, below -- the same way System.calculate does it.
         for i, istate in enumerate(self.states):
             if not istate.term_dict:
                 continue
             en, fr = self.bonded_ff(pos, pbc, cell, istate.term_dict)
-            en_nb, fr_nb = self.nonbonded_ff(pos, pbc, cell, istate.term_dict)
-            ham[i, i] = en + en_nb
-            state_forces[i] = fr + fr_nb
+            ham[i, i] = en
+            state_forces[i] = fr
 
         # fill off-diagonal
         fham = np.zeros((nstates, nstates) + pos.shape)
@@ -67,9 +71,12 @@ class EVBSystem:
                 ham[j, i] = hij
 
                 # gradient of H_ij = sqrt((1+h)*H_ii*H_jj) via chain rule
+                # H_ij = sign * sqrt(|hprod|), so the chain rule carries the
+                # sign of hprod onto *both* terms, not just the first.  Inert
+                # while H_ii and H_jj share a sign, wrong when they do not.
                 if hii != 0.0 and hjj != 0.0:
-                    fij = (
-                        np.sign(hprod) * (hij / (2 * hii)) * state_forces[i]
+                    fij = np.sign(hprod) * (
+                        (hij / (2 * hii)) * state_forces[i]
                         + (hij / (2 * hjj)) * state_forces[j]
                     )
                 else:
@@ -85,9 +92,21 @@ class EVBSystem:
         energy = np.einsum("i,ij,j->", statevec, ham, statevec)
         forces = np.einsum("i,ijnd,j->nd", statevec, fham, statevec)
 
+        # Topology-independent electrostatics, added once on top of the ground
+        # state.  Every state carries the same `atom` terms, so state 0's
+        # term_dict is representative; a state with no terms at all (a fully
+        # dissociated topology) would carry none, hence the search.
+        en_nb, fr_nb = 0.0, np.zeros_like(pos)
+        for state in self.states:
+            if state.term_dict:
+                en_nb, fr_nb = self.nonbonded_ff(pos, pbc, cell, state.term_dict)
+                break
+
         results: dict[str, Any] = {
-            "energy": energy,
-            "forces": forces,
+            "energy": energy + en_nb,
+            "forces": forces + fr_nb,
+            "energy_bonded": energy,
+            "energy_nonbonded": en_nb,
             "statevec": statevecsq,
         }
         return results

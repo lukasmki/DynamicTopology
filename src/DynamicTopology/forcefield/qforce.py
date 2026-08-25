@@ -2,6 +2,24 @@ import numpy as np
 from ase import units
 from typing import Callable
 
+# Decay rate of the Morse shape term, `c * s**3 * exp(-SHAPE_DECAY * s)`.
+#
+# Fixed, not fitted: it sets *where* the correction acts, and that is a property
+# of the chemistry rather than of any one bond.  The textbook Hulburt-
+# Hirschfelder value is 2, which puts the peak at `s = 1.5`.  Measured across the
+# nineteen HCombustion transition states, the most-stretched bond of a reactant
+# diabat sits at a median `s` of 0.64 -- so at 2 the correction delivers only 9%
+# of `D` where reactions actually happen, having spent its strength on
+# geometries nothing visits.
+#
+# At 4 the peak lands at `s = 0.75`, next to that median, and the available
+# correction there is 39% of `D` -- four times as much, for the same one
+# parameter.  It also relaxes the monotonicity limit on `c` (see
+# `fit.dissociation.DEFAULT_MAX_SHAPE`) from 1.31 to 19.3, because the Morse
+# repulsion now outruns the correction much sooner.  Sweeping 2/3/4/5/6, the
+# delivered correction peaks at 4 and falls off either side.
+SHAPE_DECAY: float = 4.0
+
 
 class QForce:
     """Bonded force field.  Works internally in nm and kJ/mol, converts to ASE
@@ -67,17 +85,48 @@ class QForce:
         """
         np.add.at(f, atoms_col, grad)
 
-    def compute_bond(self, vecs, atoms, D, r0, k):
+    def compute_bond(self, vecs, atoms, D, r0, k, c=0.0):
         if self.bond_form == "morse":
-            return self._bond_morse(vecs, atoms, D, r0, k)
+            return self._bond_morse(vecs, atoms, D, r0, k, c)
         return self._bond_harmonic(vecs, atoms, D, r0, k)
 
-    def _bond_morse(self, vecs, atoms, D, r0, k):
-        """Morse potential, E = D*(1 - exp(-a*dr))**2 - D.
+    def _bond_morse(self, vecs, atoms, D, r0, k, c=0.0):
+        """Morse with a one-sided Hulburt-Hirschfelder shape term.
 
-        The -D offset puts the dissociated limit at zero, so a topology's
+            s = a*max(dr, 0),  a = sqrt(k / 2D)
+            E = D * [ (1 - exp(-a*dr))**2 - 1 + c * s**3 * exp(-b*s) ]
+
+        The `-D` offset puts the dissociated limit at zero, so a topology's
         energy carries the depth of the bonds it contains and breaking a bond
-        costs +D rather than nothing.
+        costs `+D` rather than nothing.
+
+        **Why the third parameter exists.**  Plain Morse (`c = 0`) is exact at
+        the minimum and at dissociation and has nothing left over in between:
+        `D` is pinned by the atomization energy, `r0` by the geometry, and `k`
+        by the vibrational frequency.  It came out 0.55-1.83 eV too deep at the
+        stretched geometries where reactions happen, which put every reference
+        barrier *above* both diabats -- and `fit_amplitude` has a real root only
+        below both, so eighteen of nineteen coupling channels could not be fitted
+        at all.  Buying the depth back by inflating `k` works and costs the
+        frequency: reaching even 17 of 19 needed H2 at 12402 cm^-1 against an
+        experimental 4401, and no force constant whatever reached 18.
+
+        `c` is the freedom that has no other job.  The correction is `O(s**3)`,
+        so it vanishes to second order at `dr = 0` and leaves `D`, `r0` and the
+        curvature -- hence the frequency -- exactly as they were, and it decays
+        to zero, so the dissociation limit is untouched too.  `c = 0` is plain
+        Morse, which is what every term file that predates this reads as.
+
+        `b` is `SHAPE_DECAY`, fixed rather than fitted; see its comment for why
+        it is 4 and not the textbook 2.
+
+        **Why it is one-sided.**  `s**3 * exp(-b*s)` continued to `dr < 0` grows
+        without bound against a repulsive wall that only grows like
+        `exp(-2a*dr)`, so the compressed branch would turn over and run to minus
+        infinity -- an atom pushed hard enough would fall through the nucleus.
+        Clamping at `dr = 0` costs nothing in smoothness precisely because the
+        term is cubic there: value, slope and curvature are all zero, so the
+        join is C2 and the forces never see it.
         """
         v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3)  vec from atom0->atom1
         r = np.sqrt(np.sum(v * v, -1))  # (n,)
@@ -85,10 +134,18 @@ class QForce:
         al = np.sqrt(k / (2 * D))  # (n,)  1/nm
         exp_term = np.exp(-al * dr)  # (n,)
         e = D * (1 - exp_term) ** 2 - D
-        e_tot = np.sum(e)
-
         # dE/dr  =  2*D*(1 - exp)*al*exp
         de_dr = 2 * D * (1 - exp_term) * al * exp_term  # (n,)
+
+        # Stretched branch only; `np.maximum` rather than a mask so that the
+        # zero-`c` case stays a single vectorised expression.
+        s = al * np.maximum(dr, 0.0)  # (n,)
+        decay = np.exp(-SHAPE_DECAY * s)
+        e = e + D * c * s * s * s * decay
+        # d/ds [s**3 exp(-b s)] = (3 s**2 - b s**3) exp(-b s),  ds/dr = al (or 0)
+        de_dr = de_dr + D * c * al * s * s * (3.0 - SHAPE_DECAY * s) * decay
+
+        e_tot = np.sum(e)
         # dr/dv = v/r,  v = pos_atom1 - pos_atom0
         dv = (de_dr / r)[:, None] * v  # (n, 3)
 

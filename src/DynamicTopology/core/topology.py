@@ -8,6 +8,21 @@ from molify import ase2networkx
 from .types import Term
 
 
+# Bond perception cutoff as a multiple of the summed covalent radii.
+#
+# `molify`'s default of 1.2 puts the H-H cutoff at 1.2 * 2 * 0.31 = 0.7440 A,
+# and equilibrium H2 is 0.7445 A -- outside it by 5e-4 A.  Every H2 at or beyond
+# its own bond length therefore perceived as two free atoms: the 100-molecule
+# H2/O2 box in tests/data came out with 50 bonds and 150 fragments instead of
+# 100 and 100, and a plain .xyz of H2 scored 0.0 eV against a reference of
+# -4.6701.  It stayed hidden because every file in the repo carries an explicit
+# `connectivity` list, which perception prefers.
+#
+# 1.25 already recovers that box exactly and 1.35 still fuses nothing, so 1.3 is
+# the middle of the plateau rather than either edge of it.
+BOND_SCALE: float = 1.3
+
+
 class Topology:
     def __init__(
         self,
@@ -101,7 +116,24 @@ class Topology:
         # convert to numpy
         for term_type, term_data in term_dict.items():
             term_data["atoms"] = np.array(term_data["atoms"])
+            count = len(term_data["atoms"])
             for arg, vals in term_data["kwargs"].items():
+                # Every term of a type must state the same parameters, because
+                # this layout is column-oriented: a key that only some terms
+                # carry produces a short column silently misaligned against the
+                # others.  It became reachable when `bond` gained the optional
+                # Hulburt-Hirschfelder `c` -- merging a refitted template with
+                # one that predates it puts both kinds in a single `term_dict`.
+                # Caught here rather than in the force field, where it surfaces
+                # as an unattributable broadcasting error.
+                if len(vals) != count:
+                    raise ValueError(
+                        f"{count} `{term_type}` terms but only {len(vals)} state "
+                        f"`{arg}`. The term list mixes templates that disagree "
+                        f"about which parameters a `{term_type}` has; refit them "
+                        "together, or give the ones that omit it an explicit "
+                        "default."
+                    )
                 term_data["kwargs"][arg] = np.array(vals)
 
         self.term_dict = term_dict
@@ -128,8 +160,18 @@ class Topology:
         return self.__class__(graph, self.atoms.copy(), terms)
 
     @classmethod
-    def from_atoms(cls, atoms: Atoms) -> "Topology":
-        graph = ase2networkx(atoms, False)
+    def from_atoms(cls, atoms: Atoms, scale: float = BOND_SCALE) -> "Topology":
+        """Perceive bonds from geometry, unless `atoms` states its own.
+
+        `ase2networkx` prefers an explicit `info["connectivity"]` and only falls
+        back to distance cutoffs, so `scale` matters exactly for the frames that
+        carry no connectivity -- a trajectory, or any plain `.xyz`.
+
+        Periodicity is read off `atoms` rather than assumed.  It used to be
+        passed positionally as `False`, which silently split every molecule
+        straddling a boundary in a packed box into two fragments.
+        """
+        graph = ase2networkx(atoms, pbc=bool(atoms.pbc.any()), scale=scale)
         for _, node_data in graph.nodes(data=True):
             node_data.pop("position", None)
             node_data.pop("charge", None)

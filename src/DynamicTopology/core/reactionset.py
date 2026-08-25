@@ -38,6 +38,60 @@ class ReactionSet:
         if path:
             self.load(path)
 
+    def _unknown_molecule_message(self, mol: Topology) -> str:
+        """Say which species was perceived, and what it is nearest to.
+
+        The bare repr of a `Topology` names a node and edge count and nothing
+        else, which is not enough to tell a missing template from a
+        misperceived geometry -- and the common cause is the latter.  A
+        transition state is the sharpest example: `rxn_04`'s own stored TS frame
+        perceives as H-O-H-O, a hydrogen sitting 1.16 A from one oxygen and 1.16
+        A from the other, which is not a molecule any database can hold because
+        it is not a molecule.  Naming the nearest known species by how many
+        bonds separate them is what distinguishes "you are one bond from water"
+        from "this element combination is genuinely absent".
+        """
+        elements = [
+            mol.graph.nodes[node]["atomic_number"] for node in mol.graph.nodes()
+        ]
+        formula = Atoms(numbers=elements).get_chemical_formula()
+        bonds = sorted(sorted(edge) for edge in mol.graph.edges())
+
+        # Nearest by edge-set difference among the templates with the same
+        # multiset of elements; anything else is not a rearrangement of this.
+        neighbours: list[tuple[int, str]] = []
+        for template in self.data["molecules"].values():
+            template_elements = [
+                template.graph.nodes[node]["atomic_number"]
+                for node in template.graph.nodes()
+            ]
+            if sorted(template_elements) != sorted(elements):
+                continue
+            neighbours.append(
+                (
+                    abs(template.graph.number_of_edges() - mol.graph.number_of_edges()),
+                    f"{Atoms(numbers=template_elements).get_chemical_formula()} "
+                    f"with bonds "
+                    f"{sorted(sorted(e) for e in template.graph.edges())}",
+                )
+            )
+        nearest = (
+            min(neighbours)[1]
+            if neighbours
+            else "nothing in the database has this element composition"
+        )
+
+        return (
+            f"perceived the molecule {formula} with bonds {bonds}, which is not "
+            f"in the ReactionSet. Nearest known species: {nearest}. A geometry "
+            "part-way through a reaction perceives as a bridged species that is "
+            "neither the reactant nor the product and has no diabatic template "
+            "by construction -- if this frame is a transition state, score it "
+            "under an endpoint's connectivity instead (see "
+            "`fit.dissociation.diabatic_energy`). Otherwise the species is "
+            "genuinely missing and belongs in the dataset manifest."
+        )
+
     @staticmethod
     def _molecule_signature(molecule: Topology) -> tuple[tuple, tuple]:
         """Exact identity of a molecule as it sits in the live system.
@@ -269,7 +323,7 @@ class ReactionSet:
             mol_hash = self.hash_molecule(mol)
             mol_data: Topology = self.data["molecules"].get(mol_hash)
             if mol_data is None:
-                raise ValueError(f"Molecule {mol} not found in ReactionSet")
+                raise ValueError(self._unknown_molecule_message(mol))
 
             # map force field template to global indices
             matcher = nx.isomorphism.GraphMatcher(
@@ -324,7 +378,9 @@ class ReactionSet:
                     continue
 
                 # cache combined topology hash to avoid repeated nx.union + WL hash
-                pair_key = frozenset({self.hash_molecule(imol), self.hash_molecule(jmol)})
+                pair_key = frozenset(
+                    {self.hash_molecule(imol), self.hash_molecule(jmol)}
+                )
                 if pair_key not in self._bimol_hash_cache:
                     ijmol = Topology.from_molecules([imol, jmol], False)
                     self._bimol_hash_cache[pair_key] = self.hash_molecule(ijmol)

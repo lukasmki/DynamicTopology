@@ -123,6 +123,7 @@ class System:
                     "basis_size": block.nstates,
                     "depth": block.depth,
                     "capped": block.capped,
+                    "min_switch": block.min_switch,
                     "placeholder_channels": block.placeholder_channels,
                 }
             )

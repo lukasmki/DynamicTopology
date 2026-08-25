@@ -39,6 +39,13 @@ logger: logging.Logger = logging.getLogger(__name__)
 # Coupling considered switched off at this magnitude (eV).
 DEFAULT_EPS: float = 1e-3
 
+# Stand-in amplitude used to give a decoupled channel a finite width.  A zero
+# amplitude has no width -- the condition `|V| <= eps` at the endpoints is
+# satisfied everywhere -- but writing a nonsense number would make the term
+# unreadable if someone later fills the amplitude in by hand.  1 eV is a
+# plausible coupling, so the stored width stays meaningful.
+NOMINAL_AMPLITUDE: float = 1.0
+
 
 class CouplingFitError(ValueError):
     """Raised when the reference data cannot define a real coupling."""
@@ -67,7 +74,11 @@ def fit_width(frames: list[Atoms], amplitude: float, eps: float = DEFAULT_EPS) -
             "an endpoint coincides with the transition state, so no width can "
             "switch the coupling off there"
         )
-    return float(np.log(abs(amplitude) / eps) / nearest**2)
+    # A decoupled channel is off at every geometry, so every width satisfies the
+    # condition and `log(0)` is the arithmetic saying so.  Report the width a
+    # plausible amplitude would have needed instead.
+    magnitude = abs(amplitude) if amplitude != 0.0 else NOMINAL_AMPLITUDE
+    return float(np.log(magnitude / eps) / nearest**2)
 
 
 def fit_amplitude(
@@ -128,7 +139,9 @@ def fit_coupling(
             free-atom zero.  Required to fit the amplitude; combined with the
             reference energy carried by the TS frame.
         amplitude: use this amplitude instead of fitting one.  Needed while a
-            dataset has geometries but no reference energies.
+            dataset has geometries but no reference energies.  Pass `0.0` to
+            decouple the channel outright, which is what an unfittable barrier
+            gets: no stabilization, so the state never enters an EVB basis.
         eps: coupling magnitude (eV) considered switched off at the endpoints.
 
     Returns:
@@ -146,7 +159,16 @@ def fit_coupling(
     # be inverted.  Recording which is which lets the EVB report the channels a
     # basis was built on unfitted couplings, instead of inferring it from a
     # magic amplitude value.
-    provenance = "placeholder" if amplitude is not None else "fitted"
+    #
+    # Zero is the honest stand-in and the default one: it contributes no
+    # stabilization, so `EVBBasis` never admits the state at all, where a large
+    # placeholder would drive the Hamiltonian with a number nobody fitted.
+    if amplitude is None:
+        provenance = "fitted"
+    elif amplitude == 0.0:
+        provenance = "decoupled"
+    else:
+        provenance = "placeholder"
 
     if amplitude is None:
         if diabatic_energies is None:

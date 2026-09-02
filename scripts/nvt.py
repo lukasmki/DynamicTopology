@@ -42,15 +42,23 @@ DEFAULT_TEMPERATURE = 2000.0  # K
 DEFAULT_FRICTION = 0.01  # 1/fs
 DEFAULT_INTERVAL = 5  # steps between trajectory frames
 
-# 0.5 fs was comfortable against q-force's force constants.  The refit
-# (`fit.dissociation`) took the H-H stretch to 5282 cm^-1 -- a 6.3 fs period, so
-# 0.5 fs is ~13 steps per period.  Fine at 2000 K; halve it at 3000 K, and halve
-# it again if a run heats up without a reaction to explain it.
+# The timestep follows from the fastest mode on the surface, and nothing else:
+# velocity Verlet wants roughly 15 steps per vibrational period, so
 #
-# Most of the depth the diabats needed comes from the Morse shape parameter `c`,
-# which is O(dr**3) at the minimum and so costs no frequency at all.  Without it
-# the same channel count needed 3.3x in force constant, or H2 at 12402 cm^-1,
-# and a timestep to match.
+#     dt_max [fs]  =  33356 / (15 * nu [cm^-1])
+#
+# Check it against the fit's report, which prints the fastest mode and this
+# quotient directly -- `scripts/fit.py --force-constants` ends with a
+# "fastest mode ... -> N fs at 15 steps/period" line.  Do not carry a timestep
+# across a refit without re-reading it; a refit moves the frequencies by
+# factors of two to four and this number with them.
+#
+# The trap, recorded because it cost the production sweep a factor of ten: the
+# `k`-scale the fit reports is *not* the frequency cost.  It is bounded at 1.41x
+# while the surface it produced carried an 11735 cm^-1 mode -- a 2.84 fs period,
+# so 0.19 fs -- because most of the stiffness came from the repulsion's own
+# curvature and from the shape term at a displaced `r0`, neither of which the
+# `k`-scale knows about.
 DEFAULT_TIMESTEP = 0.5  # fs
 
 
@@ -255,6 +263,7 @@ def main() -> int:
                 {
                     "energy_bonded": float(diagnostics["energy_bonded"]),
                     "energy_nonbonded": float(diagnostics["energy_nonbonded"]),
+                    "energy_zbl": float(diagnostics["energy_zbl"]),
                     "topology_changed": bool(diagnostics["topology_changed"]),
                     "nblocks": len(blocks),
                     "max_nstates": max((b["nstates"] for b in blocks), default=0),

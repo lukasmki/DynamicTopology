@@ -322,14 +322,19 @@ class TestCutoffContinuity:
     def test_energy_is_continuous_across_the_bimolecular_cutoff(
         self, reaction_set, templates
     ):
-        # A spectator O2 is walked away from a reacting fragment.  Below the
-        # cutoff it joins that subnetwork and its dissociation channel enters the
-        # same matrix; above it, it becomes an independent subnetwork.  The
-        # geometry change per step is negligible either side of the boundary.
+        # A spectator H2 is walked away from a reacting fragment.  Below the
+        # cutoff it joins that subnetwork and its channels enter the same
+        # matrix; above it, it becomes an independent subnetwork.  The geometry
+        # change per step is negligible either side of the boundary.
+        #
+        # H2 rather than O2: the reacting fragment is H2O2, and no channel in
+        # the dataset pairs it with O2 at all, so an O2 spectator crosses the
+        # cutoff without the applicable set ever changing and the scan measures
+        # nothing.  The count assertion in the next test is what caught that.
         reacting = reactive()
         energies, separations = [], []
         for dx in np.arange(3.80, 4.35, 0.05):
-            atoms = with_spectator(reacting, templates["O2"].atoms, dx)
+            atoms = with_spectator(reacting, templates["H2"].atoms, dx)
             energies.append(calculate(atoms, reaction_set)["energy"])
             positions = atoms.positions
             separations.append(
@@ -352,6 +357,80 @@ class TestCutoffContinuity:
             f"separations {separations[worst]:.3f} and {separations[worst + 1]:.3f} A "
             f"(cutoff {BIMOL_CUTOFF} A)"
         )
+
+    def test_the_repulsion_does_not_move_at_the_cutoff(self, reaction_set, templates):
+        """The repulsion is the same number on both sides of the applicable set.
+
+        `bimol_cutoff` decides which reactions are applicable, and therefore how
+        many diabatic states a block has.  A repulsion that knew about the
+        topology would change shape exactly there, and every previous version of
+        this term did: a boolean-on-applicability rule stepped by the whole
+        wall, and the pair potential had to be switched off by `bimol_cutoff` to
+        make the step cost anything less than that.  `ZBL` takes no topology at
+        all, so the set can change however it likes and the number does not move
+        -- and `pair_potential` needs no cutoff, which is why it does not have
+        one.
+
+        Asserted as exact equality rather than as a tolerance, because that is
+        what topology-independence means.  The count assertion is what stops it
+        from being vacuously true of a scan where the set never changed.
+        """
+        from DynamicTopology.core import Topology
+
+        reacting = reactive()
+        repulsions, counts, separations = [], [], []
+        for dx in np.arange(3.88, 4.00, 0.005):
+            atoms = with_spectator(reacting, templates["H2"].atoms, dx)
+            state = Topology.from_atoms(atoms)
+            state.set_atoms(atoms)
+            repulsions.append(
+                System(atoms, state, reaction_set).calculate()["energy_zbl"]
+            )
+            counts.append(
+                sum(
+                    1 for _ in reaction_set.get_network(state, BIMOL_CUTOFF).reactions()
+                )
+            )
+            positions = atoms.positions
+            separations.append(
+                min(
+                    np.linalg.norm(positions[i] - positions[j])
+                    for i in range(len(reacting))
+                    for j in range(len(reacting), len(atoms))
+                )
+            )
+
+        assert separations[0] < BIMOL_CUTOFF < separations[-1], (
+            "the scan must straddle the cutoff for this test to mean anything; "
+            f"got {separations[0]:.3f} to {separations[-1]:.3f} A"
+        )
+        assert len(set(counts)) > 1, (
+            f"no step in the scan changed the applicable set; counts were {counts}"
+        )
+        assert repulsions[0] > 1.0, (
+            "the repulsion is negligible throughout, so a scan of it cannot show "
+            "whether the applicable set moves it"
+        )
+
+        # The spectator is *moving* along this scan, so the repulsion is
+        # supposed to change -- it is a function of the geometry.  What it must
+        # not do is change *differently* where the applicable set changes.  So
+        # the step at each boundary is compared against the steps where nothing
+        # changed, rather than against zero.
+        steps = np.abs(np.diff(repulsions))
+        boundaries = [i for i in range(len(counts) - 1) if counts[i] != counts[i + 1]]
+        interior = [s for i, s in enumerate(steps) if i not in boundaries]
+        assert interior, "the applicable set changed at every step; nothing to compare"
+
+        for i in boundaries:
+            assert steps[i] <= 2.0 * max(interior), (
+                f"the repulsion stepped by {steps[i]:.3e} eV as the applicable "
+                f"set changed from {counts[i]} reactions to {counts[i + 1]}, "
+                f"against {max(interior):.3e} eV for the largest step where it "
+                f"did not, between separations {separations[i]:.4f} and "
+                f"{separations[i + 1]:.4f} A. It has acquired a topology "
+                "dependence."
+            )
 
 
 class TestPermutationInvariance:

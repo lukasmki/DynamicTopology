@@ -42,7 +42,9 @@ def summarize(results: dict) -> None:
     print(f"max depth reached   {max(block['depth'] for block in blocks)}")
     print(f"blocks capped       {sum(block['capped'] for block in blocks)}")
 
-    placeholders = sorted({c for block in blocks for c in block["placeholder_channels"]})
+    placeholders = sorted(
+        {c for block in blocks for c in block["placeholder_channels"]}
+    )
     print(f"placeholder channels {len(placeholders)}")
     for channel in placeholders:
         print(f"    {channel}")
@@ -50,10 +52,16 @@ def summarize(results: dict) -> None:
 
 def main() -> None:
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("-i", "--input", type=Path, default="tests/data/mix-n100-d30.xyz")
-    parser.add_argument("-r", "--rnet", type=Path, default="datasets/HCombustion/HCombustion.json")
+    parser.add_argument(
+        "-i", "--input", type=Path, default="tests/data/mix-n100-d30.xyz"
+    )
+    parser.add_argument(
+        "-r", "--rnet", type=Path, default="datasets/HCombustion/HCombustion.json"
+    )
     parser.add_argument("-n", "--repeats", type=int, default=5)
-    parser.add_argument("--eps", type=float, default=None, help="Override the admission threshold.")
+    parser.add_argument(
+        "--eps", type=float, default=None, help="Override the admission threshold."
+    )
     args = parser.parse_args()
 
     atoms = io.read(args.input, index=0)
@@ -63,8 +71,10 @@ def main() -> None:
     if args.eps is not None:
         system.basis.eps = args.eps
 
-    print(f"{len(atoms)} atoms, eps = {system.basis.eps:g}, "
-          f"max_states = {system.basis.max_states}")
+    print(
+        f"{len(atoms)} atoms, eps = {system.basis.eps:g}, "
+        f"max_states = {system.basis.max_states}"
+    )
     summarize(system.calculate())  # also warms the ReactionSet caches
 
     start = time.perf_counter()

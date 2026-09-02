@@ -14,6 +14,28 @@ The two fits here are nested and each has one thing it must never give up:
   the test that matters most is the vacuity check: with the frequency frozen it
   must report no progress at all.  A fit that improves without freedom is
   reporting something other than what it did.
+
+**Open: this file is slow, and only in company.**  Every test here passes, and
+the file on its own finishes.  So does the rest of the suite -- 158 tests in 33
+seconds.  Run together they take tens of minutes on an idle machine, which is an
+order of magnitude more than the sum of the parts.
+
+Three things it is *not*, each measured rather than reasoned about:
+
+  * Not the search budget.  A `mode="shape"` fit converges on `xtol`/`ftol` at
+    1219 evaluations and about fifty seconds -- under its own `maxfev`, so there
+    is nothing to cap.  See the comment on the `minimize` call in
+    `fit.dissociation.fit_force_constants` for the sweep.
+  * Not the cost of an objective evaluation.  A full refit of every template is
+    26 ms and a full `reaction_margins` pass is 13 ms, neither depending on the
+    shape parameter.
+  * Not machine contention.  Confirmed with nothing else running.
+
+That leaves an interaction between this file and the others, and the obvious
+suspect is the one piece of shared mutable state: `fit_force_constants` mutates
+the `ReactionSet` it is handed -- deliberately, so `scripts/fit.py --dry-run`
+can fit couplings against refitted diabats -- and other modules hold their own
+`ReactionSet` fixtures.  Unverified.  Look there first.
 """
 
 import json
@@ -32,6 +54,7 @@ from DynamicTopology.fit.coupling import (
 )
 from DynamicTopology.fit.dissociation import (
     DEFAULT_MAX_SHAPE,
+    bond_curvatures,
     bond_types,
     bonded_energy,
     fit_dissociation_energies,
@@ -40,6 +63,9 @@ from DynamicTopology.fit.dissociation import (
     reaction_margins,
     scale_force_constants,
     set_shape_parameters,
+    stretch_curvatures,
+    total_wavenumber,
+    wavenumber,
 )
 from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.qforce import QForce
@@ -236,9 +262,18 @@ class TestForceConstantFit:
         `scripts/fit.py --force-constants --dry-run` depends on this: it fits
         couplings against the refitted diabats without writing anything, which is
         what makes a parameter sweep possible at all.
+
+        `mode="k"` rather than the default, and for a runtime reason worth
+        writing down.  What this asserts -- that the mutation happened -- is the
+        same in every mode, but `mode="both"` searches twice as many variables,
+        and once the templates on disk already satisfy every margin the hinge is
+        flat and Powell spends its whole 200-iteration budget trading the
+        regularizer against the geometry penalty for nothing.  Measured: 22
+        seconds in `k`, over an hour in `both`, with the same assertion passing.
+        The offline `scripts/fit.py` can afford that; a test cannot.
         """
         reaction_set = ReactionSet(RSET_PATH)
-        fit = fit_force_constants(reaction_set, templates, reactions)
+        fit = fit_force_constants(reaction_set, templates, reactions, mode="k")
         assert reaction_margins(reaction_set, reactions) == pytest.approx(fit.margins)
 
     def test_frequency_is_a_wavenumber(self):
@@ -294,11 +329,19 @@ class TestDecoupledChannels:
 class TestMorseShape:
     """The Hulburt-Hirschfelder term `c`, and the two things it must not break.
 
-    `c` earns its place only if it is free: the whole reason for preferring it
-    over stiffening the bonds is that `D`, `r0` and the curvature -- and so the
-    vibrational frequency -- come through untouched.  That is an exact algebraic
-    claim about an `O(dr**3)` correction, so it is testable exactly rather than
-    to a tolerance someone picked.
+    `D`, `r0` and the curvature *at `r0`* come through untouched.  That is an
+    exact algebraic claim about an `O(dr**3)` correction, so it is testable
+    exactly rather than to a tolerance someone picked, and the tests below
+    evaluate it at `r0` for that reason.
+
+    **What this class does not say, and used to imply.**  It said `c` "is free"
+    and that the frequency comes through untouched, full stop.  That reading
+    held only while `r0` was where the bond sat.  `fit_bond_lengths` now
+    displaces `r0` inside the reference bond length so the Morse can lean
+    against the repulsion, and away from `r0` this term is the largest single
+    contribution to the stiffness of most of HCombustion's bonds.  See
+    `TestStretchCurvature` below, which measures it, and
+    `fit.dissociation._bonded_curvature`.
     """
 
     D, R0, K = 436.0, 0.07772, 251200.0
@@ -421,3 +464,116 @@ class TestMorseShape:
                         "the shape fit moved a force constant, which is the one "
                         "thing it exists to avoid"
                     )
+
+
+class TestStretchCurvature:
+    """The stiffness the integrator sees, and the cheap stand-in for it.
+
+    The timestep follows from the fastest mode and nothing else, so the fit has
+    to be able to price a wavenumber -- which means computing one inside an
+    objective that runs to five figures of evaluations.  `bond_curvatures` is
+    the honest measurement and costs two assembled force calls per bond;
+    `stretch_curvatures` is the analytic-plus-cached stand-in the objective
+    actually calls.  These hold them against each other.
+    """
+
+    # Largest disagreement, in eV/A**2, permitted on a bond whose displaced atom
+    # carries no other bond.  Those rows agree to about 0.04 -- the residual is
+    # the finite-difference step in `bond_curvatures`, not a modelling gap -- so
+    # 0.5 is an order of magnitude of headroom and still an order of magnitude
+    # under the one row that genuinely differs.
+    SIMPLE_TOLERANCE = 0.5
+
+    def test_the_cheap_curvature_matches_the_measured_one(self, templates):
+        """Everywhere the stand-in claims to be exact, it is.
+
+        Excludes the one bond type it does not model: `bond_curvatures`
+        displaces atom `j` along the `ij` axis and so picks up every term that
+        touches `j`, while `stretch_curvatures` takes the bond's own Morse and
+        the nonbonded terms and stops.  H2O2's O-O is the only bond in
+        HCombustion whose displaced atom carries both another bond and a
+        dihedral, and it is checked separately below rather than waved through
+        by a tolerance wide enough to hide it.
+        """
+        errors = {}
+        for name, atoms, terms in templates:
+            measured = bond_curvatures(atoms, terms)
+            cheap = stretch_curvatures(atoms, terms)
+            assert len(measured) == len(cheap)
+            for index, (a, b) in enumerate(zip(measured, cheap)):
+                if (name, index) == ("mol_06", 0):  # H2O2 O-O; see below
+                    continue
+                if abs(a - b) > self.SIMPLE_TOLERANCE:
+                    errors[f"{name}[{index}]"] = (
+                        f"bond_curvatures {a:.4f}, stretch_curvatures {b:.4f}, "
+                        f"difference {a - b:+.4f} eV/A**2"
+                    )
+        assert not errors, (
+            "the objective's curvature no longer matches the measured one:\n  "
+            + "\n  ".join(f"{k}: {v}" for k, v in sorted(errors.items()))
+        )
+
+    def test_the_one_bond_the_stand_in_does_not_model_is_the_expected_one(
+        self, templates
+    ):
+        """Anti-vacuity, and it guards a real limit rather than a number.
+
+        If some refactor made `stretch_curvatures` pick up the neighbouring
+        bond and dihedral terms as well, the test above would keep passing while
+        this one failed -- and that would be worth knowing, because it would
+        mean the cheap path had quietly become the expensive one.  Asserted as a
+        band rather than a value: the gap is ~22 eV/A**2 on the shipped
+        parameters, of which ~16 is the O-H Morse on the moved oxygen and ~6 the
+        angle and dihedral terms, and it moves when the fit moves.
+        """
+        name, atoms, terms = next(t for t in templates if t[0] == "mol_06")
+        gap = bond_curvatures(atoms, terms)[0] - stretch_curvatures(atoms, terms)[0]
+        assert 1.0 < gap < 100.0, (
+            f"H2O2's O-O stand-in is off by {gap:+.3f} eV/A**2. It is supposed "
+            "to be off, by roughly 22 -- the terms on the displaced oxygen that "
+            "`stretch_curvatures` does not model. A gap near zero means it now "
+            "models them and is no longer the cheap path; a large one means "
+            "something else changed."
+        )
+
+    def test_the_cap_binds_on_the_modes_that_set_the_timestep(self, templates):
+        """The rows the stand-in is exact on are the rows the cap acts on.
+
+        The whole argument for using an approximation inside the objective is
+        that it is exact where it matters: the cap binds on X-H stretches, which
+        are the fast modes, and the row it is inexact on is a heavy-atom mode
+        far below any cap worth setting.  If a refit ever brought H2O2's O-O up
+        near the cap, that reasoning would lapse silently.
+        """
+        for name, atoms, terms in templates:
+            if name != "mol_06":
+                continue
+            oxygen_oxygen = stretch_curvatures(atoms, terms)[0]
+            assert total_wavenumber(oxygen_oxygen, 15.999, 15.999) < 3500.0, (
+                "H2O2's O-O has come up near the wavenumber cap, and it is the "
+                "one bond type the objective's curvature is inexact on. Either "
+                "cap it with `bond_curvatures` or re-derive the approximation."
+            )
+
+    def test_the_two_wavenumber_entry_points_agree(self):
+        """`wavenumber` takes the reduction the objective precomputed."""
+        for mass_a, mass_b, curvature in [
+            (1.008, 1.008, 33.89),
+            (15.999, 1.008, 68.48),
+            (15.999, 15.999, 139.72),
+        ]:
+            reduced = mass_a * mass_b / (mass_a + mass_b)
+            assert wavenumber(curvature, reduced) == pytest.approx(
+                total_wavenumber(curvature, mass_a, mass_b), rel=1e-12
+            )
+
+    def test_a_bond_that_is_not_at_a_minimum_has_no_wavenumber(self):
+        """Negative curvature must not reach `sqrt`.
+
+        The objective evaluates this at every point Powell tries, including ones
+        where a bond type's total curvature has gone negative.  A NaN there
+        propagates into the objective and Powell follows it somewhere arbitrary,
+        which is a failure mode with no symptom other than a bad answer.
+        """
+        assert wavenumber(-10.0, 1.0) == 0.0
+        assert total_wavenumber(0.0, 1.008, 1.008) == 0.0

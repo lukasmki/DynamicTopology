@@ -113,9 +113,18 @@ class QForce:
 
         `c` is the freedom that has no other job.  The correction is `O(s**3)`,
         so it vanishes to second order at `dr = 0` and leaves `D`, `r0` and the
-        curvature -- hence the frequency -- exactly as they were, and it decays
-        to zero, so the dissociation limit is untouched too.  `c = 0` is plain
-        Morse, which is what every term file that predates this reads as.
+        curvature there exactly as they were, and it decays to zero, so the
+        dissociation limit is untouched too.  `c = 0` is plain Morse, which is
+        what every term file that predates this reads as.
+
+        **That is a statement about `dr = 0`, not about the molecule.**  It was
+        read as "the shape term is free of frequency" for as long as `r0` was
+        where the bond sat.  It is not: `fit.dissociation.fit_bond_lengths` now
+        displaces `r0` inside the reference bond length so the Morse can lean
+        against the repulsion, and this term's second derivative at that
+        displacement, `D c a**2 (6s - 6b s**2 + b**2 s**3) exp(-b s)`, is the
+        largest single contribution to the stiffness of most of HCombustion's
+        bonds.  See `fit.dissociation._bonded_curvature`.
 
         `b` is `SHAPE_DECAY`, fixed rather than fitted; see its comment for why
         it is 4 and not the textbook 2.
@@ -187,6 +196,54 @@ class QForce:
         supply, so it is small and Morse carries the physics.
         """
         return np.sum(E0), np.zeros((vecs.shape[0], 3))
+
+    def compute_exclusion(self, vecs, atoms, sigma, eps):
+        """Cancels the global Lennard-Jones term between near neighbours.
+
+        **Dormant.**  The repulsion is `forcefield/zbl.py`, which has no
+        exclusions, and `ReactionSet.load` no longer derives `exclusion` terms --
+        so nothing in the calculator reaches this method.  It is kept because
+        `lj.with_exclusions` still builds those terms on demand, for the tests
+        that check the Lennard-Jones decomposition still holds, and because a
+        dataset shipping explicit `exclusion` terms would still be honoured.
+
+        `forcefield/lj.py` sums 12-6 over *every* pair in the system, including
+        pairs that are bonded to each other, because that sum is the same for
+        every diabatic state and can therefore be evaluated once outside the EVB.
+        What is topology-dependent is which pairs should not have been counted,
+        and that is the pairs within `lj.EXCLUSION_DEPTH` bonds of each other --
+        a per-molecule quantity, which is what makes it expressible as a term.
+
+        The functional form must match `LennardJones` exactly, combining rule
+        included, or an isolated template stops reproducing its own energy.
+        `sigma` and `eps` are therefore the already-combined pair values, worked
+        out once when the template is loaded rather than twice from different
+        code -- and the form itself comes from `lj.pair_potential` for the same
+        reason.  It was open-coded here once, and the copy silently stopped
+        matching the moment `pair_potential` gained its short-range linear
+        continuation: the two halves of the cancellation disagreed by 1609 eV on
+        an H2 template.
+        """
+        from DynamicTopology.forcefield.lj import pair_potential
+
+        v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3)  vec from atom0->atom1
+        r = np.sqrt(np.sum(v * v, -1))  # (n,)
+        # In q-force's nm, like everything else in this class.  `pair_potential`
+        # is unit-agnostic, so this half of the cancellation is the same function
+        # of the same numbers as the other half.
+        u, du_dr = pair_potential(r, sigma, eps)
+        e_tot = -np.sum(u)
+
+        # e = -u, so de_dr = -du/dr
+        de_dr = -du_dr
+        dv = (de_dr / r)[:, None] * v  # (n, 3)
+
+        n_atoms = vecs.shape[0]
+        f = np.zeros((n_atoms, 3))
+        # F = -dE/d(pos)
+        np.add.at(f, atoms[:, 0], dv)
+        np.add.at(f, atoms[:, 1], -dv)
+        return e_tot, f
 
     def compute_angle(self, vecs, atoms, theta0, k):
         va = vecs[atoms[:, 0], atoms[:, 1]]  # (n, 3)

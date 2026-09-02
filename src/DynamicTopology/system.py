@@ -14,6 +14,7 @@ from DynamicTopology.core.topology import Topology
 from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.acks2 import ACKS2
+from DynamicTopology.forcefield.zbl import ZBL
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class System:
 
         self.bonded_ff = QForce()
         self.nonbonded_ff = ACKS2()
+        self.zbl_ff = ZBL()
         self.coupling = EVBCoupling()
         self.basis = EVBBasis(reaction_set, self.bonded_ff, self.coupling)
 
@@ -137,6 +139,16 @@ class System:
         energy += en_nb
         forces += fr_nb
 
+        # ZBL over *every* pair, bonded ones included and nothing excluded.
+        # This is the term that opposes ACKS2's contact funnel; see
+        # `forcefield/zbl.py` for why it takes no topology.  Being the same
+        # number for every diabatic state of every block, adding it once here
+        # shifts each diagonal equally, which shifts the ground-state eigenvalue
+        # by exactly that constant and leaves the eigenvectors alone.
+        en_zbl, fr_zbl = self.zbl_ff(pos, self.atoms.numbers, pbc, cell)
+        energy += en_zbl
+        forces += fr_zbl
+
         # combine block topologies
         new_topo = Topology.from_molecules(final_states, remap=False)
         new_topo.set_atoms(self.atoms)
@@ -147,6 +159,7 @@ class System:
             "topology": new_topo,
             "energy_bonded": energy_bonded,
             "energy_nonbonded": en_nb,
+            "energy_zbl": en_zbl,
             "blocks": blocks,
         }
 

@@ -19,9 +19,8 @@ bonds first so that they are; see `fit.dissociation`.
 
 Three routes, and they are not equivalent:
 
-  --fit-mode shape  fits the Morse shape parameter `c`, which is O(dr**3) at the
-                    minimum and so leaves every vibrational frequency exactly
-                    alone.  13 of 19 channels, for free.
+  --fit-mode shape  fits the Morse shape parameter `c`, which is O(dr**3) at
+                    `r0`.  13 of 19 channels.
   --fit-mode k      buys the same depth by stiffening the bonds instead.  Tops
                     out at 17 of 19 and needs H2 at 12402 cm^-1 against an
                     experimental 4401 to get there; the count saturates, so a
@@ -29,7 +28,18 @@ Three routes, and they are not equivalent:
   --fit-mode both   the default.  Spends the free parameter first and the
                     minimum frequency for the rest: 18 of 19 at 1.41x.
 
-The frequency table is printed in cm^-1, where the cost is legible.
+**`--fit-mode shape` is not free, and this file said it was.**  `c` costs no
+frequency *at `r0`*, which was the same thing as "at the minimum" only while the
+bonded terms were the whole potential.  `fit_bond_lengths` ended that: `r0` is
+now pulled 0.04-0.22 A inside the reference bond length so the Morse can lean
+against the repulsion, and at that displacement the shape term is the largest
+single contribution to the stiffness -- 63 eV/A**2 of H2's 115, 509 of O2's 793,
+323 of HO's 480.  The surface it produced had an 11735 cm^-1 mode on it while
+the `k`-scale reported 1.41x.
+
+`w total` in the table below is the honest number and `--max-wavenumber` is what
+prices it; see `fit.dissociation.DEFAULT_MAX_WAVENUMBER`.  The frequency table
+is printed in cm^-1, where the cost is legible.
 """
 
 from argparse import ArgumentParser
@@ -42,10 +52,12 @@ from ase import Atoms, io
 
 from DynamicTopology.core import ReactionSet
 from DynamicTopology.fit.dissociation import (
+    DEFAULT_CURVATURE_WEIGHT,
     DEFAULT_FREQUENCY_WEIGHT,
     DEFAULT_MARGIN,
     DEFAULT_MAX_SCALE,
     DEFAULT_MAX_SHAPE,
+    DEFAULT_MAX_WAVENUMBER,
     DissociationFitError,
     bonded_energy,
     diabatic_energy,
@@ -54,6 +66,7 @@ from DynamicTopology.fit.dissociation import (
     frequency,
     install_templates,
     scale_factor,
+    total_wavenumber,
 )
 from DynamicTopology.fit.coupling import (
     DEFAULT_EPS,
@@ -64,7 +77,10 @@ from DynamicTopology.forcefield.qforce import QForce, SHAPE_DECAY
 from DynamicTopology.io.json import read_jsonl, write_jsonl
 
 # Masses used for the frequency report only, so a q-force force constant can be
-# quoted as a wavenumber.  Nothing in the force field reads them.
+# quoted as a wavenumber.  Nothing in the force field reads them.  `ase.data`
+# is where `fit.dissociation` takes them from; these agree with it to the digits
+# a wavenumber is printed to and are kept because the report also needs a
+# fallback for an element that is not in a template.
 MASSES: dict[str, float] = {"H": 1.008, "C": 12.011, "N": 14.007, "O": 15.999}
 
 
@@ -100,15 +116,24 @@ def load_reactions(
     ]
 
 
-def report_force_constants(fit) -> None:
-    """What the fit moved, and what it cost in wavenumbers."""
+def report_force_constants(fit, max_wavenumber: float = 0.0) -> None:
+    """What the fit moved, and what it cost in wavenumbers.
+
+    `w total` is the number the timestep is set by, so any row over
+    `max_wavenumber` is flagged: those are the modes that would have to be
+    integrated, and a fit that leaves one there has not bought a larger step
+    however good its margins look.
+    """
     if fit.mode in ("shape", "both"):
         print(
             f"{'bond':<22}{'c':>7}{'peak (eV)':>11}{'k scale':>9}"
-            f"{'w before':>10}{'w after':>9}{'ratio':>7}"
+            f"{'w before':>10}{'w total':>9}{'ratio':>7}  over cap"
         )
         k_scales = fit.k_scales or [1.0] * len(fit.variables)
-        for variable, shape, k_scale in zip(fit.variables, fit.scales, k_scales):
+        curvatures = fit.curvatures or [None] * len(fit.variables)
+        for variable, shape, k_scale, curvature in zip(
+            fit.variables, fit.scales, k_scales, curvatures
+        ):
             masses = [MASSES.get(element, 1.0) for element in variable.elements]
             label = f"{variable.template} {'-'.join(variable.elements)}"
             # `D * c * s**3 * exp(-b s)` is maximal at `s = 3/b`, where it is
@@ -118,20 +143,36 @@ def report_force_constants(fit) -> None:
             depth = fit.depths.get((variable.template, variable.r0, variable.k), 0.0)
             peak = (3.0 / SHAPE_DECAY) ** 3 * np.exp(-3.0) * shape * depth
             before_w = frequency(variable.k, *masses)
-            after_w = frequency(variable.k * k_scale, *masses)
+            after_w = (
+                total_wavenumber(curvature, *masses)
+                if curvature is not None
+                else frequency(variable.k * k_scale, *masses)
+            )
+            over = (
+                f"  +{after_w - max_wavenumber:.0f}"
+                if max_wavenumber > 0.0 and after_w > max_wavenumber
+                else ""
+            )
             print(
                 f"{label:<22}{shape:>7.3f}{peak:>11.3f}"
                 f"{k_scale:>9.3f}{before_w:>10.0f}{after_w:>9.0f}"
-                f"{after_w / before_w:>7.2f}"
+                f"{after_w / before_w:>7.2f}{over}"
             )
-        worst = max((max(v, 1.0 / v) for v in k_scales), default=1.0) ** 0.5
-        note = (
-            " -- `c` is O(dr**3) at the minimum, so it leaves the curvature, and "
-            "therefore every frequency, untouched."
-            if worst < 1.005
-            else ""
+        # Measured on the total curvature, not on the k-scale.  The k-scale is
+        # what the fit *chose*; the ratio below is what the molecule ends up
+        # with, and with an untapered short-range repulsion in the force field
+        # the two are not the same number.
+        worst = max(
+            (
+                total_wavenumber(curvature, *[MASSES.get(e, 1.0) for e in v.elements])
+                / frequency(v.k, *[MASSES.get(e, 1.0) for e in v.elements])
+                for v, curvature in zip(fit.variables, curvatures)
+                if curvature is not None
+            ),
+            default=max((max(v, 1.0 / v) for v in k_scales), default=1.0) ** 0.5,
         )
-        print(f"\nworst frequency drift {worst:.2f}x{note}")
+        print(f"\nworst frequency drift {worst:.2f}x")
+        _report_timestep(fit, max_wavenumber)
         _report_margins(fit)
         return
 
@@ -156,6 +197,38 @@ def report_force_constants(fit) -> None:
     worst = max((max(s, 1.0 / s) for s in fit.scales), default=1.0) ** 0.5
     print(f"\nworst frequency drift {worst:.2f}x")
     _report_margins(fit)
+
+
+def _report_timestep(fit, max_wavenumber: float) -> None:
+    """The worst stretching mode, and the timestep that follows from it.
+
+    Velocity Verlet wants roughly 15 steps per vibrational period, so the
+    fastest mode on the surface is what a production run's timestep has to be
+    chosen against.  Printed here because it is the point of the cap and it is
+    otherwise a calculation the reader has to do themselves.
+    """
+    masses = [
+        [MASSES.get(element, 1.0) for element in variable.elements]
+        for variable in fit.variables
+    ]
+    modes = [
+        (total_wavenumber(curvature, *pair), variable)
+        for curvature, pair, variable in zip(fit.curvatures, masses, fit.variables)
+        if curvature is not None
+    ]
+    if not modes:
+        return
+    worst, variable = max(modes, key=lambda item: item[0])
+    label = f"{variable.template} {'-'.join(variable.elements)}"
+    # 1 cm^-1 is 29.9793 THz^-1; a period in fs is 33356.4 / nu.
+    period = 33356.4 / worst if worst > 0 else float("inf")
+    print(
+        f"fastest mode {worst:.0f} cm^-1 ({label}), period {period:.2f} fs "
+        f"-> {period / 15.0:.3f} fs at 15 steps/period"
+    )
+    if max_wavenumber > 0.0:
+        over = sum(1 for value, _ in modes if value > max_wavenumber)
+        print(f"{over} of {len(modes)} bond types over the {max_wavenumber:.0f} cap")
 
 
 def _report_margins(fit) -> None:
@@ -234,6 +307,21 @@ def main() -> int:
         help="how hard the fit is pulled back towards q-force's force constants",
     )
     parser.add_argument(
+        "--max-wavenumber",
+        type=float,
+        default=DEFAULT_MAX_WAVENUMBER,
+        help="stretching modes above this (cm^-1) cost the objective. This is "
+        "the timestep expressed as a force-field property: ~15 steps per period "
+        "means a dt of 0.5 fs needs everything under 4450.",
+    )
+    parser.add_argument(
+        "--curvature-weight",
+        type=float,
+        default=DEFAULT_CURVATURE_WEIGHT,
+        help="how much a mode over --max-wavenumber costs. 0 removes the cap "
+        "entirely, which is the vacuity check for it.",
+    )
+    parser.add_argument(
         "--refit-manual",
         action="store_true",
         help="overwrite amplitudes marked `provenance: manual` in the existing "
@@ -271,8 +359,10 @@ def main() -> int:
             max_scale=args.max_k_scale,
             mode=args.fit_mode,
             max_shape=args.max_shape,
+            max_wavenumber=args.max_wavenumber,
+            curvature_weight=args.curvature_weight,
         )
-        report_force_constants(fit)
+        report_force_constants(fit, args.max_wavenumber)
         if not args.dry_run:
             for (name, _, _), stem in zip(templates, molecule_stems):
                 write_jsonl(stem.with_suffix(".jsonl"), fit.terms[name], exist_ok=True)

@@ -199,7 +199,11 @@ class TestGetTermsTopology:
         def terms_for(reaction_set):
             topology = Topology.from_atoms(target)
             return sorted(
-                (t["type"], tuple(sorted(t["atoms"].items())), tuple(sorted(t["kwargs"])))
+                (
+                    t["type"],
+                    tuple(sorted(t["atoms"].items())),
+                    tuple(sorted(t["kwargs"])),
+                )
                 + tuple(round(float(v), 8) for _, v in sorted(t["kwargs"].items()))
                 for t in reaction_set.get_terms_topology(topology)
             )

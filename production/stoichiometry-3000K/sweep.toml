@@ -25,10 +25,76 @@ rnet = "datasets/HCombustion/HCombustion.json"
 
 [md]
 temperature = 3000.0  # K
-# 0.25 fs, not the script default of 0.5.  The refit took the H-H stretch to
-# 5282 cm^-1 (a 6.3 fs period), which is ~13 steps per period at 0.5 fs -- an
-# acceptable margin at 2000 K and not one worth spending at 3000 K.
-timestep = 0.25       # fs
+# 0.5 fs, measured on this box against this force field.
+#
+# **The timestep is set by the fastest vibrational mode and by nothing else.**
+# Velocity Verlet wants ~15 steps per period, so
+#
+#     dt_max [fs]  =  33356 / (15 * nu [cm^-1])
+#
+# and every previous number here was really a statement about `nu`.  0.25 fs was
+# sized against vibrational periods before there was a repulsion; 0.05 fs was
+# measured against `forcefield/lj.py`'s 12-6 and then held after that term was
+# replaced.  What made it necessary was never the repulsion's magnitude -- it
+# was that the fastest stretch on the surface had reached **11697 cm^-1**, a
+# 2.84 fs period, against an experimental 3738 for the same bond.
+#
+# `fit.dissociation` now prices that directly (`DEFAULT_MAX_WAVENUMBER`), and
+# the fastest mode is 4399 cm^-1 -- a 7.58 fs period, so 0.51 fs at 15 steps per
+# period.  The cap cost nothing to apply: 14 of 19 channels fittable, which is
+# what the uncapped fit gets.
+#
+# Re-measured after that refit, as NVE from this box's packed geometry with the
+# drift taken over a common 20 fs window:
+#
+#   0.5 fs     +0.235 eV   59.3 meV/atom/ps   )
+#   0.25 fs    +0.056 eV   14.1 meV/atom/ps   ) ratios 4.21, 4.04
+#   0.125 fs   +0.014 eV    3.5 meV/atom/ps   )
+#
+# Ratios of four across two halvings is O(dt**2) and nothing else: the drift is
+# integrator error, not force inconsistency, which would not converge at all.
+#
+# **59 meV/atom/ps is large, and the thermostat is what makes it acceptable --
+# so that was measured too rather than assumed.**  Two 2 ps Langevin runs from
+# this box, same seed, differing only in the step:
+#
+#           T mean    T (second half)   sd    E_nonbonded        closest approach
+#   0.5 fs   2960 K        2931 K      136 K  +0.02..+0.60 eV        1.162 A
+#   0.25 fs  3009 K        3032 K      192 K  -0.03..+0.60 eV             --
+#
+# The coarser step runs 49 K cool over the run and 101 K cool over its second
+# half.  That is a real bias rather than noise, it is 1.6-3.4%, and it is inside
+# the 150 K this sweep is willing to spend.  Anything needing the temperature to
+# better than a percent should use 0.25 fs and pay twice the compute.
+#
+# Neither run capped its basis, drifted its nonbonded energy, or let two
+# molecules closer than 1.162 A -- the same closest approach the old 0.05 fs
+# probe reached, so ten times the step costs nothing in collapse resistance.
+#
+# What to do when the force field is refitted: read the fit's own report, which
+# ends with a "fastest mode ... -> N fs at 15 steps/period" line, and re-measure
+# rather than carrying this number across.  `test_reference_energies.py::
+# TestTemplateFrequencies` fails if a refit takes the fastest mode past 4600.
+timestep = 0.5        # fs
 friction = 0.01       # 1/fs
-steps = 400000        # 100 ps at 0.25 fs
-interval = 100        # a frame every 25 fs -> 4000 frames per run
+# 100 ps, unchanged in simulated time.  Ignition is a rare event: a barrier
+# crossing needs a collision that reaches the transition-state region, and a
+# 40 fs probe samples none (the basis stays single-state, correctly -- the
+# fitted coupling widths switch off at the reactant minimum by construction).
+# At transition-state geometries the basis does go multi-state, 2 and 3 states
+# on the two reactions the test suite exercises, so the machinery is live; it is
+# the sampling that needs the full 100 ps.
+#
+# **Cost, and this is where the timestep is worth its argument.**  Measured at
+# 202 ms/step on 200 atoms, so 200,000 steps is **~11 hours of serial compute
+# per run** and ~12 core-days for the sweep.  That fits inside `submit.slurm`'s
+# 48 h wall with room to spare, which is the whole difference the step makes:
+# at 0.05 fs the same 100 ps was 2,000,000 steps and ~10 days per run, needing
+# roughly six `--restart` continuations each and ~250 days across the sweep.
+# The restart path still works and is still worth keeping, but no longer has to.
+#
+# Shortening the trajectory is a scientific call about whether less than 100 ps
+# still samples ignition, and is deliberately not made here -- there is no
+# longer a compute reason to make it.
+steps = 200000        # 100 ps at 0.5 fs
+interval = 50         # a frame every 25 fs -> 4000 frames per run, as before

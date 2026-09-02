@@ -52,6 +52,7 @@ class DynamicTopology(Calculator):
         self.diagnostics: dict[str, Any] = {
             "energy_bonded": results["energy_bonded"],
             "energy_nonbonded": results["energy_nonbonded"],
+            "energy_zbl": results["energy_zbl"],
             "blocks": results["blocks"],
             "topology_changed": self.topology_changed,
         }
@@ -81,7 +82,7 @@ class EVB(Calculator):
             terms = reaction_set.get_terms(state)
             state.set_terms(terms)
 
-        self.system = EVBSystem(atoms, states=states)
+        self.system = EVBSystem(atoms, states=states, reaction_set=reaction_set)
 
     def calculate(
         self,

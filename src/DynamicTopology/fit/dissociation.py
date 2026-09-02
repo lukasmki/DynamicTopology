@@ -64,18 +64,50 @@ where q-force put them, while raising the stretched branch by up to
 `0.168 * c * D`.  `c = 0` is plain Morse, which is what every term file
 predating the parameter reads as.
 
-`c` is bounded, and not arbitrarily: past `c = 1.308` the correction beats the
+`c` is bounded, and not arbitrarily: past `c = 19.33` the correction beats the
 exponential and the dissociation curve turns over, putting a barrier on a
 channel that has none and a bound state beyond it.  `DEFAULT_MAX_SHAPE` is that
 limit.  See its comment for the derivation.
 
 `fit_force_constants` fits one variable per distinct bond type in any of three
 modes -- `shape` (`c` only, no frequency cost), `k` (the old route), or `both`
--- always with the `D` scale re-solved underneath by `fit_dissociation_energies`,
-so the atomization energy stays exact by construction rather than becoming one
-residual among many.  The objective is a hinge: once a margin is positive the
-barrier is reproduced exactly by the amplitude, which is free per reaction, so
-overshooting buys nothing.
+-- always with `fit_template` re-solved underneath it, so neither the
+atomization energy nor the geometry is something the objective can spend.  The
+objective is a hinge: once a margin is positive the barrier is reproduced
+exactly by the amplitude, which is free per reaction, so overshooting buys
+nothing.
+
+
+Where the minimum is: `r0` against a repulsion that is not zero there
+---------------------------------------------------------------------
+
+The paragraph above says `r0` is pinned by the geometry, and while the bonded
+terms were the whole molecular potential that was true by construction: q-force
+fitted `r0` to the geometry, so the bonded minimum sat on it and nothing had to
+be solved.  `ZBL` ended that.  It is a real repulsion at bonding distances --
+2.0 eV at the H2 bond length, 5.4 at O-H, 11.6 at O-O, with slopes to match --
+and the *total* is what has a minimum, so the Morse has to lean into it.
+
+Nothing made it.  `fit_dissociation_energies` matched each template's energy at
+its stored QM geometry, exactly, to 1e-13 -- and nothing anywhere looked at the
+gradient there.  The templates came out with the right energies at geometries
+they were not at rest in, and relaxed away from them: H2 by 0.105 A, HO2's O-O
+by 0.825, every stretching frequency 1.7 to 2.6x experiment.  H2's own minimum
+landed *outside* the bond-perception radius, so a relaxed H2 re-perceived as two
+free atoms.
+
+`fit_bond_lengths` adds the missing condition -- one equation per bond type, the
+total force along it vanishing at the reference geometry -- and `fit_template`
+alternates it with the depth solve until both hold.  Both are determinate, so
+neither is fitted and neither competes with the barriers.
+
+It is also not always solvable, which is worth stating plainly: a Morse pulls at
+most `D*a/2`, and `ZBL` pushes O-O in HO2 apart with 25.0 eV/A against a ceiling
+of 8.3 at q-force's own force constants.  The ceiling rises with `D`, `k` and
+`c`, so the geometry condition is really a constraint on the search box -- seven
+of HCombustion's eight bond types come inside it at `c = 19.3` and the eighth at
+`k`-scale 2 -- which is why the origin is no longer a feasible starting point
+and `_feasible_start` exists.
 """
 
 import logging
@@ -83,11 +115,13 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from ase import Atoms, units
+from ase.data import atomic_masses, atomic_numbers
 from scipy.optimize import brentq, minimize
 
 from DynamicTopology.core.types import Term
 from DynamicTopology.forcefield.acks2 import ACKS2
-from DynamicTopology.forcefield.qforce import QForce
+from DynamicTopology.forcefield.qforce import SHAPE_DECAY, QForce
+from DynamicTopology.forcefield.zbl import ZBL
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -119,6 +153,8 @@ DEFAULT_FREQUENCY_WEIGHT: float = 0.005
 # it can before any frequency is spent:
 #
 #     cap 1.0 (shape only)  13 / 19   1.00x
+#     cap 1.1               13 / 19   1.05x
+#     cap 1.2               13 / 19   1.10x
 #     cap 1.5               15 / 19   1.22x
 #     cap 1.7               16 / 19   1.30x
 #     cap 1.85              16 / 19   1.36x
@@ -129,9 +165,41 @@ DEFAULT_FREQUENCY_WEIGHT: float = 0.005
 # of 16 does.  The third Morse parameter is what turns "spend 3.31x and still
 # fall short" into "spend 1.41x and stop".
 #
-# The one remaining channel is `rxn_08`, and no cap reaches it: its stored
+# **No nonbonded term moves this curve, and one of them provably cannot.**  A
+# Lennard-Jones with per-state exclusions was added on the hypothesis that Pauli
+# repulsion would lift the diabats at the transition states and make the channels
+# fittable for free, and the numbers looked emphatic: 14 of 19 feasible with no
+# refitting whatever.  All of it was artefact -- a diabat that had broken a bond
+# called its two atoms different molecules while they sat at the bond length, and
+# the whole-system sum charged them 727 to 1550 eV there.  Excluding those pairs
+# properly returned the count to 1 of 19.
+#
+# The repulsion is now `ZBL`, which takes no topology at all, so it is the *same
+# number* on every diabat of a block and cancels exactly out of every margin this
+# module computes.  It cannot help here and it cannot hurt here, by construction.
+# The overbinding this fit exists to repair is in the Morse form, and the bonded
+# parameters are the only thing that can pay for it.
+#
+# **The knee is not a preference, and the lower caps are not usable.**  A
+# decoupled channel is switched off entirely, so a cap that leaves six of them
+# off does not merely fit fewer barriers -- it takes the EVB basis apart.  At cap
+# 1.0 and at cap 1.5 the standard test geometries drop from three diabatic states
+# to two, and nine tests across `test_evb_invariants`, `test_gradients` and
+# `test_trajectory_io` fail their own vacuity guards: there is no longer a
+# multi-state block to be pivot-invariant about, no channel inside the admission
+# ramp, and no topology change along a trajectory.  Only cap 2.0 leaves a
+# reactive model behind, which is why the 1.41x is spent.
+#
+# Re-running this fit from q-force's own force constants -- rather than from the
+# twice-stiffened ones the dataset had drifted to -- reproduces the single-pass
+# result exactly and changes only O2, from 3259 cm^-1 back to 2305.  That is what
+# undoing the double application is worth; the rest of the drift is the fit
+# genuinely wanting it.
+#
+# The one channel no cap reaches is `rxn_06`.  `rxn_08` -- whose stored
 # transition state is not a saddle but a *minimum*, 4.87 eV below its own
-# reactant.  See `tests/test_reference_energies.py`.
+# reactant; see `tests/test_reference_energies.py` -- was the holdout before the
+# shape term existed and is fittable now, at cap 2.0, by 0.011 eV.
 #
 # Note that this bounds the scale relative to whatever `k` the templates handed
 # in already carry, not relative to q-force's original fit, so **running the fit
@@ -140,9 +208,94 @@ DEFAULT_FREQUENCY_WEIGHT: float = 0.005
 DEFAULT_MAX_SCALE: float = 2.0
 
 
+# Weight on the leftover force at each template's reference geometry, in
+# 1/(eV/A)**2, i.e. how hard the objective insists that a molecule be at rest
+# where its reference energy says it is.
+#
+# It is a penalty rather than a constraint, and that is a deliberate second
+# attempt.  Treating it as a constraint -- `score` returning `inf` wherever
+# `fit_bond_lengths` had no solution -- is exactly right on paper and
+# catastrophic in practice: at `c = 0` and q-force's own force constants most
+# of these bonds cannot cancel `ZBL` at any length, so the infeasible set is
+# most of the box, and Powell line-searching across a plateau of infinities
+# turned a 40 second fit into one that ran for half an hour without converging.
+# A quadratic penalty puts the same pressure on a surface the optimizer can
+# actually descend.
+#
+# 10.0 makes a 0.3 eV/A leftover force -- the worst any HCombustion template
+# shows -- cost about as much as a 1 eV margin shortfall, so the geometry is
+# worth roughly one channel.  That is the intended exchange rate: a template
+# that cannot sit still is a worse defect than a barrier that cannot be fitted,
+# but not by so much that the fit will spend every force constant it has to buy
+# the last milli-eV per Angstrom.
+DEFAULT_GEOMETRY_WEIGHT: float = 10.0
+
+
+# Wavenumber (cm^-1) above which a stretching mode starts costing the
+# objective.  This is the timestep, expressed as a property of the force field:
+# velocity Verlet wants ~15 steps per vibrational period, so `dt` femtoseconds
+# needs every mode under `33356 / (15 dt)`, which is 4450 at the 0.5 fs the
+# production sweep is trying to reach.  4400 is that, rounded down to H2's own
+# experimental stretch so the cap is a real number rather than a derived one.
+#
+# Nothing priced this before, and the result was a surface with an 11735 cm^-1
+# mode on it -- a 2.84 fs period, which is what pinned the sweep at 0.05 fs.
+# See `_bonded_curvature` for where the stiffness was coming from: not from the
+# `k`-scale this fit reports, which is bounded at 1.41x, but from the shape term
+# at a displaced `r0`.
+DEFAULT_MAX_WAVENUMBER: float = 4400.0
+
+# Weight on `max(0, nu - max_wavenumber)**2`, in 1/cm**-2.
+#
+# A hinge and not a bound, for the reason `DEFAULT_GEOMETRY_WEIGHT` records:
+# a hard constraint here would return `inf` over most of the box at `c = 0`,
+# and Powell line-searching a plateau of infinities is what turned a 40 second
+# fit into an hour-long one last time.
+#
+# **The cap costs no channels at all, which was not the expected answer.**
+# Swept over HCombustion from the `8f32706` reset in the default `both` mode at
+# `--max-k-scale 3`, cap 4400.  The first table is the cap at the weight it was
+# first guessed at, 1e-6, and it is the shape of a hinge too soft to bind:
+#
+#     cap        fastest mode   dt at 15 steps/period   channels   over cap
+#     none            11697            0.190 fs           14/19      6 of 8
+#     6000             6160            0.361              13/19      2 of 8
+#     5000             5781            0.385              13/19      3 of 8
+#     4400             5309            0.419              13/19      4 of 8
+#     4000             5262            0.423              13/19      6 of 8
+#
+# It saturates around 5260 cm^-1 and stops responding to the cap, having bought
+# 2.2x in timestep for one channel.  That reads like a floor and is not one: a
+# scan of the whole `(k-scale, c)` box for water's O-H alone reaches 4337 cm^-1
+# -- its repulsion's own curvature, 4342 -- across every `k`-scale at `c <= 5`.
+# The fit was not failing to go lower, it was declining to.  Weight, at cap 4400:
+#
+#     weight     fastest mode   dt at 15 steps/period   channels   over cap
+#     1e-6             5309            0.419              13/19      4 of 8
+#     1e-5             4636            0.480              14/19      5 of 8
+#     1e-4             4546            0.489              13/19      4 of 8
+#     1e-3             4401            0.505              14/19      1 of 8
+#     1e-2             4399            0.506              14/19      0 of 8
+#     3e-2             4399            0.506              14/19      0 of 8
+#     1e-1             4501            0.494              14/19      1 of 8
+#
+# 14 of 19 is what the *uncapped* fit gets.  So the whole 2.7x in timestep --
+# 0.190 fs to 0.506 -- is bought for nothing, and the trade this hinge was
+# written to manage turns out not to exist on this dataset.  What the cap
+# actually does is stop the fit spending `c` in the region where `c` is
+# expensive; there was another region, equally good for the margins, that it had
+# no reason to prefer until now.
+#
+# 1e-2 is the middle of a plateau three decades wide, and the two weights that
+# reach the cap on every bond type are inside it.  Higher is not better: at 1e-1
+# the fit is back to one bond over, because the penalty starts distorting the
+# search before it binds any harder.
+DEFAULT_CURVATURE_WEIGHT: float = 1e-2
+
 # Stateless, and constructed once: the outer fit calls `bonded_energy`
 # thousands of times.
 _ACKS2 = ACKS2()
+_ZBL = ZBL()
 
 
 class DissociationFitError(ValueError):
@@ -177,6 +330,57 @@ def _scaled(terms: list[Term], scale: float) -> list[Term]:
     return out
 
 
+# Memo for the nonbonded half of a template's energy and forces, keyed by the
+# geometry and the ACKS2 parameters it was computed from.
+#
+# **Why this is safe, and why it matters.**  Both nonbonded terms are functions
+# of the geometry alone -- `ZBL` reads only atomic numbers, and `ACKS2` reads
+# the `atom` terms, which no part of this module fits.  The fit moves `D`, `r0`,
+# `k` and `c`, every one of them bonded.  So across an entire
+# `fit_force_constants` run, at a fixed template geometry, this pair of numbers
+# never changes.
+#
+# It was being recomputed for every one of them: `fit_dissociation_energies`
+# runs `brentq` to 1e-12, which is ~40 evaluations of `bonded_energy`, each
+# solving the ACKS2 charge equilibration from scratch, and that happens once per
+# round per template per objective evaluation.  Caching it is most of the
+# difference between a fit that takes a minute and one that takes an hour.
+#
+# The key includes the ACKS2 parameters rather than trusting the argument
+# above, so a caller that *did* fit them would miss the cache rather than read
+# a stale number from it.
+_NONBONDED_CACHE: dict[tuple, tuple[float, np.ndarray]] = {}
+
+
+def _nonbonded_key(atoms: Atoms, term_dict: dict) -> tuple:
+    acks2 = term_dict.get("atom", {})
+    return (
+        atoms.positions.tobytes(),
+        atoms.numbers.tobytes(),
+        atoms.cell.array.tobytes(),
+        tuple(atoms.pbc),
+        tuple(
+            (name, np.asarray(value).tobytes())
+            for name, value in sorted(acks2.get("kwargs", {}).items())
+        ),
+        np.asarray(acks2.get("atoms", ())).tobytes(),
+    )
+
+
+def _nonbonded(atoms: Atoms, term_dict: dict) -> tuple[float, np.ndarray]:
+    """ACKS2 + ZBL energy and forces at `atoms`, memoized on the geometry."""
+    key = _nonbonded_key(atoms, term_dict)
+    hit = _NONBONDED_CACHE.get(key)
+    if hit is None:
+        energy, forces = _ACKS2(atoms.positions, atoms.pbc, atoms.cell, term_dict)
+        zbl_energy, zbl_forces = _ZBL(
+            atoms.positions, atoms.numbers, atoms.pbc, atoms.cell
+        )
+        hit = (float(energy + zbl_energy), forces + zbl_forces)
+        _NONBONDED_CACHE[key] = hit
+    return hit
+
+
 def bonded_energy(atoms: Atoms, terms: list[Term]) -> float:
     """Total energy of `terms` at `atoms`' geometry, in eV.
 
@@ -202,15 +406,26 @@ def bonded_energy(atoms: Atoms, terms: list[Term]) -> float:
 
 
 def nonbonded_energy(atoms: Atoms, term_dict: dict) -> float:
-    """ACKS2 energy of `term_dict` at `atoms`' geometry, in eV.
+    """ACKS2 plus whole-system ZBL, at `atoms`' geometry, in eV.
 
-    Topology-independent in the sense that matters here: evaluated at each of
-    the nineteen transition-state geometries under the reactant's and the
-    product's parameter sets it gives the same number to every printed digit, so
-    it can be added once outside the EVB Hamiltonian -- which is exactly what
-    `System.calculate` does -- rather than sitting on the diagonal.
+    Both are topology-independent, and in the strong sense: ACKS2 evaluated at
+    each of the nineteen transition-state geometries under the reactant's and
+    the product's parameter sets gives the same number to every printed digit,
+    and `ZBL` does not consult the topology at all -- it reads atomic numbers
+    off the `Atoms`.  So both are added once outside the EVB Hamiltonian, which
+    is exactly what `System.calculate` does, rather than sitting on the diagonal.
+
+    This is the sum a reference atomization energy has to be matched against.
+    Fitting the Morse depths against the bonded part alone left every
+    heteronuclear template overbound by exactly its own ACKS2 energy -- water at
+    -12.3701 eV against a reference of -9.8735, 25% too deep -- and the error was
+    invisible on H2 and O2, which have no charge separation.  `ZBL` closes that
+    hole for the homonuclear templates too: it is nonzero on every bonded pair
+    (+2.0 eV at the H2 bond length, +11.6 at O2's), so leaving it out here would
+    reintroduce the same class of error on exactly the two templates the old
+    version of this bug hid behind.
     """
-    return _ACKS2(atoms.positions, atoms.pbc, atoms.cell, term_dict)[0]
+    return _nonbonded(atoms, term_dict)[0]
 
 
 def fit_dissociation_energies(atoms: Atoms, terms: list[Term]) -> list[Term]:
@@ -255,6 +470,494 @@ def fit_dissociation_energies(atoms: Atoms, terms: list[Term]) -> list[Term]:
 
     scale = brentq(residual, low, high, xtol=1e-12, rtol=1e-14)
     return _scaled(terms, scale)
+
+
+# --------------------------------------------------------------------------
+# Bond lengths
+# --------------------------------------------------------------------------
+
+# Half-width, in nm, of the window `fit_bond_lengths` searches around the `r0`
+# a template arrived with.  It is a tripwire rather than a tuning parameter:
+# the shifts this actually needs are 0.005 to 0.014 nm, so a solve that wants
+# more than 0.03 has gone somewhere it should not, and the caller should be
+# told rather than handed a molecule with a 3 Angstrom bond in it.
+MAX_LENGTH_SHIFT: float = 0.03
+
+# How many times `fit_template` alternates the `r0` solve with the `D` solve.
+# Each is exact given the other and they couple only through `a = sqrt(k/2D)`,
+# so the alternation contracts by about an order of magnitude a round.  Worst
+# residual force left on any HCombustion template, in eV/A:
+#
+#     rounds   1        2        3        4
+#              1.5e-3   1.2e-4   1.9e-5   1.9e-6
+#
+# Iterating the `r0` solve *within* a round instead makes it worse -- 3.0e-3,
+# 5.6e-4, 1.1e-4, 2.0e-5 for the same work -- because the extra passes refine
+# towards a fixed point of a stale `D`.  So `fit_bond_lengths` is one pass and
+# the alternation is here, which is both twice as fast and ten times as
+# accurate as looping in both places.
+LENGTH_DEPTH_ROUNDS: int = 4
+
+
+def _morse_stretch_force(r, D: float, r0, k: float, c: float):
+    """`-dE/dr` of one Morse bond, in q-force units (kJ/mol/nm).
+
+    Positive is the force pulling the two atoms *apart*, i.e. the sign a
+    compressed bond carries.  This mirrors `QForce._bond_morse` exactly,
+    including the one-sided shape term; it is written out a second time here
+    because the fit needs the derivative of a single bond as a function of `r0`
+    with everything else held still, and the force field only ever offers the
+    assembled Cartesian forces of a whole system.
+
+    `r` and `r0` broadcast, and the search below depends on it.  This is the
+    innermost thing in `fit_force_constants` -- one call per grid point, per
+    bond type, per round, per objective evaluation, and Powell's evaluation
+    count runs to five figures -- so scanning a bond length has to be one array
+    expression rather than four hundred scalar ones.  Left as a scalar loop it
+    turned a fit that took seconds into one that took the better part of an
+    hour.
+    """
+    dr = np.asarray(r, dtype=float) - np.asarray(r0, dtype=float)
+    al = np.sqrt(k / (2 * D))
+    exp_term = np.exp(-al * dr)
+    de_dr = 2 * D * (1 - exp_term) * al * exp_term
+    s = al * np.maximum(dr, 0.0)
+    de_dr = de_dr + (
+        D * c * al * s * s * (3.0 - SHAPE_DECAY * s) * np.exp(-SHAPE_DECAY * s)
+    )
+    return -de_dr
+
+
+def bond_lengths(terms: list[Term], atoms: Atoms) -> list[list[float]]:
+    """Actual bond distance in nm of every bond, grouped by `bond_types` order.
+
+    Two bonds share a type when q-force gave them identical `(r0, k)`, which
+    does not make them the same length -- H2O2's two O-H bonds are one type and
+    happen to be symmetric, but nothing guarantees that in general.
+    """
+    types = bond_types(terms)
+    lengths: list[list[float]] = [[] for _ in types]
+    for term in terms:
+        if term["type"] != "bond":
+            continue
+        i, j = list(term["atoms"].values())
+        index = types.index((term["kwargs"]["r0"], term["kwargs"]["k"]))
+        lengths[index].append(float(atoms.get_distance(i, j)) / 10.0)
+    return lengths
+
+
+def set_bond_lengths(terms: list[Term], values: list[float]) -> list[Term]:
+    """Copy of `terms` with each bond type's `r0` set, in `bond_types` order."""
+    order = {pair: index for index, pair in enumerate(bond_types(terms))}
+    out: list[Term] = []
+    for term in terms:
+        if term["type"] != "bond":
+            out.append(term)
+            continue
+        kwargs = dict(term["kwargs"])
+        kwargs["r0"] = float(values[order[(kwargs["r0"], kwargs["k"])]])
+        out.append({**term, "kwargs": kwargs})
+    return out
+
+
+def stretch_forces(atoms: Atoms, terms: list[Term]) -> list[float]:
+    """Net force along the bonds of each type, in eV/A, in `bond_types` order.
+
+    For a bond `(i, j)` this is `0.5 * (F_i - F_j) . u_ij` summed over the
+    bonds of the type -- the part of the total force that a change in that
+    type's `r0` can move, and nothing else.  `F` is the *whole* force:
+    every bonded term, ACKS2 and ZBL, through the same pipeline
+    `System.calculate` uses, so no contribution is assumed away.
+    """
+    from DynamicTopology.core.topology import Topology
+
+    topology = Topology.from_terms(terms, atoms)
+    topology.set_terms(terms)
+    term_dict = topology.term_dict
+    forces = QForce(bond_form="morse")(
+        atoms.positions, atoms.pbc, atoms.cell, term_dict
+    )[1]
+    forces = forces + _nonbonded(atoms, term_dict)[1]
+
+    types = bond_types(terms)
+    out = [0.0] * len(types)
+    for term in terms:
+        if term["type"] != "bond":
+            continue
+        i, j = list(term["atoms"].values())
+        index = types.index((term["kwargs"]["r0"], term["kwargs"]["k"]))
+        unit = atoms.positions[j] - atoms.positions[i]
+        unit = unit / np.linalg.norm(unit)
+        out[index] += 0.5 * float(np.dot(forces[j] - forces[i], unit))
+    return out
+
+
+def bond_curvatures(atoms: Atoms, terms: list[Term]) -> list[float]:
+    """Second derivative along each bond type, in eV/A**2, in `bond_types` order.
+
+    The *total*, not the Morse's own: measured by displacing the two atoms of
+    each bond along their axis and differencing the assembled forces, so ZBL
+    and ACKS2 are in it.  Averaged over the bonds of a type, which is what a
+    per-type wavenumber can mean at all.
+
+    This exists because `frequency` does not answer the question any more.  It
+    converts a bonded force constant to a wavenumber, and while the bonded
+    terms were the whole potential that was the frequency.  `ZBL`'s curvature
+    at a bond length is not small next to a bond's -- 68.5 eV/A**2 at the O-H
+    distance, which on its own is 4431 cm^-1 -- so a report built on the bonded
+    `k` alone understates the real stiffness by about a factor of two, and the
+    force-constant fit's headline "drift" number was understating it by that
+    much.
+    """
+    from DynamicTopology.core.topology import Topology
+
+    topology = Topology.from_terms(terms, atoms)
+    topology.set_terms(terms)
+    term_dict = topology.term_dict
+    qforce = QForce(bond_form="morse")
+
+    def stretch(i: int, j: int, delta: float) -> float:
+        """`-dE/dr` of the whole system with bond `(i, j)` stretched by `delta`."""
+        moved = atoms.copy()
+        unit = atoms.positions[j] - atoms.positions[i]
+        unit = unit / np.linalg.norm(unit)
+        moved.positions[j] = moved.positions[j] + delta * unit
+        forces = qforce(moved.positions, moved.pbc, moved.cell, term_dict)[1]
+        forces = forces + _nonbonded(moved, term_dict)[1]
+        return float(np.dot(forces[j], unit))
+
+    step = 1e-3
+    types = bond_types(terms)
+    totals = [0.0] * len(types)
+    counts = [0] * len(types)
+    for term in terms:
+        if term["type"] != "bond":
+            continue
+        i, j = list(term["atoms"].values())
+        index = types.index((term["kwargs"]["r0"], term["kwargs"]["k"]))
+        totals[index] += -(stretch(i, j, step) - stretch(i, j, -step)) / (2 * step)
+        counts[index] += 1
+    return [t / max(n, 1) for t, n in zip(totals, counts)]
+
+
+def _bonded_curvature(kwargs: dict, r: float) -> float:
+    """`d2E/dr2` of one Morse bond at separation `r`, in eV/A**2.
+
+    Analytic, and written out here for the same reason `_morse_stretch_force`
+    is: the objective needs the second derivative of a *single* bond as a
+    function of that bond's parameters, thousands of times, and the force field
+    only offers assembled Cartesian forces of a whole system.  Differentiating
+    `QForce._bond_morse` twice,
+
+        d2/dr2 [ D (1 - exp(-a dr))**2 ]  =  2 D a**2 exp(-a dr) (2 exp(-a dr) - 1)
+        d2/dr2 [ D c s**3 exp(-b s) ]     =  D c a**2 (6 s - 6 b s**2 + b**2 s**3) exp(-b s)
+
+    with `s = a max(dr, 0)`, so the shape term contributes nothing on the
+    compressed branch -- where it is clamped -- and nothing at `dr = 0`, where
+    it is cubic.
+
+    **It contributes a great deal anywhere else**, which is the finding this
+    function exists to price.  The claim that `c` is `O(dr**3)` at the minimum
+    and therefore free of frequency was true while `r0` *was* the minimum.
+    `fit_bond_lengths` ended that: `r0` is now pulled 0.04-0.22 A inside the
+    reference bond length so the Morse can lean against the repulsion, and at
+    that displacement this term is the largest single contribution to the
+    stiffness -- 63 eV/A**2 of H2's 115, 509 of O2's 793, 323 of HO's 480.
+
+    `r` in Angstrom; `kwargs` in q-force units, as stored.
+    """
+    D = kwargs["D"]
+    k = kwargs["k"]
+    c = kwargs.get("c", 0.0)
+    dr = r / 10.0 - kwargs["r0"]  # nm
+    al = np.sqrt(k / (2 * D))
+
+    exp_term = np.exp(-al * dr)
+    curvature = 2 * D * al * al * exp_term * (2 * exp_term - 1)
+
+    s = al * max(dr, 0.0)
+    curvature += (
+        D
+        * c
+        * al
+        * al
+        * (6 * s - 6 * SHAPE_DECAY * s**2 + SHAPE_DECAY**2 * s**3)
+        * np.exp(-SHAPE_DECAY * s)
+    )
+    # kJ/mol/nm**2 -> eV/A**2
+    return float(curvature * units.kJ / units.mol / units.nm**2)
+
+
+# Nonbonded curvature per bond type, memoized exactly like `_NONBONDED_CACHE`
+# and for a stronger reason: it is a function of the geometry and the ACKS2
+# parameters alone, and neither moves during a force-constant fit.  One
+# measurement per template covers every objective evaluation.
+_CURVATURE_CACHE: dict[tuple, list[float]] = {}
+
+
+def nonbonded_curvatures(atoms: Atoms, terms: list[Term]) -> list[float]:
+    """ACKS2 + `ZBL` second derivative along each bond type, in eV/A**2.
+
+    The half of `bond_curvatures` the fit cannot change.  Split out because the
+    other half is analytic and this one is not: measuring it costs two assembled
+    force calls per bond, and the objective is evaluated four figures of times.
+
+    Averaged over the bonds of a type, in `bond_types` order, which is what a
+    per-type wavenumber can mean at all.
+    """
+    from DynamicTopology.core.topology import Topology
+
+    topology = Topology.from_terms(terms, atoms)
+    topology.set_terms(terms)
+    term_dict = topology.term_dict
+
+    types = bond_types(terms)
+    grouping: list[tuple[int, int]] = []
+    for term in terms:
+        if term["type"] != "bond":
+            continue
+        i, j = list(term["atoms"].values())
+        grouping.append(
+            (types.index((term["kwargs"]["r0"], term["kwargs"]["k"])), i, j)
+        )
+
+    # The `(r0, k)` a type is *named* by moves as the fit runs; which bonds are
+    # grouped together does not.  Key on the grouping, so the cache cannot be
+    # read across a genuinely different partition.
+    key = (_nonbonded_key(atoms, term_dict), tuple(grouping))
+    hit = _CURVATURE_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    def stretch(i: int, j: int, delta: float) -> float:
+        """`-dE_nonbonded/dr` with bond `(i, j)` stretched by `delta`."""
+        moved = atoms.copy()
+        unit = atoms.positions[j] - atoms.positions[i]
+        unit = unit / np.linalg.norm(unit)
+        moved.positions[j] = moved.positions[j] + delta * unit
+        return float(np.dot(_nonbonded(moved, term_dict)[1][j], unit))
+
+    step = 1e-3
+    totals = [0.0] * len(types)
+    counts = [0] * len(types)
+    for index, i, j in grouping:
+        totals[index] += -(stretch(i, j, step) - stretch(i, j, -step)) / (2 * step)
+        counts[index] += 1
+
+    hit = [t / max(n, 1) for t, n in zip(totals, counts)]
+    _CURVATURE_CACHE[key] = hit
+    return hit
+
+
+def stretch_curvatures(
+    atoms: Atoms, terms: list[Term], nonbonded: list[float] | None = None
+) -> list[float]:
+    """Per-bond-type stretch stiffness in eV/A**2: own Morse plus nonbonded.
+
+    The cheap stand-in for `bond_curvatures` that the objective can afford --
+    one analytic expression plus a cached measurement, against two assembled
+    force calls per bond -- and deliberately *not* the same quantity.
+
+    `bond_curvatures` differences the whole potential along "displace atom `j`
+    along the `ij` axis", so it also picks up every angle, dihedral and *other*
+    bond term that touches `j`.  This one takes the bond's own Morse and the
+    nonbonded terms and stops.  Measured against it on the shipped parameters:
+
+        template  bond   bond_curvatures   this   difference
+        H2        H-H            115.118  115.120     0.001
+        O2        O-O            792.475  792.506     0.031
+        HO        O-H            477.132  477.172     0.039
+        H2O       O-H            109.498  109.498     0.000
+        HO2       O-O            104.347  104.335     0.011
+        HO2       O-H             94.195   94.195     0.000
+        H2O2      O-O            269.782  247.671    22.111
+        H2O2      O-H             81.477   81.477     0.000
+
+    One row differs and it is the one row that can: H2O2's O-O is the only bond
+    here whose displaced atom carries both another bond and a dihedral.  Of the
+    22.1, about 15.9 is the O-H Morse on the moved oxygen and 6.2 is the angle
+    and dihedral terms.
+
+    That is tolerable *for the use this has* and for no other.  The cap the
+    objective applies binds on X-H stretches -- they are the fast modes, and
+    they are exactly the rows that agree to 1e-3 -- while the row that differs
+    is a 2967 cm^-1 heavy-atom mode, 8% wrong and nowhere near a cap of 4400.
+    Anything that wants the real number should call `bond_curvatures`, which is
+    what the report does.
+    """
+    if nonbonded is None:
+        nonbonded = nonbonded_curvatures(atoms, terms)
+
+    types = bond_types(terms)
+    totals = [0.0] * len(types)
+    counts = [0] * len(types)
+    for term in terms:
+        if term["type"] != "bond":
+            continue
+        i, j = list(term["atoms"].values())
+        index = types.index((term["kwargs"]["r0"], term["kwargs"]["k"]))
+        totals[index] += _bonded_curvature(term["kwargs"], atoms.get_distance(i, j))
+        counts[index] += 1
+    return [t / max(n, 1) + nb for t, n, nb in zip(totals, counts, nonbonded)]
+
+
+def fit_bond_lengths(
+    atoms: Atoms, terms: list[Term], strict: bool = True
+) -> list[Term]:
+    """Shift each bond type's `r0` so the *total* potential is flat along it.
+
+    **Why this exists.**  `TestTemplateEnergies` pins each template's energy at
+    its reference geometry and `fit_dissociation_energies` solves it to 1e-13.
+    Nothing pinned the *gradient* there, and once `ZBL` was added it stopped
+    being anywhere near zero: the repulsion is 2.0 eV at the H2 bond length and
+    11.6 at O2's, with slopes to match, and `r0` was the only parameter that
+    could have leaned against it -- so the minima simply moved outward.  H2 by
+    0.105 A, HO2's O-O by 0.825, and every stretching frequency with them.
+
+    The condition is one equation per bond type and it is determinate, not
+    fitted: the net force along the type's bonds must vanish at the geometry the
+    template's reference energy belongs to.  It is solved rather than optimized
+    for the same reason the depth is -- a margin objective given a say in the
+    geometry would trade the molecule against the barriers, and the geometry is
+    data.
+
+    **What absorbs what.**  Only the bond `r0` moves.  `bondbond` and
+    `bondangle` carry reference lengths of their own and keep them: those terms
+    are q-force's own cross-coupling fit, and shifting their reference changes
+    what they mean rather than where they sit.  Their gradient at the reference
+    geometry is part of what the bond `r0` is solved against, which is the
+    consistent reading -- the condition is on the total, and the total is what
+    the calculator computes.
+
+    Solved by fixed point rather than by a root finder.  Everything except a
+    type's own Morse is nearly constant in that type's `r0`, so subtracting the
+    Morse's own contribution leaves an external force to cancel, and the `r0`
+    that cancels it follows from a one-dimensional bracket on an analytic
+    function.  The residual coupling -- through atoms two bonds share, and
+    through the angle terms -- is what the iteration is for.
+    """
+    types = bond_types(terms)
+    if not types:
+        return list(terms)
+
+    ev_per_qforce = units.kJ / units.mol / units.nm
+    original = [r0 for r0, _ in types]
+    current = list(original)
+
+    # One pass.  The alternation with the depth solve lives in
+    # `fit_template`; doing it in both places converges to the wrong place,
+    # because the extra passes refine towards a fixed point of a stale `D`.
+    # See `LENGTH_DEPTH_ROUNDS` for the numbers.
+    working = set_bond_lengths(terms, current)
+    params = {
+        key: (t["kwargs"]["D"], t["kwargs"]["k"], t["kwargs"].get("c", 0.0))
+        for t in working
+        if t["type"] == "bond"
+        for key in [(t["kwargs"]["r0"], t["kwargs"]["k"])]
+    }
+    total = stretch_forces(atoms, working)
+    lengths = bond_lengths(working, atoms)
+
+    for index, (r0, k) in enumerate(bond_types(working)):
+        D, k_value, c = params[(r0, k)]
+        # The type's own Morse contribution to `total[index]`, so that what
+        # is left is the part no choice of `r0` can change.
+        bond_r = np.asarray(lengths[index], dtype=float)
+        own = (
+            float(_morse_stretch_force(bond_r, D, r0, k_value, c).sum()) * ev_per_qforce
+        )
+        external = total[index] - own
+
+        def residual(trial, _r=bond_r, _D=D, _k=k_value, _c=c, _e=external):
+            """Total force along this bond type if its `r0` were `trial`.
+
+            Vectorized over `trial`, so the grid below is a single call.
+            """
+            mine = _morse_stretch_force(
+                _r, _D, np.asarray(trial, dtype=float)[..., None], _k, _c
+            ).sum(-1)
+            return mine * ev_per_qforce + _e
+
+        # Shortening `r0` stretches the bond and so pulls harder -- but
+        # only up to a point.  A Morse's pull peaks at `D*a/2` and falls
+        # away again past the inflection, so an external push above that
+        # ceiling cannot be cancelled at any bond length.  That is not a
+        # bracketing failure to be widened around; it is the functional
+        # form running out, and it is common enough here to be worth
+        # naming: `ZBL` pushes O-O in HO2 apart with 25.0 eV/A and that
+        # bond's Morse, as q-force parameterizes it, tops out at 8.3.
+        #
+        # The ceiling moves with `D`, `k` and `c`, all of which the outer
+        # fit and the depth solve are free to raise, so infeasible here
+        # means "not at these force constants" rather than "not at all":
+        # at `c = 19.3` seven of HCombustion's eight bond types come
+        # inside it, and the eighth does at `k`-scale 2.
+        # The search window is `MAX_LENGTH_SHIFT` either side of the
+        # length the template arrived with, so both branches below are
+        # bounded by the same tripwire rather than by whatever bracket
+        # happened to be tried.
+        low = original[index] - MAX_LENGTH_SHIFT
+        high = original[index] + MAX_LENGTH_SHIFT
+        grid = np.linspace(low, high, 400)
+        values = residual(grid)
+
+        # Not a sign test on the endpoints.  The pull peaks part-way down
+        # and falls off again past the inflection, so when a solution
+        # exists there are *two* roots and both ends of the window can sit
+        # on the same side of zero.  Bracket from the strongest pull
+        # outward to `high`, which picks the root nearer the bond length:
+        # the far one shortens `r0` past the inflection, where the
+        # curvature has the wrong sign and the "minimum" is a maximum.
+        peak = int(np.argmin(values))
+        if values[peak] <= 0.0 <= values[-1]:
+            current[index] = brentq(
+                lambda x: float(residual(x)),
+                grid[peak],
+                high,
+                xtol=1e-14,
+                rtol=1e-15,
+            )
+        elif strict:
+            raise DissociationFitError(
+                f"no bond length within {MAX_LENGTH_SHIFT} nm cancels the "
+                f"{external:+.3f} eV/A pushing the {types[index]} bonds "
+                f"apart: this Morse pulls at most "
+                f"{-(values[peak] - external):.3f} eV/A there"
+            )
+        else:
+            # Best effort, for a baseline or a report: the length that
+            # leaves the least force behind.  The caller is told nothing
+            # here, which is why `strict` is the default.
+            current[index] = float(grid[np.argmin(np.abs(values))])
+
+    return set_bond_lengths(terms, current)
+
+
+def fit_template(
+    atoms: Atoms,
+    terms: list[Term],
+    strict: bool = True,
+    rounds: int = LENGTH_DEPTH_ROUNDS,
+) -> list[Term]:
+    """Solve one template's `r0` and `D` together at its reference geometry.
+
+    Two determinate conditions, not an optimization: the total energy equals the
+    reference atomization energy (`fit_dissociation_energies`), and the total
+    force along every bond vanishes (`fit_bond_lengths`).  They couple only
+    through `a = sqrt(k / 2D)` -- a deeper well is a narrower one, which moves
+    the gradient at a fixed geometry -- so alternating them converges rather
+    than needing a joint solve.
+
+    This is the inner solve of `fit_force_constants`: whatever `c` and `k` the
+    outer search is trying, the geometry and the atomization energy are restored
+    underneath it, so neither is something the margin objective can spend.
+    """
+    fitted = list(terms)
+    for _ in range(rounds):
+        fitted = fit_dissociation_energies(
+            atoms, fit_bond_lengths(atoms, fitted, strict)
+        )
+    return fitted
 
 
 def scale_factor(atoms: Atoms, terms: list[Term], fitted: list[Term]) -> float:
@@ -307,12 +1010,19 @@ class ForceConstantFit:
     mode: str = "shape"
     # Fitted Morse depth per `(template, r0, k)`, in eV, so a report can quote
     # the shape term's bump as an energy rather than as a bare coefficient.
-    # Keyed on the *input* `(r0, k)` because that is what `BondVariable` carries;
-    # the inner solve moves `D` but never `r0` or `k`.
+    # Keyed on the *input* `(r0, k)` because that is what `BondVariable` carries.
+    # The inner solve moves `D` and `r0`; `k` is the outer search's.
     depths: dict[tuple[str, float, float], float] = field(default_factory=dict)
     # Force-constant scale per bond type; all 1.0 unless `mode == "both"`, where
     # `scales` holds `c` and the frequencies move as well.
     k_scales: list[float] = field(default_factory=list)
+    # Total second derivative along each bond type at its template's reference
+    # geometry, in eV/A**2, aligned with `variables`.  Reported separately from
+    # the fitted `k` because they are no longer the same quantity: `ZBL` adds
+    # curvature at the bond length that the bonded parameters do not know
+    # about, and it is roughly as large as the bond's own.  A report that
+    # quotes only the fitted `k` understates the real stiffness by about 2x.
+    curvatures: list[float] = field(default_factory=list)
 
 
 def bond_types(terms: list[Term]) -> list[tuple[float, float]]:
@@ -427,6 +1137,52 @@ def frequency(force_constant: float, mass_a: float, mass_b: float) -> float:
     return float(omega / (2.0 * np.pi * units._c * 100.0))
 
 
+def total_wavenumber(curvature: float, mass_a: float, mass_b: float) -> float:
+    """Harmonic wavenumber (cm^-1) of a diatomic with this *total* curvature.
+
+    `frequency` above answers the same question about a bonded force constant,
+    which used to be the same number and is not any more.  The repulsion adds
+    curvature at the bond length -- 68.5 eV/A**2 at O-H, on its own worth
+    4431 cm^-1 -- and `fit_bond_lengths` displaces `r0` far enough that the
+    shape term adds more again, so the bonded `k` understates the stiffness the
+    integrator actually sees by a factor of two to four.
+
+    This is the number the timestep is set by: a stable velocity-Verlet run
+    wants ~15 steps per period, so a step of `dt` femtoseconds needs every mode
+    under `33356 / (15 dt)` cm^-1 -- 4450 at 0.5 fs.
+
+    `curvature` in eV/A**2, masses in amu.
+    """
+    return wavenumber(curvature, mass_a * mass_b / (mass_a + mass_b))
+
+
+def wavenumber(curvature: float, reduced_mass: float) -> float:
+    """`total_wavenumber` given the reduced mass directly, in amu.
+
+    The form the objective uses, because `reduced_masses` below precomputes the
+    reduction once for the whole search and there is nothing to be gained by
+    undoing it and redoing it a few hundred thousand times.
+    """
+    stiffness = curvature * units._e / 1e-20
+    if stiffness <= 0.0:  # a bond that is not at a minimum has no wavenumber
+        return 0.0
+    return float(
+        np.sqrt(stiffness / (reduced_mass * units._amu)) / (2 * np.pi * units._c * 1e2)
+    )
+
+
+def reduced_masses(variables: list["BondVariable"]) -> np.ndarray:
+    """Reduced mass in amu of each variable's bond, aligned with `variables`."""
+    return np.array(
+        [
+            (lambda a, b: a * b / (a + b))(
+                *(atomic_masses[atomic_numbers[e]] for e in variable.elements)
+            )
+            for variable in variables
+        ]
+    )
+
+
 def diabatic_energy(reaction_set, qforce: QForce, frame: Atoms, positions) -> float:
     """Total energy of `frame`'s connectivity evaluated at `positions`.
 
@@ -449,7 +1205,9 @@ def diabatic_energy(reaction_set, qforce: QForce, frame: Atoms, positions) -> fl
     topology = Topology.from_atoms(atoms)
     topology.set_terms(reaction_set.get_terms(topology))
     energy = qforce(atoms.positions, atoms.pbc, atoms.cell, topology.term_dict)[0]
-    return energy + nonbonded_energy(atoms, topology.term_dict)
+    energy += nonbonded_energy(atoms, topology.term_dict)
+
+    return energy
 
 
 def install_templates(
@@ -465,6 +1223,13 @@ def install_templates(
     fit has not yet decided to keep.  Only `kwargs` change, so the stored
     `Topology` graphs and hashes stay valid; the remapped-term cache does not,
     and is cleared.
+
+    Only `kwargs` change, so no term list is rebuilt on the way in.  This used
+    to route through `lj.with_exclusions`, and installing without it silently
+    stripped the exclusion terms off every template: the global Lennard-Jones
+    sum then stood uncancelled inside `nonbonded_energy` and every margin read
+    feasible by hundreds of eV (rxn_14 by +2131) whatever the force constants
+    were.  `ZBL` needs no exclusions, so there is nothing left to strip.
     """
     from DynamicTopology.core.topology import Topology
 
@@ -509,6 +1274,9 @@ def fit_force_constants(
     max_scale: float = DEFAULT_MAX_SCALE,
     mode: str = "both",
     max_shape: float = DEFAULT_MAX_SHAPE,
+    geometry_weight: float = DEFAULT_GEOMETRY_WEIGHT,
+    max_wavenumber: float = DEFAULT_MAX_WAVENUMBER,
+    curvature_weight: float = DEFAULT_CURVATURE_WEIGHT,
 ) -> ForceConstantFit:
     """Refit every template's force constants so the couplings become fittable.
 
@@ -520,12 +1288,23 @@ def fit_force_constants(
 
     The objective is a hinge, not a least squares:
 
-        J = sum_r max(0, margin - margin_r)**2 + frequency_weight * sum_b x_b**2
+        J = sum_r max(0, margin - margin_r)**2
+          + geometry_weight  * sum_b (leftover force at the reference geometry)**2
+          + curvature_weight * sum_b max(0, nu_b - max_wavenumber)**2
+          + frequency_weight * sum_b (x_b / box_b)**2
 
     A margin past the target is worth nothing -- the barrier is already
     reproduced exactly by the amplitude, which is free per reaction -- so the
     hinge stops pushing as soon as a channel is feasible and spends nothing more
-    of the frequency on it.
+    on it.  The same shape is used for the wavenumber: a mode under the cap is
+    free, and one over it pays.
+
+    The third term is the timestep, and it was missing for as long as this fit
+    existed.  Everything here was priced in `k`, whose bound is 1.41x in
+    wavenumbers, while the stiffness the integrator sees came mostly from
+    elsewhere -- the repulsion's own curvature and the shape term at a displaced
+    `r0` -- and reached 11735 cm^-1 with the `k`-scale reporting 1.41x.  See
+    `DEFAULT_MAX_WAVENUMBER` and `_bonded_curvature`.
 
     Args:
         reaction_set: a loaded `ReactionSet` for the same dataset.  **Mutated**:
@@ -538,6 +1317,9 @@ def fit_force_constants(
         margin: how far below the reference barrier a diabat must sit.
         frequency_weight: pull back towards the original force constants.
         max_scale: hard bound on each k-scale, in both directions.
+        max_wavenumber: stretching modes above this cost the objective.
+        curvature_weight: how much they cost.  Zero restores the old objective,
+            which is the vacuity check for the cap.
     """
     variables: list[BondVariable] = []
     for name, atoms, terms in templates:
@@ -586,9 +1368,26 @@ def fit_force_constants(
             list(x[lo:hi]),
         )
 
-    def refit(x: np.ndarray) -> list[list[Term]]:
+    # Both constant across the entire search: the elements do not change, and
+    # the nonbonded curvature is a function of the fixed template geometry.
+    # Measured once here rather than per objective evaluation, which is the
+    # difference between a hinge that costs nothing and one that doubles the
+    # cost of the fit.
+    masses = reduced_masses(variables)
+    frozen_nonbonded = [
+        nonbonded_curvatures(atoms, terms) for _, atoms, terms in templates
+    ]
+
+    def refit(x: np.ndarray, rounds: int = LENGTH_DEPTH_ROUNDS) -> list[list[Term]]:
+        """Every template's geometry and depth re-solved at this point.
+
+        Always best-effort on the geometry: where no bond length cancels the
+        repulsion, `fit_bond_lengths` leaves the closest it can and `score`
+        charges for what is left.  See `DEFAULT_GEOMETRY_WEIGHT` for why this
+        is a penalty and not a constraint.
+        """
         return [
-            fit_dissociation_energies(atoms, apply(terms, x, lo, hi))
+            fit_template(atoms, apply(terms, x, lo, hi), strict=False, rounds=rounds)
             for (_, atoms, terms), (lo, hi) in zip(templates, spans)
         ]
 
@@ -608,16 +1407,47 @@ def fit_force_constants(
 
     def score(x: np.ndarray) -> float:
         try:
-            install_templates(reaction_set, templates, refit(x))
+            # Two rounds, not four.  The inner solve is most of this fit's
+            # runtime and the objective only reads *margins* and a residual
+            # force, neither of which a 1e-4 eV/A refinement moves.  What gets
+            # written out is refit at full accuracy below.
+            fitted = refit(x, rounds=2)
+            install_templates(reaction_set, templates, fitted)
         except DissociationFitError:
             # These force constants leave some template with no depth scale that
             # reproduces its atomization energy.  Not a failure of the fit, just
             # a point the outer solve should walk away from.
             return np.inf
+        leftover = np.array(
+            [
+                value
+                for (_, atoms, _), terms in zip(templates, fitted)
+                for value in stretch_forces(atoms, terms)
+            ]
+        )
         shortfall = [
             max(0.0, margin - value)
             for value in reaction_margins(reaction_set, reactions).values()
         ]
+        # Stretching wavenumbers, in `variables` order.  `stretch_curvatures`
+        # rather than `bond_curvatures`: same number on every mode the cap can
+        # bind on, at a hundredth of the cost.  See its docstring for the one
+        # row where they differ and why it does not matter here.
+        overshoot = np.array(
+            [
+                max(0.0, wavenumber(curvature, mass) - max_wavenumber)
+                for mass, curvature in zip(
+                    masses,
+                    (
+                        value
+                        for (_, atoms, _), terms, nonbonded in zip(
+                            templates, fitted, frozen_nonbonded
+                        )
+                        for value in stretch_curvatures(atoms, terms, nonbonded)
+                    ),
+                )
+            ]
+        )
         # The regularizer is on the *fraction of the available box* each
         # variable uses, not on its raw value.  `c` and `log(k-scale)` live on
         # scales that differ by an order of magnitude, and `c`'s own bound moves
@@ -628,13 +1458,21 @@ def fit_force_constants(
         # nothing to do with the physics.
         used = x / scale_of
         return float(
-            np.dot(shortfall, shortfall) + frequency_weight * np.dot(used, used)
+            np.dot(shortfall, shortfall)
+            + geometry_weight * np.dot(leftover, leftover)
+            + curvature_weight * np.dot(overshoot, overshoot)
+            + frequency_weight * np.dot(used, used)
         )
 
     # Length of the search vector: `both` carries a `c` and a log k-scale per
     # bond type, the single-parameter modes carry one each.
     n_x = width * (2 if mode == "both" else 1)
 
+    # The baseline is taken with the geometry solve in best-effort mode.  At
+    # `c = 0` and `k`-scale 1 several bond types cannot cancel `ZBL` at any
+    # length -- see `fit_bond_lengths` -- so the strict solve has no answer
+    # there, and refusing to report a "before" column because the *starting*
+    # point is infeasible would be reporting nothing at all.
     install_templates(reaction_set, templates, refit(np.zeros(n_x)))
     before = reaction_margins(reaction_set, reactions)
 
@@ -659,6 +1497,28 @@ def fit_force_constants(
             box = [(-bound, bound)] * width
         else:
             box = [(0.0, max_shape)] * width + [(-bound, bound)] * width
+        # **The search converges on its own; there is nothing here to cap.**
+        # Worth writing down because it was twice diagnosed wrongly.  Swept over
+        # `mode="shape"` from plain Morse, which is the slowest configuration:
+        #
+        #     budget         time    nfev   objective   channels
+        #     maxfev=200     8.0s     200   135.18145   12 -> 14
+        #     maxfev=400    16.0s     400     6.05919   12 -> 15
+        #     maxfev=800    32.3s     800     5.72266   12 -> 14
+        #     maxfev=2000   49.5s    1219     5.71545   12 -> 15
+        #
+        # The last row is the answer: `nfev` came in *under* its cap, so Powell
+        # stopped on `xtol`/`ftol` at 1219 evaluations and about fifty seconds.
+        # Everything past 400 is noise -- the objective moves 6.059 to 5.715 and
+        # the channel count wanders between 14 and 15 while improving, because
+        # the hinge, the regularizer and the geometry penalty will trade a
+        # marginal channel against each other.
+        #
+        # `maxiter` was the wrong knob regardless: it counts Powell *sweeps*
+        # while `maxfev` counts evaluations, and with `maxfev` defaulting to
+        # `N * 1000` the sweep cap is never what binds.  Capping it at 30 and
+        # then at 10 changed nothing, which is what sent this looking in the
+        # wrong place to begin with.
         result = minimize(
             score,
             np.zeros(len(box)),
@@ -675,6 +1535,11 @@ def fit_force_constants(
 
     fitted = refit(solution)
     install_templates(reaction_set, templates, fitted)
+    curvatures = [
+        value
+        for (_, atoms, _), terms in zip(templates, fitted)
+        for value in bond_curvatures(atoms, terms)
+    ]
     return ForceConstantFit(
         terms={name: terms for (name, _, _), terms in zip(templates, fitted)},
         variables=variables,
@@ -688,6 +1553,7 @@ def fit_force_constants(
             else [1.0] * width
         ),
         mode=mode,
+        curvatures=curvatures,
         margins=reaction_margins(reaction_set, reactions),
         margins_before=before,
         depths={

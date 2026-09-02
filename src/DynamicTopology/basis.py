@@ -216,6 +216,8 @@ class EVBBasis:
         # only to deliberately bound multi-step chains.
         self.max_depth = max_states if max_depth is None else max_depth
 
+        self._bimol_cutoff: float = 4.0
+
         self._energy_cache: dict[StateKey, tuple[float, np.ndarray]] = {}
         self._reaction_cache: dict[StateKey, list[tuple[Reaction, dict]]] = {}
         self._coupling_cache: dict[tuple, tuple[float, np.ndarray]] = {}
@@ -287,7 +289,16 @@ class EVBBasis:
         return self._molecule_terms(molecule, atoms)[0]
 
     def _local_energy(self, graph: nx.Graph, atoms: Atoms) -> float:
-        """Bonded energy of the molecules in `graph`, summed over components."""
+        """Bonded energy of the molecules in `graph`.
+
+        Bonded only, because that is now the whole of what differs between two
+        diabats.  Both nonbonded terms -- `ACKS2` and `ZBL` -- are functions of
+        the geometry and the elements alone, so they contribute equally to every
+        state of a block and cancel from the gap this screens on.  That is the
+        property the previous Lennard-Jones design did not have, and paying for
+        it here is what the Lennard-Jones correction that used to sit on this
+        line was doing.
+        """
         return sum(
             self._molecule_energy(Topology(graph.subgraph(nodes)), atoms)
             for nodes in nx.connected_components(graph)
@@ -373,6 +384,7 @@ class EVBBasis:
 
     def _energy(self, state: Topology, atoms: Atoms) -> tuple[float, np.ndarray]:
         """Diabatic energy and forces of one state at the current geometry.
+
 
         Evaluated over the state's own atoms rather than the whole system.
         `QForce.__call__` forms a full N x N x 3 displacement array per call, so
@@ -492,6 +504,7 @@ class EVBBasis:
         self._reaction_cache.clear()
         self._coupling_cache.clear()
         self._molecule_cache.clear()
+        self._bimol_cutoff = bimol_cutoff
 
         network = self.reaction_set.get_network(seed, bimol_cutoff)
         blocks: list[Block] = []

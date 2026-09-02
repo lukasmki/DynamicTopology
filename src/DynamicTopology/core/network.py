@@ -103,9 +103,7 @@ class ReactionNetwork:
         blocks: list[tuple[list[dict], list[Topology]]] = []
         claimed: set[int] = set()
         for members in grouped.values():
-            mol_ids: list[int] = sorted(
-                {m for i in members for m in endpoints[i]}
-            )
+            mol_ids: list[int] = sorted({m for i in members for m in endpoints[i]})
             claimed.update(mol_ids)
             blocks.append(
                 ([reactions[i] for i in members], [molecules[m] for m in mol_ids])
@@ -152,9 +150,7 @@ class ReactionNetwork:
                     best[key] = (strength, rxn_data, Si)
 
             block_states: list[tuple[dict | None, Topology]] = [(None, S0)]
-            block_states.extend(
-                (rxn_data, Si) for _, rxn_data, Si in best.values()
-            )
+            block_states.extend((rxn_data, Si) for _, rxn_data, Si in best.values())
 
             states.append(block_states)
         return states

@@ -140,8 +140,7 @@ def atom_energy(
         spin = ATOM_SPIN[symbol]
     except KeyError as exc:
         raise KeyError(
-            f"No ground-state spin known for element {symbol!r}; "
-            "add it to ATOM_SPIN."
+            f"No ground-state spin known for element {symbol!r}; add it to ATOM_SPIN."
         ) from exc
 
     mol = gto.M(

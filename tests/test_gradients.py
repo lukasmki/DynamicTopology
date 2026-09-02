@@ -12,6 +12,9 @@ from ase import units
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.acks2 import ACKS2
 from DynamicTopology.forcefield.coupling import EVBCoupling
+from DynamicTopology.forcefield.lj import LennardJones
+from DynamicTopology.forcefield.zbl import ZBL
+from DynamicTopology.forcefield import zbl as zbl_module
 
 from geometry import REACTION, REACTION_PATH_RAMP, reaction_path
 
@@ -396,8 +399,253 @@ class TestACKS2Gradients:
 
 
 # ---------------------------------------------------------------------------
+# ZBL gradient tests
+# ---------------------------------------------------------------------------
+
+
+class TestZBLGradients:
+    """The screened-nuclear repulsion that opposes ACKS2's contact funnel.
+
+    Checked across the whole range it is asked to work over, because it is asked
+    to work over an unusually wide one: it must be a hard wall at 0.3 A, a few eV
+    at bond lengths, and a fraction of that in the van der Waals region, and the
+    screening function is a sum of four exponentials whose derivative is easy to
+    get subtly wrong in a way that only shows up at one end.
+
+    `ZBL` is the only force field here that does not take a `term_dict`; it reads
+    atomic numbers straight off the `Atoms`.  That is deliberate -- see
+    `forcefield/zbl.py` -- so these tests pass `numbers` directly and there is no
+    term-order/global-order case to check.
+    """
+
+    zbl = ZBL()
+
+    @pytest.mark.parametrize("z1, z2", [(1, 1), (8, 1), (8, 8)], ids=["hh", "oh", "oo"])
+    @pytest.mark.parametrize(
+        "r",
+        [0.3, 0.6, 0.777, 0.96, 1.21, 3.0],
+        ids=["core", "fusion", "hh_bond", "oh_bond", "oo_bond", "vdw"],
+    )
+    def test_pair_potential(self, z1, z2, r):
+        """`du/dr` against central differences, decade by decade."""
+        r = np.array([float(r)])
+        z_1, z_2 = np.array([float(z1)]), np.array([float(z2)])
+        _, analytic = zbl_module.pair_potential(r, z_1, z_2)
+
+        h = 1e-7
+        numeric = (
+            zbl_module.pair_potential(r + h, z_1, z_2)[0]
+            - zbl_module.pair_potential(r - h, z_1, z_2)[0]
+        ) / (2 * h)
+        assert analytic == pytest.approx(numeric, rel=1e-5)
+
+    @pytest.mark.parametrize(
+        "positions", [POS_2, POS_3, POS_4, POS_H2O2], ids=["n2", "n3", "n4", "h2o2"]
+    )
+    def test_all_pairs(self, positions):
+        numbers = np.array([8 if i % 2 == 0 else 1 for i in range(len(positions))])
+
+        def energy_fn(p):
+            return self.zbl(p, numbers, PBC, CELL)[0]
+
+        _, f_analytical = self.zbl(positions, numbers, PBC, CELL)
+        f_numerical = finite_difference_forces(energy_fn, positions)
+        np.testing.assert_allclose(f_analytical, f_numerical, atol=1e-5, rtol=1e-5)
+
+    def test_forces_under_periodic_boundaries(self):
+        """The minimum-image path has its own branch and its own gradient."""
+        rng = np.random.default_rng(11)
+        positions = rng.uniform(0.0, 6.0, (10, 3))
+        numbers = rng.choice([1, 8], size=10)
+        cell = np.eye(3) * 6.0
+        pbc = np.ones(3, dtype=bool)
+
+        def energy_fn(p):
+            return self.zbl(p, numbers, pbc, cell)[0]
+
+        _, f_analytical = self.zbl(positions, numbers, pbc, cell)
+        f_numerical = finite_difference_forces(energy_fn, positions, delta=1e-5)
+        np.testing.assert_allclose(f_analytical, f_numerical, atol=1e-4, rtol=1e-4)
+
+    def test_it_is_repulsive_and_monotone_everywhere(self):
+        """Positive, decreasing, and with a restoring force at every separation.
+
+        A capped or tapered wall satisfies the first and fails the third exactly
+        where it matters -- the force goes to zero inside the plateau and atoms
+        drift through it.  This is the property that makes the term work as a
+        guard rather than merely as a large number.
+        """
+        r = np.geomspace(0.05, 8.0, 400)
+        for z1, z2 in [(1.0, 1.0), (8.0, 1.0), (8.0, 8.0)]:
+            u, du_dr = zbl_module.pair_potential(
+                r, np.full_like(r, z1), np.full_like(r, z2)
+            )
+            assert np.all(u > 0.0)
+            assert np.all(np.diff(u) < 0.0)
+            assert np.all(du_dr < 0.0)
+
+    def test_it_beats_the_acks2_funnel_at_contact(self):
+        """The whole point of the term, as a number.
+
+        ACKS2 pulls an O-H pair downhill monotonically to -4.03 eV at contact
+        with no repulsive branch of its own; a 200-atom box run against it alone
+        reached 0.60 A intermolecular contacts.  At that separation this term has
+        to be worth substantially more than kT = 0.26 eV against it.
+        """
+        r = np.array([0.6])
+        u = zbl_module.pair_potential(r, np.array([8.0]), np.array([1.0]))[0]
+        assert u[0] > 15.0  # measured: 20.9 eV, against ACKS2's -2.19 eV there
+
+
+# ---------------------------------------------------------------------------
 # EVBCoupling gradient tests
 # ---------------------------------------------------------------------------
+
+
+class TestLennardJonesGradients:
+    """The Pauli/dispersion term, in both of the forms it is evaluated in.
+
+    It is computed twice by design -- once over all pairs by `LennardJones` and
+    once per near-neighbour pair by `QForce.compute_exclusion`, which subtracts
+    it again -- and the two must be the same function of the geometry to the
+    last bit or an isolated template stops reproducing its own energy.  So each
+    is checked against finite differences here, and `test_the_two_forms_cancel`
+    checks them against each other.
+
+    `POS_2` sits at 0.856 A, well inside sigma, so these run on the steep
+    repulsive branch where a sign error in `du/dr` cannot hide.
+    """
+
+    lj = LennardJones()
+    qf = QForce()
+
+    # q-force units: sigma in nm, eps in kJ/mol.  O and the hydrogen values
+    # derived from its van der Waals radius, as the dataset carries them.
+    SIGMA = [0.296, 0.196]
+    EPS = [0.71128, 0.184]
+
+    def _atom_terms(self, n):
+        return make_term(
+            "lennardjones",
+            [[i] for i in range(n)],
+            sigma=[self.SIGMA[i % 2] for i in range(n)],
+            eps=[self.EPS[i % 2] for i in range(n)],
+        )
+
+    @pytest.mark.parametrize(
+        "positions", [POS_2, POS_3, POS_4, POS_H2O2], ids=["n2", "n3", "n4", "h2o2"]
+    )
+    def test_all_pairs(self, positions):
+        td = self._atom_terms(len(positions))
+
+        def energy_fn(p):
+            return self.lj(p, PBC, CELL, td)[0]
+
+        _, f_analytical = self.lj(positions, PBC, CELL, td)
+        f_fd = finite_difference_forces(energy_fn, positions)
+        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize("positions", [POS_2, POS_3, POS_4], ids=["n2", "n3", "n4"])
+    def test_exclusion(self, positions):
+        """The negative pair term `QForce` subtracts for intramolecular pairs."""
+        n = len(positions)
+        rows, sigma, eps = [], [], []
+        for i in range(n):
+            for j in range(i + 1, n):
+                rows.append([i, j])
+                sigma.append(np.sqrt(self.SIGMA[i % 2] * self.SIGMA[j % 2]))
+                eps.append(np.sqrt(self.EPS[i % 2] * self.EPS[j % 2]))
+        td = make_term("exclusion", rows, sigma=sigma, eps=eps)
+
+        def energy_fn(p):
+            return self.qf(p, PBC, CELL, td)[0]
+
+        _, f_analytical = self.qf(positions, PBC, CELL, td)
+        f_fd = finite_difference_forces(energy_fn, positions)
+        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize(
+        "positions", [POS_2, POS_3, POS_4, POS_H2O2], ids=["n2", "n3", "n4", "h2o2"]
+    )
+    def test_the_two_forms_cancel(self, positions):
+        """One small molecule: every pair is a near neighbour, so the sum is zero.
+
+        This is the identity the whole decomposition rests on -- the global sum
+        minus the per-molecule exclusions -- and it is asserted to machine
+        precision rather than to a tolerance, because nothing here is an
+        approximation: the same `pair_potential` is evaluated twice with
+        opposite signs.
+        """
+        n = len(positions)
+        rows, sigma, eps = [], [], []
+        for i in range(n):
+            for j in range(i + 1, n):
+                rows.append([i, j])
+                sigma.append(np.sqrt(self.SIGMA[i % 2] * self.SIGMA[j % 2]))
+                eps.append(np.sqrt(self.EPS[i % 2] * self.EPS[j % 2]))
+
+        global_energy, global_forces = self.lj(
+            positions, PBC, CELL, self._atom_terms(n)
+        )
+        exclusion_energy, exclusion_forces = self.qf(
+            positions, PBC, CELL, make_term("exclusion", rows, sigma=sigma, eps=eps)
+        )
+        assert abs(global_energy + exclusion_energy) < 1e-9 * max(
+            1.0, abs(global_energy)
+        ), f"{global_energy} does not cancel {exclusion_energy}"
+        np.testing.assert_allclose(
+            global_forces, -exclusion_forces, atol=1e-9, rtol=1e-9
+        )
+
+    @pytest.mark.parametrize("separation", [0.744, 0.3, 0.2, 0.024])
+    def test_a_compressed_bond_stays_within_precision(self, separation):
+        """The decomposition must survive a bond being crushed.
+
+        `E = sum_all_pairs - sum_near_pairs` evaluates every *bonded*
+        pair in both sums, at a separation where plain 12-6 is enormous.  At
+        equilibrium that is merely ugly.  On a hot trajectory it destroyed the
+        3000 K probe: an H2 bond compressed towards contact put 1e8 eV into both
+        sums by step 130, 1e10 by step 140, and 1e21 by step 143 -- at which
+        point their difference, the physical energy of order 1e2, came back
+        quantized to 2**22 eV, the forces went with it, and the box heated to
+        1e16 K.  The potential energy alone looked fine the whole way down,
+        which is why this is asserted on the magnitude rather than on the total.
+
+        `pair_potential`'s linear continuation is what bounds it.  Both halves
+        go through that function, so the cancellation stays exact as well --
+        which is the other half of the assertion, and the half that broke when
+        `compute_exclusion` still open-coded the form.
+        """
+        pos = np.array([[0.0, 0.0, 0.0], [separation, 0.0, 0.0]])
+        sigma = np.sqrt(self.SIGMA[0] * self.SIGMA[1])
+        eps = np.sqrt(self.EPS[0] * self.EPS[1])
+
+        total, forces = self.lj(pos, PBC, CELL, self._atom_terms(2))
+        cancel, cancel_forces = self.qf(
+            pos,
+            PBC,
+            CELL,
+            make_term("exclusion", [[0, 1]], sigma=[sigma], eps=[eps]),
+        )
+
+        # Bounded: unlinearized 12-6 reaches 8e7 eV at 0.3 A and 1e21 at 0.024.
+        assert abs(total) < 1e5, (
+            f"a bond at {separation} A contributes {total:.3e} eV to the "
+            "whole-system sum; the difference of two such numbers has no "
+            "precision left and the forces derived from it are noise"
+        )
+        assert abs(total + cancel) < 1e-6, (
+            f"at {separation} A the global sum ({total:.6e}) and the exclusion "
+            f"({cancel:.6e}) no longer cancel"
+        )
+        np.testing.assert_allclose(forces, -cancel_forces, atol=1e-6, rtol=1e-9)
+
+
+@pytest.fixture(scope="module")
+def reaction_set():
+    from DynamicTopology.core import ReactionSet
+
+    return ReactionSet(RSET_PATH)
 
 
 class TestEVBCouplingGradients:

@@ -12,8 +12,8 @@ produced it.
 | seeds | 5 per composition — 25 runs |
 | temperature | 3000 K, Langevin, friction 0.01/fs |
 | box | **22.44 Å fixed** — constant *number* density, ~200 atoms throughout |
-| timestep | 0.25 fs |
-| length | 100 ps (400,000 steps), a frame every 25 fs |
+| timestep | **0.5 fs** |
+| length | 100 ps (200,000 steps), a frame every 25 fs |
 
 **Why the box is fixed rather than the density.** O2 is sixteen times heavier than H2, so holding
 mass density at the usual 250 kg/m³ while sweeping composition would run the box from 24.4 Å at
@@ -22,9 +22,11 @@ composition and confound the only variable being swept. Holding the volume fixed
 density vary instead (320 → 78 kg/m³), which is the honest trade: one of the two has to move, and
 concentration is the one that would otherwise masquerade as chemistry.
 
-**Why 0.25 fs.** The refit in `fit.dissociation` took the H–H stretch to 5282 cm⁻¹, a 6.3 fs
-period. The script's 0.5 fs default is ~13 steps per period, which is acceptable at 2000 K and not
-worth relying on at 3000 K.
+**Why 0.5 fs.** The timestep is set by the fastest vibrational mode and by nothing else — velocity
+Verlet wants ~15 steps per period. That mode was 11697 cm⁻¹ (a 2.84 fs period) because nothing in the
+force-constant fit priced curvature; it is now 4399 cm⁻¹, and 0.5 fs follows. Measured, not reasoned
+about: see `sweep.toml` for the NVE ladder, the thermostatted comparison against 0.25 fs, and what to
+re-measure after a refit.
 
 ## Running
 
@@ -47,8 +49,13 @@ own last frame, which now carries the bonding the run had reached rather than re
 
 ## Cost
 
-~290 ms per force call at 200 atoms, so 400,000 steps is **~32 h per run** and ~800 core-hours for
-the sweep. The 25 runs are independent and single-threaded; parallelism comes from the array.
+~202 ms per force call at 200 atoms, so 200,000 steps is **~11 hours per run** and ~280 core-hours for
+the sweep. The 25 runs are independent and single-threaded; parallelism comes from the array, and a
+run now fits inside the 48 h wall on its own.
+
+This used to be ~10 days per run and ~250 days across the sweep. The entire difference is the
+timestep, and the entire reason the timestep could move is that the force field's stretching
+frequencies came down by a factor of 2.7 — see below.
 
 ## Reading the result
 
@@ -72,17 +79,129 @@ means the dataset moved.
 - `submit.slurm` — SLURM array over the indices
 - `run_all_local.sh` — the same, on one machine
 
-## Status: built and verified, NOT yet submitted
+## Status: submittable
 
-A probe at 3000 K found a blocker that is **not** in this directory and not in the sweep design.
-`E_nonbonded` runs away monotonically (+0.60 → −66.95 eV in 0.1 ps on the 2:1 box) while the bonded
-energy stays flat and no species ever changes. The cause is in `forcefield/acks2.py`: the
-bond-softness block is built over *all* atom pairs with a 2.7–4.4 Å decay rather than being
-restricted to bonded pairs, and only *total* charge is constrained, so charge flows freely between
-molecules that share no bond. After 0.1 ps, 44 of 99 neutral H2/O2 molecules carry net charge, one
-of them 1.29 e.
+Every blocker previously recorded here is resolved. What follows is the history, because each fix
+was found by the previous one and the sequence is the argument.
 
-It is pre-existing — re-scoring the old pre-refit trajectory shows the same runaway (−124.65 eV by
-0.29 ps) — but it means these 25 runs would measure an electrostatics artifact rather than
-combustion. Fix the charge constraint first; everything here is ready to run unchanged once that
-lands.
+### 1. There was no repulsion in the force field
+
+A probe at 3000 K found `E_nonbonded` running away monotonically (+0.60 → −66.95 eV in 0.1 ps on the
+2:1 box) while the bonded energy stayed flat and no species ever changed.
+
+**The cause was first attributed to `forcefield/acks2.py` — that was wrong.** ACKS2 was being handed
+geometries no charge model can describe. There was no Pauli repulsion anywhere in the force field, so
+nothing opposed two molecules occupying the same space: on `examples/nvt-n100-d250.xyz`, atoms in
+*different* molecules reached **0.044 Å**, 225 of the 227 sub-1.5 Å pairs involving a hydrogen —
+exactly the atom q-force assigns a zero Lennard-Jones radius. q-force had been emitting those
+parameters all along and `io/xml.py` was discarding them, because a `<Particle>` carries no atom
+indices and every per-particle force parsed to an empty `atoms` dict.
+
+**`forcefield/lj.py` supplied that term for four design iterations and never fixed it.** q-force's
+12-6 is 100–1000× too strong where reactive chemistry lives — 504 eV at the H2 bond length, 930 eV at
+O–H, 1348 eV at O–O — so a dissociated diabat had to have its wall *removed*, and every rule written
+to remove it (the union rule, the lost-exclusion rule, the reference topology, the coupling gate) took
+away either too much or too little. The box fused at 0.60 Å under one of them.
+
+`forcefield/zbl.py` supplies it now: the ZBL screened-nuclear repulsion over every pair, no
+exclusions, no cutoff, and **no topology**. Being identical across every diabatic state, it adds the
+same constant to every EVB diagonal, which `np.linalg.eigh` removes from the eigenvectors exactly —
+so it cannot produce a plateau, a spurious coupling amplitude, or a discontinuity at `bimol_cutoff`.
+
+### 2. Adding it broke the geometries, because nothing constrained the gradient
+
+ZBL is a real repulsion at bonding distances — 2.0 eV at the H2 bond length, 11.6 at O–O — and the
+dissociation fit had no `r0` degree of freedom to absorb it. It matched *energies* at each template's
+fixed QM geometry (to 1e-13) while nothing at all constrained the *gradient* there, so every template
+relaxed somewhere else: HO2's O–O opened by 0.825 Å, and the strain released as heat was the whole
+3000 K temperature excess (a packed box reached 5693 K in NVE with its total energy flat).
+
+`fit.dissociation.fit_bond_lengths` is the missing condition — one equation per bond type, the total
+force along it vanishing at the reference geometry, solved rather than fitted. Every bond now relaxes
+to within 0.009 Å of its reference.
+
+### 3. Fixing that broke the frequencies, and the frequencies were the timestep
+
+The Morse has to lean into the repulsion for the sum to be flat, which pulls `r0` 0.04–0.22 Å inside
+the reference bond length — and away from `r0` the Hulburt–Hirschfelder shape term `c` is not the
+free parameter three files claimed it was. Its curvature at that displacement was the largest single
+contribution to the stiffness of most bonds: 63 eV/Å² of H2's 115, 509 of O2's 793, 323 of HO's 480.
+
+Nothing priced it. `fit_force_constants` bounded the `k`-scale at 1.41× in wavenumbers and reported
+that as the frequency cost, while the surface it produced carried an **11697 cm⁻¹** stretch against
+an experimental 3738. That is a 2.84 fs period, and it is the entire reason this sweep was configured
+at 0.05 fs.
+
+`fit.dissociation.DEFAULT_MAX_WAVENUMBER` prices the total curvature directly. The fastest mode is
+now 4399 cm⁻¹ and the sweep runs at 0.5 fs. **The cap cost nothing:** 14 of 19 channels fittable,
+which is exactly what the uncapped fit gets — the fit had simply been spending `c` in the region
+where `c` is expensive, and there was an equally good region it had no reason to prefer.
+
+What it did cost is basis richness at one geometry: surveying all nineteen channels either side of
+the refit, `rxn_10` went from three states to two, `rxn_05` from two to one, and `rxn_11` from one to
+two. The channels are all still fitted; three amplitudes are no longer large enough to admit an extra
+diabat at their own transition states. `tests/geometry.py` moved to `rxn_13` and `rxn_14` because of
+it, and carries the survey.
+
+### Where the frequencies stop
+
+Every X–H stretch now sits *on* the repulsion's own curvature — H2 at 34.2 eV/Å² against ZBL's 33.9,
+water's O–H at 65.9 against 65.7. The Morse contributes essentially nothing. That floor is a property
+of the repulsion's functional form, not of any parameter, and it is what puts the O–H stretch at
+4349 cm⁻¹ against an experimental 3756.
+
+So the chemistry is still stiff by 15–20% on the X–H stretches and by more on O2, and going under it
+means changing the repulsion's form — a softer, longer-ranged core that keeps the divergence at
+contact but drops the curvature at bonding distances. That is a real piece of work with a full refit
+behind it, and it buys accuracy rather than timestep: 0.5 fs is already reached.
+
+### What the harness does now
+
+Validated end to end: `run_one.py 10 --steps 20` resolves the config, runs the calculator, and writes
+`config.json`, `log.jsonl` and `traj.xyz`; all 25 indices enumerate; 5 input boxes are packed.
+
+### Confirmed on this box at 3000 K over 2 ps, at 0.5 fs
+
+| | failing runs | required | measured |
+| --- | --- | --- | --- |
+| closest intermolecular approach | 0.60 / 0.62 Å | above 1.0 Å | **1.162 Å** |
+| `E_nonbonded` | −41.7 / −46.6 eV, monotone | bounded | **+0.02 … +0.60 eV** |
+| temperature | 3806 / 3960 / 6800 K | 3000 ± 150 K | **2960 K** mean |
+| basis capped | — | never | **0** |
+| NVE drift ratio per halving | — | ≥ 3 (dt²) | **4.21, 4.04** |
+
+The box does not react over 2 ps and is not expected to: the admission gate correctly closes at
+near-equilibrium geometries, and a barrier crossing is a rare event. That is why the sweep is 100 ps.
+
+### Two things previously recorded here that were wrong
+
+- *"No H2 + O2 initiation channel exists."* False. `Reaction(O2 + H2 -> HO2 + H)` is applicable to
+  the sweep box; 8 reactions are found there. The error was reading reactant formulas off the stored
+  forward direction, forgetting that `ReactionSet` stores both directions, reversed under the product
+  hash.
+- *"Reactions never fire, which may be the fundamental blocker."* False. At transition-state
+  geometries the basis goes to 3 and 2 states on the two reactions the suite exercises. Packed boxes
+  sit single-state because the admission gate correctly closes at near-equilibrium geometries, and a
+  40 fs probe cannot sample a barrier crossing. That is why the sweep is 100 ps.
+
+### The compute decision, which is no longer a decision
+
+At 202 ms/step, 100 ps at 0.5 fs is 2e5 steps ≈ **11 hours of serial compute per run**, ~280
+core-hours across the 25 runs, against `submit.slurm`'s 48 h wall. A run fits on its own.
+
+This section used to weigh three ways of fitting ~10 days per run into 48 hours — chained restarts,
+a longer allocation, or a shorter trajectory. Only the last was scientific, and it is the one that no
+longer has to be considered: 100 ps stays at 100 ps. `run_one.py --restart` still works and is still
+worth keeping for a job that hits the wall for some other reason, but nothing depends on it now.
+
+### What remains
+
+Nothing blocking. Two things worth knowing before reading results:
+
+1. **The stretching frequencies are still 15–20% high on X–H and more on O2**, held there by the
+   repulsion's own curvature rather than by any parameter. See *Where the frequencies stop* above.
+   Rates that depend on a vibrational partition function inherit that.
+2. **`Topology.from_atoms` still cuts bonds at a hard covalent-radii threshold** — O–H at 1.261 Å —
+   and a hot O–H oscillates across it. MD carries its topology and never sees this; reading a frame
+   back does, so `topologize.py`, `--restart` and any analysis that re-perceives can disagree with
+   the run about what is bonded. `analyze.py` reads the stored connectivity and is unaffected.

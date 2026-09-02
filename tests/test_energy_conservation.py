@@ -66,18 +66,72 @@ SEED = 0
 # each other no longer produce a multi-state basis at all -- fitted coupling
 # widths switch off at the reactant and product minima by construction -- so a
 # trajectory that crosses the admission gate has to start near a transition
-# state.  See `tests/geometry.py`.  Slightly on the reactant side of the saddle
-# rather than on it, so the run starts in a well and the kinetic energy the
-# drift is measured against is representative.
-GATE_START = -0.15
+# state.  See `tests/geometry.py`.  Right at the point where `REACTION`'s gate
+# opens, so a thermalized run crosses it in both directions rather than sitting
+# on one side.  Measured over 200 steps at `GATE_TEMPERATURE`, as the number of
+# times the basis changed size:
+#
+#     start t   0.06  0.08  0.10  0.11  0.12  0.13  0.14
+#     changes      0     0     1     1     2     2     2
+#
+# The two tests that use this assert `basis_changes > 0` themselves, so a value
+# that stops crossing fails loudly rather than passing vacuously -- which is how
+# the move from rxn_10 to rxn_13 was caught.
+GATE_START = 0.12
 GATE_TEMPERATURE = 1000.0  # K
 
-TIMESTEP = 0.05  # fs
+# **This is not the production timestep and is not meant to be.**  The sweep
+# runs at 0.5 fs; these cases run twenty times finer, deliberately.  Their job
+# is to detect forces inconsistent with the energy, and the sharpest detector is
+# a tight absolute tolerance at a step where discretization error is negligible
+# -- not a loose one at a step where it dominates.  What pins the production
+# step is `test_reference_energies.py::TestTemplateFrequencies`, which asserts
+# the fastest mode on the surface directly.
+#
+# Measured peak-to-peak drift as a fraction of the mean kinetic energy, on the
+# refitted surface:
+#
+#     case            0.1 fs    0.05 fs   0.025 fs
+#     H2O   (EVB)     8.76e-3   2.17e-3    5.41e-4
+#     H2O2  (EVB)     1.69e-2   4.16e-3    1.03e-3
+#     HO2   (Dyn)     4.17e-4   1.04e-4    2.59e-5
+#
+# 0.025 fs is the coarsest step that clears `DRIFT_TOL` on every case, and the
+# tolerance has never moved: it was set before the shape term existed, survived
+# the force-constant refit, and survives the wavenumber cap.  A tolerance that
+# has held across three changes to the force field is worth more than one
+# retuned to whatever the surface currently does.
+TIMESTEP = 0.025  # fs
 # Peak-to-peak drift, as a fraction of the mean kinetic energy.  Measured values
-# at this timestep are ~3e-4 (EVB) and ~1e-5 (DynamicTopology).
+# at this timestep are ~1.0e-3 (EVB) and ~2.6e-5 (DynamicTopology).
 DRIFT_TOL = 2e-3
 # Halving dt must shrink the drift by at least this much (ideal: 4.0).
 CONVERGENCE_TOL = 3.5
+
+# Coarsest rung of the dt-halving ladders.  Ten times what it was, because the
+# refit made the surface ten times softer -- the fastest stretch went from
+# 11697 cm^-1 to 4399 -- and a convergence test is worth more the closer it runs
+# to the step production actually uses.
+#
+# **One rung under 0.5 fs, and that is measured rather than cautious.**  At
+# 0.5 fs the ratios stop being reliable: the gate crossing reads 3.47, 3.46,
+# 4.36 and 3.18 depending only on how long the window is, and H2O+O2 moves from
+# 4.11 to 3.66 over the same change.  Neither is undersampling -- lengthening
+# the window does not settle them -- it is those cases leaving the dt^2 regime,
+# which is exactly the condition that makes this ladder stop measuring what it
+# is for.  At 0.25 fs every case reads 3.98 to 4.07 and is window-independent:
+#
+#     case                     0.25 fs    0.125 fs   0.0625 fs   ratios
+#     H2O+O2 (EVB)             1.01e-3     2.53e-4     6.4e-5    4.0, 4.0
+#     O2+O2  (Dyn)             4.52e-5     1.12e-5     2.8e-6    4.0, 4.0
+#     gate crossing (Dyn)      8.64e-3     2.15e-3    5.37e-4    4.02, 4.00
+#
+# The 200-atom production box is *not* at that edge at 0.5 fs -- it converges
+# 4.21 and 4.04 -- because its drift is spread over many soft modes rather than
+# concentrated in the one fast one an isolated molecule at 300 K has.  That
+# asymmetry is why the production step is measured on the production box and
+# asserted through the frequencies, not through this ladder.
+LADDER = (0.25, 0.125, 0.0625)
 
 
 @pytest.fixture(scope="module")
@@ -243,7 +297,7 @@ class TestEVBEnergyConservation:
     def test_drift_converges_with_timestep(self, reaction_set):
         atoms = build_atoms(reaction_set, ["H2O", "O2"])
         drifts = []
-        for dt in (0.1, 0.05, 0.025):
+        for dt in LADDER:
             total, _, changed, _ = run_nve(
                 atoms, EVB, reaction_set, dt_fs=dt, steps=int(round(4.0 / dt))
             )
@@ -285,7 +339,7 @@ class TestDynamicTopologyEnergyConservation:
             build_atoms(reaction_set, ["O2", "O2"]), DynamicTopology, reaction_set
         )
         drifts = []
-        for dt in (0.1, 0.05, 0.025):
+        for dt in LADDER:
             total, _, changed, _ = run_nve(
                 atoms,
                 DynamicTopology,
@@ -331,12 +385,12 @@ class TestDynamicTopologyEnergyConservation:
 
         The one that separates "continuous potential, finite timestep" from
         "smaller discontinuity": a step in the energy does not shrink with dt,
-        however small it is.  Measured ratios 4.00 and 4.00, on a run whose
-        basis does change size.
+        however small it is.  Measured ratios 4.02 and 4.00 at `LADDER`, on a run
+        whose basis does change size.
         """
         atoms = reaction_path(REACTION, GATE_START, CELL)
         drifts = []
-        for dt in (0.1, 0.05, 0.025):
+        for dt in LADDER:
             total, _, changed, basis_changes = run_nve(
                 atoms,
                 DynamicTopology,
@@ -369,27 +423,44 @@ class TestTopologyChangeContinuity:
     could not tell a broken swap from the baseline.
     """
 
-    # Started at `rxn_02`'s transition state.  `rxn_16`, which the rest of this
-    # file uses, holds a wider basis but is a *symmetric* hydrogen transfer, so
-    # a trajectory started there sits in one topology and the guard below --
-    # correctly -- reports that the test would be asserting nothing.  `rxn_02`
-    # is not symmetric and crosses four times in these 300 steps.
+    # A different channel from the rest of this file, and deliberately: the one
+    # `REACTION` names has to hold three states over a wide interval, while this
+    # one has to *recross a topology change*, and no channel on the current
+    # surface does both.  `tests/geometry.py:SWITCHING_REACTION` carries the
+    # survey that picked it and the two refits that moved it.
     REACTION = SWITCHING_REACTION
     START = SWITCHING_PATH_START
     TEMPERATURE = 1000.0
     STEPS = 300
     DT = 0.1  # fs; hot and coarse on purpose, to provoke switches
 
+    # Pooled over several seeds rather than run from the module `SEED` alone.
+    # A few atoms on a reactive surface are chaotic, so how many times one
+    # trajectory recrosses is not a property of the force field: adding a
+    # repulsion once took `SEED` from four crossings to one and tripped the
+    # vacuity guard below, while other seeds all still crossed twice or more.
+    # The assertion being guarded -- that a switch costs no energy -- is
+    # unchanged, and the repulsion cannot be what moves the barrier: `ZBL` is
+    # the same number on every diabatic state, so it cancels exactly out of the
+    # gap.  Pooling makes the guard depend on the surface rather than on one
+    # draw from a Maxwell distribution.
+    SEEDS = (SEED, 1, 2)
+
     def _trajectory(self, reaction_set):
-        """NVE on the pair, yielding (positions, previous_graph) at each switch."""
+        """NVE on the pair, pooling (positions, previous_graph) over `SEEDS`."""
+        switches, sizes, energies = [], [], []
+        for seed in self.SEEDS:
+            self._run_one(reaction_set, seed, switches, sizes, energies)
+        return switches, sizes, energies
+
+    def _run_one(self, reaction_set, seed, switches, sizes, energies):
         atoms = reaction_path(self.REACTION, self.START, CELL)
         MaxwellBoltzmannDistribution(
-            atoms, temperature_K=self.TEMPERATURE, rng=np.random.default_rng(SEED)
+            atoms, temperature_K=self.TEMPERATURE, rng=np.random.default_rng(seed)
         )
         Stationary(atoms)
         atoms.calc = DynamicTopology(atoms, reaction_set)
 
-        switches, sizes, energies = [], [], []
         dyn = VelocityVerlet(atoms, timestep=self.DT * units.fs)
         for _ in range(self.STEPS):
             previous = atoms.calc.system.topology.graph.copy()
@@ -407,7 +478,6 @@ class TestTopologyChangeContinuity:
             sizes.append(tuple(b["basis_size"] for b in diagnostics["blocks"]))
             energies.append(energy)
             dyn.run(1)
-        return switches, sizes, energies
 
     def test_energy_is_unchanged_by_the_switch(self, reaction_set):
         switches, sizes, _ = self._trajectory(reaction_set)
@@ -479,13 +549,15 @@ class TestGateContinuity:
         atoms.calc = DynamicTopology(atoms, reaction_set)
 
         dyn = VelocityVerlet(atoms, timestep=TIMESTEP * units.fs)
-        previous_positions, previous_size = None, None
+        previous_positions, previous_size, previous_topology = None, None, None
         for _ in range(200):
             atoms.get_potential_energy()
             size = sum(b["basis_size"] for b in atoms.calc.diagnostics["blocks"])
             if previous_size is not None and size != previous_size:
-                return previous_positions, atoms.positions.copy()
-            previous_positions, previous_size = atoms.positions.copy(), size
+                return previous_positions, atoms.positions.copy(), previous_topology
+            previous_positions = atoms.positions.copy()
+            previous_size = size
+            previous_topology = atoms.calc.system.topology
             dyn.run(1)
         raise AssertionError(
             "no basis-size change over 200 steps; the scan below would not "
@@ -493,16 +565,32 @@ class TestGateContinuity:
         )
 
     def test_energy_is_continuous_across_the_gate(self, reaction_set):
-        before, after = self._crossing(reaction_set)
+        """The gate, with the topology held fixed the way the dynamics holds it.
+
+        The seed topology is the one the trajectory was carrying at `before`,
+        not one re-perceived at each scan point.  That is what `System` is
+        actually handed during MD -- `calculate` returns the topology and the
+        calculator feeds it back -- and it is the difference between measuring
+        the gate and measuring something else entirely.
+
+        Re-perceiving along the scan puts a **bond-perception** step in the way:
+        `Topology.from_atoms` uses a hard distance threshold, so an O-H edge
+        appears between two scan points and brings its whole Morse term with it.
+        Measured on this crossing, that is a 6.95 eV step at t = 0.625, against
+        the basis change at t = 0.95 which costs 0.0022 eV -- in line with every
+        neighbouring step.  The perception discontinuity is real and unfixed; it
+        is simply not what this test is about, and it swamps what is.
+        """
+        before, after, topology = self._crossing(reaction_set)
         template = reaction_path(REACTION, GATE_START, CELL)
 
         energies, sizes = [], []
         for t in self.SCAN:
             atoms = template.copy()
             atoms.positions = before + t * (after - before)
-            results = System(
-                atoms, Topology.from_atoms(atoms), reaction_set
-            ).calculate()
+            seed = Topology(topology.graph.copy())
+            seed.set_atoms(atoms)
+            results = System(atoms, seed, reaction_set).calculate()
             energies.append(results["energy"])
             sizes.append(sum(b["basis_size"] for b in results["blocks"]))
 

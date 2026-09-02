@@ -58,16 +58,65 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # preserves every template's energy at its own geometry *exactly*, and this box
 # is near equilibrium.  A refit that had actually broken something would not
 # land within 2e-5 of the old number by accident.
+#
+# Regenerated a second time when Lennard-Jones repulsion and dispersion were
+# added, twice more as that term was reshaped, and once more when it was taken
+# out of the force field again and replaced by `ZBL` (`forcefield/zbl.py`).  The
+# LJ era's numbers are in git; what they recorded, and what it is worth keeping,
+# is that `energy_bonded` sat at ~-1.1e5 eV with the LJ sum at ~+1.1e5 -- the
+# whole-system 12-6 counting every intramolecular pair at bond length, where it
+# is enormous, and the `exclusion` terms inside the bonded total subtracting
+# exactly those pairs.  Two halves of one cancelling pair, reported under
+# different names, with only their sum physical.
+#
+# That cancellation is gone: `energy_bonded` is now -1227 eV and means what it
+# says, because `ZBL` has no exclusions and nothing has to be cancelled.  The
+# repulsion is +723 eV (d30) and +766 eV (d250) across 200 atoms, dominated by
+# bonded pairs, and it is absorbed into the fitted Morse depths -- every
+# template still reproduces its own reference energy to 1e-13.  See
+# `test_reference_energies.py`.
+#
+# **What did not move is the point.**  The block counts (87, 28) and the ACKS2
+# energies are identical to the last digit, as they must be: neither the
+# repulsion nor the refit touches the block partition or the electrostatics.
+# The totals moved by +3.78 eV (d30) and +42.7 eV (d250), and the dense box
+# moving ten times as much is the term doing its job -- d250 is the box that
+# used to interpenetrate.
+#
+# Regenerated once more when `fit.dissociation.fit_bond_lengths` was added --
+# the condition that each template be at *rest* at its reference geometry, not
+# merely at the right energy there.  That moved `energy_bonded` by -0.10 eV
+# (d30) and -0.19 eV (d250), and moved the ACKS2 energies and the block counts
+# by nothing whatever, which is the shape a bonded-parameter change is supposed
+# to have.
+#
+# And again for `DEFAULT_MAX_WAVENUMBER`, the cap that made the fit pay for the
+# curvature it was spending.  That refit is the largest change to the force
+# field in this file's history *by the measure that mattered* -- the fastest
+# stretching mode went from 11697 cm^-1 to 4399, and the timestep it admits from
+# 0.19 fs to 0.51 -- and it moves the numbers here by one milli-electronvolt:
+#
+#     energy_bonded   -0.0010 eV (d30)   -0.0011 eV (d250)
+#     ACKS2                 identical          identical
+#     ZBL                   identical          identical
+#     blocks                identical          identical
+#
+# That is not a coincidence and it is worth stating, because it is the whole
+# reason the frequencies were free to be wrong for so long: the atomization
+# condition pins each template's *energy* exactly, so a refit can move every
+# curvature on the surface by a factor of three and leave a box's energy where
+# it was.  Nothing in this file, or in `test_reference_energies.py`, could have
+# noticed.  `TestTemplateFrequencies` is what notices now.
 REFERENCE = {
     "tests/data/mix-n100-d30.xyz": (
-        -507.9134879573974,
-        -507.9548039148416,
+        -504.27727899414504,
+        -1227.521496119292,
         0.04131595744415656,
         87,
     ),
     "tests/data/mix-n100-d250.xyz": (
-        -507.09060866657546,
-        -507.9470177215211,
+        -460.4629502872532,
+        -1227.606831502965,
         0.8564090549456548,
         28,
     ),
@@ -124,6 +173,15 @@ def test_repeated_calls_are_stable(reaction_set):
     assert np.array_equal(second["forces"], first["forces"])
 
 
+# Box and spectator placement for the admitting-branch case below.  The gap is
+# inside `System.bimol_cutoff` of 4.0 A on purpose, so the spectator is in the
+# reaction network rather than merely nearby; measured, it makes no difference
+# to the admitted count whether it sits at 2, 3 or 5 A, which is the screen
+# behaving as advertised.
+SPECTATOR_CELL = 24.0
+SPECTATOR_GAP = 3.0
+
+
 def _compare_screen_against_full(reaction_set, atoms, limit=400):
     """Return (n_admitted, n_rejected) after checking each against full evaluation."""
     from DynamicTopology.basis import state_key
@@ -138,7 +196,6 @@ def _compare_screen_against_full(reaction_set, atoms, limit=400):
     for _, molecules in network.reaction_blocks():
         parent = Topology.from_molecules(molecules, remap=False)
         parent.attach_atoms(atoms)
-        parent_energy, _ = basis._energy(parent, atoms)
 
         for reaction, mapping in basis._reactions(parent, system.bimol_cutoff):
             broken, formed = reaction.edge_changes(mapping)
@@ -147,6 +204,7 @@ def _compare_screen_against_full(reaction_set, atoms, limit=400):
             child = reaction.apply(parent, mapping, share_atoms=True)
             if state_key(child) == state_key(parent):
                 continue
+            parent_energy, _ = basis._energy(parent, atoms)
             child_energy, _ = basis._energy(child, atoms)
             coupling, coupling_forces = basis._coupling(atoms, reaction, mapping)
 
@@ -193,14 +251,37 @@ def test_screening_agrees_with_whole_state_evaluation(reaction_set):
 
 
 def test_screening_agrees_where_a_reaction_is_live(reaction_set):
-    """The admitting branch of the screen, on a stretched bond."""
-    atoms = io.read("tests/data/mix-n100-d250.xyz")
-    # Stretch one bond most of the way to dissociation so its channel switches on.
-    atoms.positions[1] += (atoms.positions[1] - atoms.positions[0]) * 0.8
+    """The admitting branch of the screen, at a geometry that admits.
+
+    Built from `geometry.REACTION` inside its admission ramp plus a spectator,
+    rather than by deforming the mixture box.  That is both more robust and a
+    better test of the claim: the screen's whole argument is that spectator
+    molecules cancel between the two diabats, so the case worth running is one
+    with an actual spectator in it, placed inside `bimol_cutoff` where it enters
+    the reaction network.
+
+    **This used to stretch one H-H bond to 1.8x and rely on that opening a
+    channel.**  It stopped after the force-constant refit, and nothing about the
+    box would bring it back: swept to 3.6x -- an H-H at 2.68 A, five times
+    unbound -- and no channel admitted; nor did stretching an O-O to 2.87 A, nor
+    walking an H2 up to an O2 down to a 0.85 A gap.  A deformation that happened
+    to open a channel on one surface is not a property of the screen, and
+    tying this test to one made it fail for a reason that had nothing to do with
+    what it measures.
+    """
+    from geometry import REACTION, REACTION_PATH_RAMP, reaction_path, with_spectator
+
+    spectator = io.read("datasets/HCombustion/molecules/mol_02.xyz")  # O2
+    atoms = with_spectator(
+        reaction_path(REACTION, REACTION_PATH_RAMP, SPECTATOR_CELL),
+        spectator,
+        SPECTATOR_GAP,
+    )
 
     admitted, rejected = _compare_screen_against_full(reaction_set, atoms)
     assert admitted > 0, (
-        "no channel was admitted even with a bond stretched to 1.8x; the "
-        "admitting branch of the screen is untested"
+        "no channel was admitted at a geometry inside the admission ramp; the "
+        "admitting branch of the screen is untested. Re-measure "
+        "geometry.REACTION_PATH_RAMP -- it moves with every refit."
     )
     assert rejected > 0

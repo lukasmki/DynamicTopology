@@ -80,7 +80,7 @@ def read_xmls(data: str) -> list[Term]:
             continue
 
         # loop over children
-        for dof in dofs:
+        for position, dof in enumerate(dofs):
             attrib: dict[str, str] = dof.attrib
             keys: list[str] = list(attrib.keys())
             args: dict[str, float] = {
@@ -90,7 +90,17 @@ def read_xmls(data: str) -> list[Term]:
             if params is not None:
                 for k in parameter_map.keys():
                     args[parameter_map[k]] = args.pop(k)
-                idx: dict[str, int] = {k: int(v) for k, v in attrib.items()}
+                # A <Bond>/<Angle>/<Torsion> names its atoms explicitly ("p1",
+                # "p2", ...), but a <Particle> does not: its index is its
+                # position in the list, and every attribute it carries is a
+                # parameter.  Reading the indices off `attrib` therefore left
+                # every per-particle force with an empty `atoms` dict, which is
+                # how q-force's Lennard-Jones parameters were parsed for years
+                # without ever being attachable to an atom.
+                if dofs.tag == "Particles":
+                    idx: dict[str, int] = {"p0": position}
+                else:
+                    idx = {k: int(v) for k, v in attrib.items()}
                 term: Term = {"type": name.lower(), "atoms": idx, "kwargs": args}
                 terms.append(term)
     return terms

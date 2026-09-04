@@ -19,8 +19,8 @@ bonds first so that they are; see `fit.dissociation`.
 
 Three routes, and they are not equivalent:
 
-  --fit-mode shape  fits the Morse shape parameter `c`, which is O(dr**3) at
-                    `r0`.  13 of 19 channels.
+  --fit-mode shape  fits the Morse shape parameters `c` and `b`, leaving every
+                    force constant where q-force put it.  13 of 19 channels.
   --fit-mode k      buys the same depth by stiffening the bonds instead.  Tops
                     out at 17 of 19 and needs H2 at 12402 cm^-1 against an
                     experimental 4401 to get there; the count saturates, so a
@@ -56,7 +56,9 @@ from DynamicTopology.fit.dissociation import (
     DEFAULT_FREQUENCY_WEIGHT,
     DEFAULT_MARGIN,
     DEFAULT_MAX_SCALE,
-    DEFAULT_MAX_SHAPE,
+    DEFAULT_MAX_DECAY,
+    DEFAULT_MAX_SHAPE_FRACTION,
+    DEFAULT_MIN_DECAY,
     DEFAULT_MAX_WAVENUMBER,
     DissociationFitError,
     bonded_energy,
@@ -65,6 +67,7 @@ from DynamicTopology.fit.dissociation import (
     fit_force_constants,
     frequency,
     install_templates,
+    shape_bound,
     scale_factor,
     total_wavenumber,
 )
@@ -126,13 +129,14 @@ def report_force_constants(fit, max_wavenumber: float = 0.0) -> None:
     """
     if fit.mode in ("shape", "both"):
         print(
-            f"{'bond':<22}{'c':>7}{'peak (eV)':>11}{'k scale':>9}"
+            f"{'bond':<22}{'b':>6}{'c':>8}{'c/c_max':>9}{'peak (eV)':>11}{'k scale':>9}"
             f"{'w before':>10}{'w total':>9}{'ratio':>7}  over cap"
         )
         k_scales = fit.k_scales or [1.0] * len(fit.variables)
         curvatures = fit.curvatures or [None] * len(fit.variables)
-        for variable, shape, k_scale, curvature in zip(
-            fit.variables, fit.scales, k_scales, curvatures
+        decays = fit.decays or [SHAPE_DECAY] * len(fit.variables)
+        for variable, shape, decay, k_scale, curvature in zip(
+            fit.variables, fit.scales, decays, k_scales, curvatures
         ):
             masses = [MASSES.get(element, 1.0) for element in variable.elements]
             label = f"{variable.template} {'-'.join(variable.elements)}"
@@ -141,7 +145,8 @@ def report_force_constants(fit, max_wavenumber: float = 0.0) -> None:
             # so quote the bump against the depth the fitted terms ended up with
             # rather than the input one.
             depth = fit.depths.get((variable.template, variable.r0, variable.k), 0.0)
-            peak = (3.0 / SHAPE_DECAY) ** 3 * np.exp(-3.0) * shape * depth
+            peak = (3.0 / decay) ** 3 * np.exp(-3.0) * shape * depth
+            bound = shape_bound(decay)
             before_w = frequency(variable.k, *masses)
             after_w = (
                 total_wavenumber(curvature, *masses)
@@ -154,7 +159,8 @@ def report_force_constants(fit, max_wavenumber: float = 0.0) -> None:
                 else ""
             )
             print(
-                f"{label:<22}{shape:>7.3f}{peak:>11.3f}"
+                f"{label:<22}{decay:>6.2f}{shape:>8.3f}"
+                f"{(shape / bound if bound > 0 else 0.0):>9.3f}{peak:>11.3f}"
                 f"{k_scale:>9.3f}{before_w:>10.0f}{after_w:>9.0f}"
                 f"{after_w / before_w:>7.2f}{over}"
             )
@@ -278,18 +284,35 @@ def main() -> int:
         "--fit-mode",
         choices=["shape", "k", "both"],
         default="both",
-        help="`shape` fits the Hulburt-Hirschfelder `c` per bond type and "
-        "leaves every force constant, and so every vibrational frequency, "
-        "exactly as q-force fitted it. `k` is the older route that buys the "
-        "same depth by stiffening the bonds instead; it tops out at 17 of 19 "
-        "channels and needs H2 at 12402 cm^-1 to get there.",
+        help="`shape` fits the Hulburt-Hirschfelder pair `c` and `b` per bond "
+        "type, leaving every force constant as q-force fitted it -- though not "
+        "every frequency, since `c` is only free of curvature *at* `r0` and "
+        "`fit_bond_lengths` moves `r0` off the bond. `k` is the older route "
+        "that buys the same depth by stiffening the bonds instead; it tops out "
+        "at 17 of 19 channels and needs H2 at 12402 cm^-1 to get there.",
     )
     parser.add_argument(
         "--max-shape",
         type=float,
-        default=DEFAULT_MAX_SHAPE,
-        help="upper bound on `c`. 0 freezes the shape term, which is the "
-        "vacuity check: plain Morse must make no progress.",
+        default=DEFAULT_MAX_SHAPE_FRACTION,
+        help="upper bound on `c` as a fraction of the monotonicity limit "
+        "`shape_bound(b)`, which moves with the fitted decay. 1.0 is that limit; "
+        "0 freezes the shape term, which is the vacuity check: plain Morse must "
+        "make no progress.",
+    )
+    parser.add_argument(
+        "--min-decay",
+        type=float,
+        default=DEFAULT_MIN_DECAY,
+        help="lower bound on the fitted shape decay `b`",
+    )
+    parser.add_argument(
+        "--max-decay",
+        type=float,
+        default=DEFAULT_MAX_DECAY,
+        help="upper bound on the fitted shape decay `b`. Setting both bounds to "
+        "the same value pins it, which is how the b sweep in "
+        "`qforce.SHAPE_DECAY` was measured.",
     )
     parser.add_argument(
         "--max-k-scale",
@@ -359,6 +382,8 @@ def main() -> int:
             max_scale=args.max_k_scale,
             mode=args.fit_mode,
             max_shape=args.max_shape,
+            min_decay=args.min_decay,
+            max_decay=args.max_decay,
             max_wavenumber=args.max_wavenumber,
             curvature_weight=args.curvature_weight,
         )

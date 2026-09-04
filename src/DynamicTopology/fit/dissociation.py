@@ -64,10 +64,13 @@ where q-force put them, while raising the stretched branch by up to
 `0.168 * c * D`.  `c = 0` is plain Morse, which is what every term file
 predating the parameter reads as.
 
-`c` is bounded, and not arbitrarily: past `c = 19.33` the correction beats the
-exponential and the dissociation curve turns over, putting a barrier on a
-channel that has none and a bound state beyond it.  `DEFAULT_MAX_SHAPE` is that
-limit.  See its comment for the derivation.
+`c` is bounded, and not arbitrarily: past `c = shape_bound(b)` the correction
+beats the exponential and the dissociation curve turns over, putting a barrier on
+a channel that has none and a bound state beyond it.  The decay `b` is fitted per
+bond type alongside `c` -- see `qforce.SHAPE_DECAY` for the measurement that made
+it a parameter -- and because the bound moves with it (1.31 at b = 2, 19.33 at
+b = 4, 52.20 at b = 6) the search variable is the fraction `c / shape_bound(b)`
+rather than `c` itself.
 
 `fit_force_constants` fits one variable per distinct bond type in any of three
 modes -- `shape` (`c` only, no frequency cost), `k` (the old route), or `both`
@@ -372,8 +375,8 @@ def _nonbonded(atoms: Atoms, term_dict: dict) -> tuple[float, np.ndarray]:
     key = _nonbonded_key(atoms, term_dict)
     hit = _NONBONDED_CACHE.get(key)
     if hit is None:
-        energy, forces = _ACKS2(atoms.positions, atoms.pbc, atoms.cell, term_dict)
-        zbl_energy, zbl_forces = _ZBL(
+        energy, forces, _ = _ACKS2(atoms.positions, atoms.pbc, atoms.cell, term_dict)
+        zbl_energy, zbl_forces, _ = _ZBL(
             atoms.positions, atoms.numbers, atoms.pbc, atoms.cell
         )
         hit = (float(energy + zbl_energy), forces + zbl_forces)
@@ -499,7 +502,7 @@ MAX_LENGTH_SHIFT: float = 0.03
 LENGTH_DEPTH_ROUNDS: int = 4
 
 
-def _morse_stretch_force(r, D: float, r0, k: float, c: float):
+def _morse_stretch_force(r, D: float, r0, k: float, c: float, b: float):
     """`-dE/dr` of one Morse bond, in q-force units (kJ/mol/nm).
 
     Positive is the force pulling the two atoms *apart*, i.e. the sign a
@@ -522,9 +525,7 @@ def _morse_stretch_force(r, D: float, r0, k: float, c: float):
     exp_term = np.exp(-al * dr)
     de_dr = 2 * D * (1 - exp_term) * al * exp_term
     s = al * np.maximum(dr, 0.0)
-    de_dr = de_dr + (
-        D * c * al * s * s * (3.0 - SHAPE_DECAY * s) * np.exp(-SHAPE_DECAY * s)
-    )
+    de_dr = de_dr + (D * c * al * s * s * (3.0 - b * s) * np.exp(-b * s))
     return -de_dr
 
 
@@ -669,6 +670,7 @@ def _bonded_curvature(kwargs: dict, r: float) -> float:
     D = kwargs["D"]
     k = kwargs["k"]
     c = kwargs.get("c", 0.0)
+    b = kwargs.get("b", SHAPE_DECAY)
     dr = r / 10.0 - kwargs["r0"]  # nm
     al = np.sqrt(k / (2 * D))
 
@@ -676,14 +678,7 @@ def _bonded_curvature(kwargs: dict, r: float) -> float:
     curvature = 2 * D * al * al * exp_term * (2 * exp_term - 1)
 
     s = al * max(dr, 0.0)
-    curvature += (
-        D
-        * c
-        * al
-        * al
-        * (6 * s - 6 * SHAPE_DECAY * s**2 + SHAPE_DECAY**2 * s**3)
-        * np.exp(-SHAPE_DECAY * s)
-    )
+    curvature += D * c * al * al * (6 * s - 6 * b * s**2 + b**2 * s**3) * np.exp(-b * s)
     # kJ/mol/nm**2 -> eV/A**2
     return float(curvature * units.kJ / units.mol / units.nm**2)
 
@@ -850,7 +845,12 @@ def fit_bond_lengths(
     # See `LENGTH_DEPTH_ROUNDS` for the numbers.
     working = set_bond_lengths(terms, current)
     params = {
-        key: (t["kwargs"]["D"], t["kwargs"]["k"], t["kwargs"].get("c", 0.0))
+        key: (
+            t["kwargs"]["D"],
+            t["kwargs"]["k"],
+            t["kwargs"].get("c", 0.0),
+            t["kwargs"].get("b", SHAPE_DECAY),
+        )
         for t in working
         if t["type"] == "bond"
         for key in [(t["kwargs"]["r0"], t["kwargs"]["k"])]
@@ -859,22 +859,23 @@ def fit_bond_lengths(
     lengths = bond_lengths(working, atoms)
 
     for index, (r0, k) in enumerate(bond_types(working)):
-        D, k_value, c = params[(r0, k)]
+        D, k_value, c, decay = params[(r0, k)]
         # The type's own Morse contribution to `total[index]`, so that what
         # is left is the part no choice of `r0` can change.
         bond_r = np.asarray(lengths[index], dtype=float)
         own = (
-            float(_morse_stretch_force(bond_r, D, r0, k_value, c).sum()) * ev_per_qforce
+            float(_morse_stretch_force(bond_r, D, r0, k_value, c, decay).sum())
+            * ev_per_qforce
         )
         external = total[index] - own
 
-        def residual(trial, _r=bond_r, _D=D, _k=k_value, _c=c, _e=external):
+        def residual(trial, _r=bond_r, _D=D, _k=k_value, _c=c, _b=decay, _e=external):
             """Total force along this bond type if its `r0` were `trial`.
 
             Vectorized over `trial`, so the grid below is a single call.
             """
             mine = _morse_stretch_force(
-                _r, _D, np.asarray(trial, dtype=float)[..., None], _k, _c
+                _r, _D, np.asarray(trial, dtype=float)[..., None], _k, _c, _b
             ).sum(-1)
             return mine * ev_per_qforce + _e
 
@@ -1016,6 +1017,11 @@ class ForceConstantFit:
     # Force-constant scale per bond type; all 1.0 unless `mode == "both"`, where
     # `scales` holds `c` and the frequencies move as well.
     k_scales: list[float] = field(default_factory=list)
+    # Fitted shape decay `b` per bond type, aligned with `variables`.  Reported
+    # because `c` alone is not readable: the same `c` means a 40% correction at
+    # one decay and a 4% one at another, and the monotonicity bound it is
+    # measured against moves with `b` too.
+    decays: list[float] = field(default_factory=list)
     # Total second derivative along each bond type at its template's reference
     # geometry, in eV/A**2, aligned with `variables`.  Reported separately from
     # the fitted `k` because they are no longer the same quantity: `ZBL` adds
@@ -1083,23 +1089,72 @@ def scale_force_constants(terms: list[Term], scales: list[float]) -> list[Term]:
 #                                       + c * s**2 * (3 - b*s) ]
 #
 # and the bracket is what can go negative, since `(3 - b*s) < 0` beyond
-# `s = 3/b`.  Requiring it to stay non-negative everywhere gives, at
-# `b = SHAPE_DECAY = 4`,
+# `s = 3/b`.  Requiring it to stay non-negative everywhere gives
 #
-#     c  <=  min over s > 0.75 of  2(exp(3s) - exp(2s)) / (s**2 (4s - 3))  =  19.33
+#     c  <=  min over s > 3/b of  2(exp((b-1)s) - exp((b-2)s)) / (s**2 (b s - 3))
 #
-# Past that the correction wins over the exponential
-# and the curve turns over: a barrier appears on a dissociation channel that has
-# none, and beyond the barrier a *bound* state at long range that would trap two
-# fragments that should have separated.  The fit will happily walk there --
-# nothing in a margin objective knows what a dissociation curve is supposed to
-# look like -- so the constraint has to be in the bound.
+# Past that the correction wins over the exponential and the curve turns over: a
+# barrier appears on a dissociation channel that has none, and beyond the barrier
+# a *bound* state at long range that would trap two fragments that should have
+# separated.  The fit will happily walk there -- nothing in a margin objective
+# knows what a dissociation curve is supposed to look like -- so the constraint
+# has to be in the bound.
 #
-# The limit is generous rather than binding -- at `c = 19.3` the bump is 41% of
-# the well depth -- which is the point: the bound is there to keep the curve
-# physical, and the hinge objective plus the regularizer are what decide how
-# much of it to use.
-DEFAULT_MAX_SHAPE: float = 19.3
+# **The bound moves with `b`, which is why `c` is not fitted directly.**  It is
+# 1.31 at b = 2, 19.33 at b = 4 and 52.20 at b = 6, so a rectangular box on
+# `(c, b)` would be mostly outside the feasible region and its shape would
+# change under the optimizer's feet.  `fit_force_constants` searches the
+# *fraction* `u = c / shape_bound(b)` in [0, 1] instead, which is rectangular,
+# feasible everywhere, and makes the regularizer scale-free for free.
+_SHAPE_BOUND_CACHE: dict[float, float] = {}
+
+
+def shape_bound(decay: float) -> float:
+    """Largest `c` at this `b` for which the bond still dissociates downhill.
+
+    Evaluated on a grid rather than solved: the minimand is smooth and shallow
+    near its minimum, the answer is wanted to about three digits, and this is
+    called once per bond type per objective evaluation, so it is memoized on
+    `b` and the grid cost is paid a few dozen times per fit.
+
+    Tends to zero as `b` falls to 1: below that the Morse repulsion no longer
+    outruns the correction at *any* separation, the minimand's infimum moves out
+    to infinity, and no positive `c` is monotone.  The grid truncates at s = 60,
+    so what comes back near b = 1 is a small positive number rather than an
+    exact zero -- `DEFAULT_MIN_DECAY` keeps the fit well clear of it.
+    """
+    key = round(float(decay), 9)
+    if key not in _SHAPE_BOUND_CACHE:
+        grid = np.linspace(3.0 / max(key, 1e-9) + 1e-6, 60.0, 200_000)
+        ratio = (
+            2.0
+            * (np.exp((key - 1.0) * grid) - np.exp((key - 2.0) * grid))
+            / (grid * grid * (key * grid - 3.0))
+        )
+        _SHAPE_BOUND_CACHE[key] = max(float(np.min(ratio)), 0.0)
+    return _SHAPE_BOUND_CACHE[key]
+
+
+# Bounds on the fitted decay `b`, and both are the point where the parameter
+# stops meaning anything rather than a preference.
+#
+# Below 1.5 the monotonicity bound has collapsed -- `shape_bound` is 0.180 at
+# 1.5 and exactly 0 at 1.0 -- so the term can deliver under 7% of `D` even at
+# its own peak and the optimizer is wandering on a plateau.
+#
+# Above 8 the correction has retreated inside the bond: the negative-curvature
+# window `1.268/b < s < 4.732/b` reaches down to s = 0.158, and every
+# HCombustion bond sits at s = 0.180-0.382, so nothing is gained by going
+# further and the delivered correction is already falling (0.406 D at b = 4,
+# 0.243 D at b = 8).  Eight is chosen so that O2 -- the tightest bond at
+# s = 0.180, and the mode that sets the timestep -- can just reach the window
+# where the shape term softens it instead of stiffening it.
+DEFAULT_MIN_DECAY: float = 1.5
+DEFAULT_MAX_DECAY: float = 8.0
+
+# Upper bound on `u = c / shape_bound(b)`.  One is the monotonicity limit
+# itself; zero freezes the shape term, which is the vacuity check for it.
+DEFAULT_MAX_SHAPE_FRACTION: float = 1.0
 
 
 def set_shape_parameters(terms: list[Term], values: list[float]) -> list[Term]:
@@ -1117,6 +1172,25 @@ def set_shape_parameters(terms: list[Term], values: list[float]) -> list[Term]:
             continue
         kwargs = dict(term["kwargs"])
         kwargs["c"] = float(values[order[(kwargs["r0"], kwargs["k"])]])
+        out.append({**term, "kwargs": kwargs})
+    return out
+
+
+def set_shape_decays(terms: list[Term], values: list[float]) -> list[Term]:
+    """Copy of `terms` with each bond type's `b` set, in `bond_types` order.
+
+    Companion to `set_shape_parameters`, and always applied with it: `c` and `b`
+    are only meaningful together, since the constraint that keeps the
+    dissociation curve monotone is `c <= shape_bound(b)`.
+    """
+    order = {pair: index for index, pair in enumerate(bond_types(terms))}
+    out: list[Term] = []
+    for term in terms:
+        if term["type"] != "bond":
+            out.append(term)
+            continue
+        kwargs = dict(term["kwargs"])
+        kwargs["b"] = float(values[order[(kwargs["r0"], kwargs["k"])]])
         out.append({**term, "kwargs": kwargs})
     return out
 
@@ -1265,6 +1339,21 @@ def reaction_margins(
     return margins
 
 
+def bond_decays(terms: list[Term]) -> list[float]:
+    """Fitted shape decay `b` of each bond type, in `bond_types` order."""
+    decays: list[float] = []
+    seen: list[tuple[float, float]] = []
+    for term in terms:
+        if term["type"] != "bond":
+            continue
+        key = (term["kwargs"]["r0"], term["kwargs"]["k"])
+        if key in seen:
+            continue
+        seen.append(key)
+        decays.append(float(term["kwargs"].get("b", SHAPE_DECAY)))
+    return decays
+
+
 def fit_force_constants(
     reaction_set,
     templates: list[tuple[str, Atoms, list[Term]]],
@@ -1273,7 +1362,9 @@ def fit_force_constants(
     frequency_weight: float = DEFAULT_FREQUENCY_WEIGHT,
     max_scale: float = DEFAULT_MAX_SCALE,
     mode: str = "both",
-    max_shape: float = DEFAULT_MAX_SHAPE,
+    max_shape: float = DEFAULT_MAX_SHAPE_FRACTION,
+    min_decay: float = DEFAULT_MIN_DECAY,
+    max_decay: float = DEFAULT_MAX_DECAY,
     geometry_weight: float = DEFAULT_GEOMETRY_WEIGHT,
     max_wavenumber: float = DEFAULT_MAX_WAVENUMBER,
     curvature_weight: float = DEFAULT_CURVATURE_WEIGHT,
@@ -1353,19 +1444,33 @@ def fit_force_constants(
     if mode not in ("shape", "k", "both"):
         raise ValueError(f"mode must be 'shape', 'k' or 'both', got {mode!r}")
 
-    # In "both" the vector is all the `c` values followed by all the log
-    # k-scales, so the two halves keep their own natural bounds and a `spans`
-    # slice indexes into either half with the same offsets.
+    # The search vector is laid out in fixed-width blocks of one entry per bond
+    # type, so a `spans` slice indexes into any block with the same offsets:
+    #
+    #     shape   [ u | b ]
+    #     k       [ log k-scale ]
+    #     both    [ u | log k-scale | b ]
+    #
+    # `u` is the *fraction* of the monotonicity bound used, not `c` itself; see
+    # `shape_bound` for why the bound cannot be a constant.
     width = len(variables)
+    shaped = mode in ("shape", "both")
+    decay_at = width if mode == "shape" else 2 * width
 
     def apply(terms: list[Term], x: np.ndarray, lo: int, hi: int) -> list[Term]:
-        if mode == "shape":
-            return set_shape_parameters(terms, list(x[lo:hi]))
         if mode == "k":
             return scale_force_constants(terms, list(np.exp(x[lo:hi])))
+        decays = [float(value) for value in x[decay_at + lo : decay_at + hi]]
+        if mode == "both":
+            terms = scale_force_constants(
+                terms, list(np.exp(x[width + lo : width + hi]))
+            )
         return set_shape_parameters(
-            scale_force_constants(terms, list(np.exp(x[width + lo : width + hi]))),
-            list(x[lo:hi]),
+            set_shape_decays(terms, decays),
+            [
+                float(fraction) * shape_bound(decay)
+                for fraction, decay in zip(x[lo:hi], decays)
+            ],
         )
 
     # Both constant across the entire search: the elements do not change, and
@@ -1393,17 +1498,31 @@ def fit_force_constants(
 
     # Per-variable normalizer for the regularizer: the half-width of each
     # variable's box, so `used` below is "fraction of the freedom taken".
-    if mode == "shape":
-        scale_of = np.full(width, max(max_shape, 1e-12))
-    elif mode == "k":
-        scale_of = np.full(width, max(float(np.log(max_scale)), 1e-12))
-    else:
-        scale_of = np.concatenate(
-            [
-                np.full(width, max(max_shape, 1e-12)),
-                np.full(width, max(float(np.log(max_scale)), 1e-12)),
-            ]
-        )
+    #
+    # `u` needs none -- it is already a fraction, which is the second reason the
+    # search is parameterized that way.  The decay block is normalized on its own
+    # half-width and measured from `SHAPE_DECAY`, so that every block's origin is
+    # the *unchanged* force field: `u = 0` is plain Morse, a zero log k-scale is
+    # q-force's own constant, and `b = SHAPE_DECAY` is what a term file without a
+    # decay reads as.  Measuring the decay from zero instead would make the
+    # regularizer a preference for short-ranged corrections, and measuring it
+    # from the middle of the box would make it a preference for whatever the
+    # bounds happened to be.
+    log_bound = max(float(np.log(max_scale)), 1e-12)
+    decay_scale = max(0.5 * (max_decay - min_decay), 1e-12)
+    blocks = {
+        "shape": [np.full(width, 1.0), np.full(width, decay_scale)],
+        "k": [np.full(width, log_bound)],
+        "both": [
+            np.full(width, 1.0),
+            np.full(width, log_bound),
+            np.full(width, decay_scale),
+        ],
+    }[mode]
+    scale_of = np.concatenate(blocks)
+    origin = np.zeros(scale_of.size)
+    if shaped:
+        origin[decay_at : decay_at + width] = SHAPE_DECAY
 
     def score(x: np.ndarray) -> float:
         try:
@@ -1456,7 +1575,7 @@ def fit_force_constants(
         # the decay from 2 to 4 lifted the bound on `c` from 1.3 to 19.3 and
         # multiplied this penalty by ~200, crushing the fit for reasons that had
         # nothing to do with the physics.
-        used = x / scale_of
+        used = (x - origin) / scale_of
         return float(
             np.dot(shortfall, shortfall)
             + geometry_weight * np.dot(leftover, leftover)
@@ -1464,16 +1583,26 @@ def fit_force_constants(
             + frequency_weight * np.dot(used, used)
         )
 
-    # Length of the search vector: `both` carries a `c` and a log k-scale per
-    # bond type, the single-parameter modes carry one each.
-    n_x = width * (2 if mode == "both" else 1)
+    # Length of the search vector, from the block layout above: `both` carries
+    # `u`, a log k-scale and `b` per bond type; `shape` carries `u` and `b`; `k`
+    # carries the k-scale alone.
+    n_x = width * {"shape": 2, "k": 1, "both": 3}[mode]
 
     # The baseline is taken with the geometry solve in best-effort mode.  At
     # `c = 0` and `k`-scale 1 several bond types cannot cancel `ZBL` at any
     # length -- see `fit_bond_lengths` -- so the strict solve has no answer
     # there, and refusing to report a "before" column because the *starting*
     # point is infeasible would be reporting nothing at all.
-    install_templates(reaction_set, templates, refit(np.zeros(n_x)))
+    # `x = start` is the *unchanged* force field: `u = 0` is plain Morse and a
+    # zero log k-scale is q-force's own constant.  Zero is not the identity for
+    # the decay block -- `b = 0` is not a shape term with no effect, it is a
+    # correction that never decays -- so that block starts at `SHAPE_DECAY`,
+    # which is what a term file without a `b` reads as.  Getting this wrong
+    # makes the "before" column a report on a force field nobody ever had.
+    start = np.zeros(n_x)
+    if shaped:
+        start[decay_at : decay_at + width] = SHAPE_DECAY
+    install_templates(reaction_set, templates, refit(start))
     before = reaction_margins(reaction_set, reactions)
 
     frozen = {
@@ -1485,18 +1614,20 @@ def fit_force_constants(
         # No freedom at all.  Say so by returning the unrefitted point rather
         # than handing a degenerate box to the optimizer; this is also the path
         # the vacuity check takes.
-        solution = np.zeros(n_x)
+        solution = start
     else:
-        # `c` is bounded below by zero and above by `max_shape`; a k-scale is
-        # bounded symmetrically in the log, so that halving and doubling are the
-        # same distance from the starting point.
+        # `u` is a fraction of the monotonicity bound, so its box is [0, 1]
+        # whatever `b` does; a k-scale is bounded symmetrically in the log, so
+        # that halving and doubling are the same distance from the starting
+        # point; `b` gets the range over which it still means something.
         bound = float(np.log(max_scale))
-        if mode == "shape":
-            box = [(0.0, max_shape)] * width
-        elif mode == "k":
-            box = [(-bound, bound)] * width
-        else:
-            box = [(0.0, max_shape)] * width + [(-bound, bound)] * width
+        box = {
+            "shape": [(0.0, max_shape)] * width + [(min_decay, max_decay)] * width,
+            "k": [(-bound, bound)] * width,
+            "both": [(0.0, max_shape)] * width
+            + [(-bound, bound)] * width
+            + [(min_decay, max_decay)] * width,
+        }[mode]
         # **The search converges on its own; there is nothing here to cap.**
         # Worth writing down because it was twice diagnosed wrongly.  Swept over
         # `mode="shape"` from plain Morse, which is the slowest configuration:
@@ -1521,7 +1652,7 @@ def fit_force_constants(
         # wrong place to begin with.
         result = minimize(
             score,
-            np.zeros(len(box)),
+            start,
             method="Powell",
             bounds=box,
             options={"maxiter": 200, "xtol": 1e-3, "ftol": 1e-5},
@@ -1543,10 +1674,23 @@ def fit_force_constants(
     return ForceConstantFit(
         terms={name: terms for (name, _, _), terms in zip(templates, fitted)},
         variables=variables,
-        scales=[
-            float(value)
-            for value in (solution[:width] if mode != "k" else np.exp(solution))
-        ],
+        # `scales` is reported as the absolute `c` a reader can put back into
+        # the Morse, not as the fraction the search actually moved.
+        scales=(
+            [float(value) for value in np.exp(solution)]
+            if mode == "k"
+            else [
+                float(fraction) * shape_bound(float(decay))
+                for fraction, decay in zip(
+                    solution[:width], solution[decay_at : decay_at + width]
+                )
+            ]
+        ),
+        decays=(
+            [float(value) for value in solution[decay_at : decay_at + width]]
+            if shaped
+            else [SHAPE_DECAY] * width
+        ),
         k_scales=(
             [float(value) for value in np.exp(solution[width:])]
             if mode == "both"

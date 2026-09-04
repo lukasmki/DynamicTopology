@@ -85,7 +85,9 @@ class EVBSystem:
         for i, istate in enumerate(self.states):
             if not istate.term_dict:
                 continue
-            en, fr = self.bonded_ff(pos, pbc, cell, istate.term_dict)
+            # `EVBSystem` reports no stress -- it holds a fixed state list and
+            # is the simple alternative to `System` -- so the virial is dropped.
+            en, fr, _ = self.bonded_ff(pos, pbc, cell, istate.term_dict)
             ham[i, i] = en
             state_forces[i] = fr
 
@@ -130,10 +132,12 @@ class EVBSystem:
         en_nb, fr_nb = 0.0, np.zeros_like(pos)
         for state in self.states:
             if state.term_dict:
-                en_nb, fr_nb = self.nonbonded_ff(pos, pbc, cell, state.term_dict)
+                en_nb, fr_nb, _ = self.nonbonded_ff(pos, pbc, cell, state.term_dict)
                 break
 
-        en_zbl, fr_zbl = self.zbl_ff(pos, self.atoms.numbers, pbc, cell)
+        # `EVBSystem` holds a fixed state list and reports no stress; the
+        # virials are discarded here rather than threaded through.
+        en_zbl, fr_zbl, _ = self.zbl_ff(pos, self.atoms.numbers, pbc, cell)
 
         results: dict[str, Any] = {
             "energy": energy + en_nb + en_zbl,

@@ -32,6 +32,7 @@ class System:
         topology: Topology,
         reaction_set: ReactionSet,
         bimol_cutoff: float = 4.0,
+        evb: dict[str, Any] | None = None,
     ):
         self.atoms: Atoms = atoms
         self.topology: Topology = topology
@@ -42,7 +43,15 @@ class System:
         self.nonbonded_ff = ACKS2()
         self.zbl_ff = ZBL()
         self.coupling = EVBCoupling()
-        self.basis = EVBBasis(reaction_set, self.bonded_ff, self.coupling)
+        # `evb` passes `EVBBasis`'s own knobs -- `eps`, `switch_width`,
+        # `max_states`, `max_depth` -- straight through, defaults untouched when
+        # it is None.  They were reachable only by mutating the basis after
+        # construction, which meant a production run could not pin them and a
+        # `config.json` could not record them.  They change the potential energy
+        # surface, so anything that varies them has to say so.
+        self.basis = EVBBasis(
+            reaction_set, self.bonded_ff, self.coupling, **(evb or {})
+        )
 
     def __repr__(self) -> str:
         return f"System( {repr(self.atoms)}, {repr(self.topology)} )"
@@ -85,6 +94,10 @@ class System:
 
         energy = 0.0
         forces = np.zeros_like(pos)
+        # dE/d(strain), a single 3x3 for the whole system.  `ase.py` divides by
+        # the cell volume to get the stress; keeping it as a virial here means
+        # a non-periodic system (zero volume) is still well defined.
+        virial = np.zeros((3, 3))
         final_states: list[Topology] = []
         blocks: list[dict[str, Any]] = []
 
@@ -94,20 +107,27 @@ class System:
             if block.nstates == 1:
                 energy += block.energies[0]
                 forces += block.forces[0]
+                virial += block.virials[0]
                 final_states.append(block.states[0])
                 weights = np.ones(1)
                 pivot = 0
                 gap = np.inf
                 block_energy = float(block.energies[0])
             else:
-                ham, fham = block.hamiltonian()
+                ham, fham, vham = block.hamiltonian()
                 eigval, eigvec = np.linalg.eigh(ham)
                 statevec = eigvec[:, 0]
 
                 energy_gs = np.einsum("i,ij,j->", statevec, ham, statevec)
                 forces_gs = np.einsum("i,ijnd,j->nd", statevec, fham, statevec)
+                # The same Hellmann-Feynman contraction against strain.  It is
+                # legitimate for the same reason the forces are: the eigenvector
+                # is stationary, so its own derivative contributes nothing at
+                # first order and only the matrix's explicit dependence survives.
+                virial_gs = np.einsum("i,ijab,j->ab", statevec, vham, statevec)
                 energy += energy_gs
                 forces += forces_gs
+                virial += virial_gs
 
                 weights = statevec * statevec
                 pivot = self._pivot(weights, block.seed_index)
@@ -135,9 +155,10 @@ class System:
         # compute topology-independent nonbonded interactions
         terms = self.reaction_set.get_terms(self.topology)
         self.topology.set_terms(terms)
-        en_nb, fr_nb = self.nonbonded_ff(pos, pbc, cell, self.topology.term_dict)
+        en_nb, fr_nb, w_nb = self.nonbonded_ff(pos, pbc, cell, self.topology.term_dict)
         energy += en_nb
         forces += fr_nb
+        virial += w_nb
 
         # ZBL over *every* pair, bonded ones included and nothing excluded.
         # This is the term that opposes ACKS2's contact funnel; see
@@ -145,9 +166,10 @@ class System:
         # number for every diabatic state of every block, adding it once here
         # shifts each diagonal equally, which shifts the ground-state eigenvalue
         # by exactly that constant and leaves the eigenvectors alone.
-        en_zbl, fr_zbl = self.zbl_ff(pos, self.atoms.numbers, pbc, cell)
+        en_zbl, fr_zbl, w_zbl = self.zbl_ff(pos, self.atoms.numbers, pbc, cell)
         energy += en_zbl
         forces += fr_zbl
+        virial += w_zbl
 
         # combine block topologies
         new_topo = Topology.from_molecules(final_states, remap=False)
@@ -156,6 +178,7 @@ class System:
         results: dict[str, Any] = {
             "energy": energy,
             "forces": forces,
+            "virial": virial,
             "topology": new_topo,
             "energy_bonded": energy_bonded,
             "energy_nonbonded": en_nb,

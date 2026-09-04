@@ -204,12 +204,20 @@ def _compare_screen_against_full(reaction_set, atoms, limit=400):
             child = reaction.apply(parent, mapping, share_atoms=True)
             if state_key(child) == state_key(parent):
                 continue
-            parent_energy, _ = basis._energy(parent, atoms)
-            child_energy, _ = basis._energy(child, atoms)
-            coupling, coupling_forces = basis._coupling(atoms, reaction, mapping)
+            parent_energy, _, _ = basis._energy(parent, atoms)
+            child_energy, _, _ = basis._energy(child, atoms)
+            coupling, coupling_forces, coupling_virial = basis._coupling(
+                atoms, reaction, mapping
+            )
 
-            screened, _ = basis._channel_weight(
-                parent, mapping, (broken, formed), coupling, coupling_forces, atoms
+            screened, _, _ = basis._channel_weight(
+                parent,
+                mapping,
+                (broken, formed),
+                coupling,
+                coupling_forces,
+                coupling_virial,
+                atoms,
             )
             exact = basis._switch(parent_energy, child_energy, coupling)
             # The switching weight, not just the admit/reject decision: the

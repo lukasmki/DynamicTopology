@@ -53,7 +53,8 @@ from DynamicTopology.fit.coupling import (
     fit_coupling,
 )
 from DynamicTopology.fit.dissociation import (
-    DEFAULT_MAX_SHAPE,
+    DEFAULT_MAX_DECAY,
+    DEFAULT_MIN_DECAY,
     bond_curvatures,
     bond_types,
     bonded_energy,
@@ -62,13 +63,15 @@ from DynamicTopology.fit.dissociation import (
     frequency,
     reaction_margins,
     scale_force_constants,
+    set_shape_decays,
     set_shape_parameters,
+    shape_bound,
     stretch_curvatures,
     total_wavenumber,
     wavenumber,
 )
 from DynamicTopology.forcefield.coupling import EVBCoupling
-from DynamicTopology.forcefield.qforce import QForce
+from DynamicTopology.forcefield.qforce import SHAPE_DECAY, QForce
 from DynamicTopology.io.json import read_jsonl
 
 
@@ -346,7 +349,7 @@ class TestMorseShape:
 
     D, R0, K = 436.0, 0.07772, 251200.0
 
-    def _curve(self, r, c):
+    def _curve(self, r, c, b=SHAPE_DECAY):
         positions = np.array([[0.0, 0.0, 0.0], [r, 0.0, 0.0]])
         vectors = positions[None, :, :] - positions[:, None, :]
         return QForce(bond_form="morse")._bond_morse(
@@ -356,12 +359,14 @@ class TestMorseShape:
             np.array([self.R0]),
             np.array([self.K]),
             np.array([c]),
+            np.array([b]),
         )[0]
 
     @pytest.mark.parametrize("c", [0.0, 0.5, 1.3, -0.8])
-    def test_the_shape_term_moves_neither_the_well_nor_the_limit(self, c):
-        assert self._curve(self.R0, c) == pytest.approx(-self.D, abs=1e-9)
-        assert self._curve(2.0, c) == pytest.approx(0.0, abs=1e-9)
+    @pytest.mark.parametrize("b", [2.0, SHAPE_DECAY, 8.0])
+    def test_the_shape_term_moves_neither_the_well_nor_the_limit(self, c, b):
+        assert self._curve(self.R0, c, b) == pytest.approx(-self.D, abs=1e-9)
+        assert self._curve(2.0, c, b) == pytest.approx(0.0, abs=1e-9)
 
     @pytest.mark.parametrize("c", [0.0, 0.5, 1.3, -0.8])
     def test_the_shape_term_moves_no_frequency(self, c):
@@ -388,30 +393,85 @@ class TestMorseShape:
         for r in (0.03, 0.05, 0.07, self.R0):
             assert self._curve(r, 1.3) == pytest.approx(self._curve(r, 0.0), abs=1e-12)
 
-    def test_the_bound_is_where_dissociation_stops_being_downhill(self):
-        """`DEFAULT_MAX_SHAPE` must bind exactly, in both directions.
+    @pytest.mark.parametrize("b", [DEFAULT_MIN_DECAY, 2.0, 2.5, 3.0, 4.0, 6.0,
+                                   DEFAULT_MAX_DECAY])
+    def test_the_bound_is_where_dissociation_stops_being_downhill(self, b):
+        """`shape_bound(b)` must bind exactly, in both directions, at every `b`.
 
         Below it the curve rises monotonically to the dissociation limit; above
         it a barrier appears on a channel that has none, and a bound state
         beyond the barrier that would trap fragments that should separate.  A
         bound that is merely *safe* would pass the first half of this and make
         the second half unreachable, so both are asserted.
+
+        Swept over the whole fitted range rather than checked at one decay,
+        because `b` is now a fitted parameter and the bound moves with it by a
+        factor of five hundred -- 0.180 at b = 1.5, 92.49 at b = 8.  A bound
+        that were correct only at the old fixed b = 4 would let the fit walk
+        onto a non-monotone curve anywhere else it went.
         """
         radii = self.R0 + np.linspace(1e-4, 1.2, 20000)
 
         def monotonic(c):
-            energies = np.array([self._curve(r, c) for r in radii])
+            energies = np.array([self._curve(r, c, b) for r in radii])
             return bool(np.all(np.diff(energies) > -1e-12))
 
-        assert monotonic(DEFAULT_MAX_SHAPE), (
-            f"c = {DEFAULT_MAX_SHAPE} already puts a barrier on a dissociation "
+        bound = shape_bound(b)
+        assert monotonic(bound), (
+            f"c = {bound} at b = {b} already puts a barrier on a dissociation "
             "curve, so the bound is not protecting what it claims to"
         )
-        assert not monotonic(1.05 * DEFAULT_MAX_SHAPE), (
-            f"c = {1.05 * DEFAULT_MAX_SHAPE} still dissociates downhill, so "
-            f"{DEFAULT_MAX_SHAPE} is leaving usable freedom on the table and "
-            "this test is not measuring where the limit actually is"
+        assert not monotonic(1.05 * bound), (
+            f"c = {1.05 * bound} at b = {b} still dissociates downhill, so "
+            f"{bound} is leaving usable freedom on the table and this test is "
+            "not measuring where the limit actually is"
         )
+
+    def test_the_decay_bounds_are_where_the_parameter_stops_meaning_anything(self):
+        """Both ends of the `b` box are the edge of usefulness, not a taste.
+
+        At the bottom the monotonicity bound collapses -- it is exactly zero at
+        b = 1, so no positive `c` is admissible at all -- and at the top the
+        correction has retreated inside the bond, delivering less at its own
+        peak than it does in the middle of the range.
+        """
+        assert shape_bound(1.0) < 1e-3, (
+            "the bound has not collapsed by b = 1, so the low end of the box is "
+            "not where the parameter stops existing"
+        )
+        assert shape_bound(DEFAULT_MIN_DECAY) > 0.0
+
+        def delivered(b):
+            """Largest correction available at this decay, as a fraction of D."""
+            return shape_bound(b) * (3.0 / b) ** 3 * np.exp(-3.0)
+
+        assert delivered(DEFAULT_MIN_DECAY) < 0.10, (
+            "the low end of the box still delivers a usable correction, so it "
+            "is cutting off freedom the fit could have used"
+        )
+        assert delivered(DEFAULT_MAX_DECAY) < delivered(4.0), (
+            "the correction is still growing at the top of the box, so the "
+            "bound is not where the parameter stops paying"
+        )
+
+    def test_setting_the_decay_leaves_every_other_parameter_alone(self, templates):
+        for _, _, terms in templates:
+            decayed = set_shape_decays(terms, [2.5] * len(bond_types(terms)))
+            for before, after in zip(terms, decayed):
+                assert before["type"] == after["type"]
+                if before["type"] != "bond":
+                    assert before["kwargs"] == after["kwargs"]
+                    continue
+                assert after["kwargs"]["b"] == pytest.approx(2.5)
+                for key in ("D", "r0", "k"):
+                    assert after["kwargs"][key] == before["kwargs"][key]
+
+    def test_a_missing_decay_reads_as_the_documented_default(self):
+        """Term files predating `b` must be unchanged by its introduction."""
+        for r in (self.R0 + 0.02, self.R0 + 0.05, self.R0 + 0.12):
+            assert self._curve(r, 1.3) == pytest.approx(
+                self._curve(r, 1.3, SHAPE_DECAY), abs=1e-12
+            )
 
     def test_setting_the_shape_leaves_every_other_parameter_alone(self, templates):
         for _, _, terms in templates:

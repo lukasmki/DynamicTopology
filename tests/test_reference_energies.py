@@ -197,7 +197,7 @@ class TestTheRetiredLennardJones:
             total, forces = LennardJones()(
                 atoms.positions, atoms.pbc, atoms.cell, term_dict
             )
-            cancel, cancel_forces = QForce()(
+            cancel, cancel_forces, _ = QForce()(
                 atoms.positions,
                 atoms.pbc,
                 atoms.cell,

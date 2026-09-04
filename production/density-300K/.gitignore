@@ -1,0 +1,15 @@
+# Trajectories are large and every run is reproducible from sweep.toml plus its
+# seed, which is the point of seeding them.  Keep the recipe in git, not the
+# output.
+output/*/nvt.xyz
+output/*/npt.xyz
+output/*/slurm-*.out
+output/slurm-*.out
+
+# `config.json` and the two `.jsonl` logs are small and are the actual result,
+# so they are NOT ignored: `density.py` reads only those.  The NPT log is the
+# measurement -- it carries the per-frame volume the density is averaged from.
+#
+# `inputs/` is likewise tracked.  `molify.pack` is deterministic given its seed
+# (pinned to 42 by scripts/mixture.py), so the box is regenerable -- but it is
+# the starting point every number here descends from, and it is a few kB.

@@ -131,6 +131,37 @@ def main() -> int:
     parser.add_argument("--timestep", type=float, default=DEFAULT_TIMESTEP, help="fs")
     parser.add_argument("--friction", type=float, default=DEFAULT_FRICTION, help="1/fs")
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
+    # EVB basis controls.  These were previously reachable only by mutating
+    # `calc.system.basis` after construction, which meant a production run could
+    # not pin them and its `config.json` could not record them.  They change the
+    # potential energy surface, so anything measured under non-default values is
+    # a property of those values -- see `production/density-300K/sweep.toml`.
+    parser.add_argument(
+        "--bimol-cutoff",
+        type=float,
+        default=4.0,
+        help="minimum interatomic distance under which a bimolecular reaction "
+        "channel is considered, in Angstrom.",
+    )
+    parser.add_argument(
+        "--eps",
+        type=float,
+        default=None,
+        help="stabilization (eV) a channel must supply to enter the EVB basis. "
+        "The default 1e-3 admits nearly everything; raising it is the smooth way "
+        "to restrict the basis, since the admission ramp still switches the "
+        "coupling on continuously and no state is refused outright.",
+    )
+    parser.add_argument("--switch-width", type=float, default=None, help="eV")
+    parser.add_argument(
+        "--max-states",
+        type=int,
+        default=None,
+        help="hard cap on basis size. Unlike --eps this refuses states outright, "
+        "which makes the surface seed-dependent where it fires -- the frames "
+        "where it did are flagged `ncapped` in the log.",
+    )
+    parser.add_argument("--max-depth", type=int, default=None)
     args = parser.parse_args()
 
     if args.output.exists() and not args.restart:
@@ -161,8 +192,20 @@ def main() -> int:
     if not args.restart:
         thermalize_momenta(atoms, args.temperature, rng=thermal_rng)
 
+    evb = {
+        key: value
+        for key, value in (
+            ("eps", args.eps),
+            ("switch_width", args.switch_width),
+            ("max_states", args.max_states),
+            ("max_depth", args.max_depth),
+        )
+        if value is not None
+    }
     reaction_set = ReactionSet(args.rnet)
-    atoms.calc = DynamicTopology(atoms, reaction_set)
+    atoms.calc = DynamicTopology(
+        atoms, reaction_set, bimol_cutoff=args.bimol_cutoff, evb=evb or None
+    )
 
     log_file = None
     if args.log is not None:
@@ -180,6 +223,8 @@ def main() -> int:
                     "friction_per_fs": args.friction,
                     "interval": args.interval,
                     "steps": args.steps,
+                    "bimol_cutoff": args.bimol_cutoff,
+                    "evb": evb,
                     "natoms": len(atoms),
                     "cell": atoms.cell.lengths().tolist(),
                     "restart": args.restart,

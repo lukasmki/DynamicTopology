@@ -157,6 +157,8 @@ class Block:
     forces: np.ndarray  # (n, natoms, 3)
     couplings: np.ndarray  # (n, n), zero diagonal
     coupling_forces: np.ndarray  # (n, n, natoms, 3)
+    virials: np.ndarray  # (n, 3, 3)
+    coupling_virials: np.ndarray  # (n, n, 3, 3)
     seed_index: int
     depth: int
     capped: bool
@@ -171,14 +173,23 @@ class Block:
     def nstates(self) -> int:
         return len(self.states)
 
-    def hamiltonian(self) -> tuple[np.ndarray, np.ndarray]:
-        """The EVB matrix and its gradient, diagonals filled in."""
+    def hamiltonian(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The EVB matrix and its two gradients, diagonals filled in.
+
+        `vham` is the strain gradient in exactly the sense `fham` is the
+        position gradient, so `System.calculate` contracts both with the same
+        ground-state eigenvector.  One sign difference is deliberate and lives
+        in the terms themselves: `fham` holds *forces* (`-dE/dr`) while `vham`
+        holds virials (`+dE/de`).
+        """
         diag = np.diag_indices(self.nstates)
         ham = self.couplings.copy()
         ham[diag] = self.energies
         fham = self.coupling_forces.copy()
         fham[diag] = self.forces
-        return ham, fham
+        vham = self.coupling_virials.copy()
+        vham[diag] = self.virials
+        return ham, fham, vham
 
 
 class EVBBasis:
@@ -278,10 +289,10 @@ class EVBBasis:
                 for term in terms
             ]
         )
-        energy, local_forces = self.bonded_ff(
+        energy, local_forces, local_virial = self.bonded_ff(
             atoms.positions[nodes], atoms.pbc, atoms.cell, term_dict
         )
-        result = (energy, nodes, local_forces)
+        result = (energy, nodes, local_forces, local_virial)
         self._molecule_cache[signature] = result
         return result
 
@@ -304,21 +315,27 @@ class EVBBasis:
             for nodes in nx.connected_components(graph)
         )
 
-    def _local_forces(self, graph: nx.Graph, atoms: Atoms) -> np.ndarray:
-        """Bonded forces of the molecules in `graph`, in global atom order.
+    def _local_gradients(
+        self, graph: nx.Graph, atoms: Atoms
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Bonded forces (global atom order) and virial of `graph`'s molecules.
 
         The counterpart of `_local_energy`, and taken only on the paths that
         need a gradient of the gap -- i.e. only for a channel sitting strictly
         inside the admission ramp.  Everything it reads is already in the
-        molecule cache from the corresponding `_local_energy` call.
+        molecule cache from the corresponding `_local_energy` call, so returning
+        the virial alongside the forces costs nothing: both were computed by the
+        one `bonded_ff` call the cache holds.
         """
         forces = np.zeros_like(atoms.positions)
+        virial = np.zeros((3, 3))
         for nodes in nx.connected_components(graph):
-            _, mol_nodes, local_forces = self._molecule_terms(
+            _, mol_nodes, local_forces, local_virial = self._molecule_terms(
                 Topology(graph.subgraph(nodes)), atoms
             )
             forces[mol_nodes] += local_forces
-        return forces
+            virial += local_virial
+        return forces, virial
 
     def _channel_weight(
         self,
@@ -327,6 +344,7 @@ class EVBBasis:
         changes: tuple[set, set],
         coupling: float,
         coupling_forces: np.ndarray,
+        coupling_virial: np.ndarray,
         atoms: Atoms,
     ) -> tuple[float, np.ndarray | None]:
         """How strongly this channel couples, and the gradient of that weight.
@@ -360,7 +378,7 @@ class EVBBasis:
         energy_after = self._local_energy(after, atoms)
         weight = self._switch(energy_before, energy_after, coupling)
         if weight <= 0.0 or weight >= 1.0:
-            return weight, None
+            return weight, None, None
 
         # d(weight)/dr = S'(t)/width * d(stab)/dr, with
         #   stab = hypot(h, V) - |h|,  h = (E_after - E_before) / 2
@@ -374,15 +392,28 @@ class EVBBasis:
             / self.switch_width
         )
 
-        dgap = 0.5 * (
-            self._local_forces(before, atoms) - self._local_forces(after, atoms)
-        )
+        forces_before, virial_before = self._local_gradients(before, atoms)
+        forces_after, virial_after = self._local_gradients(after, atoms)
+        dgap = 0.5 * (forces_before - forces_after)
         dstabilization = (half_gap / hyp - np.sign(half_gap)) * dgap + (
             coupling / hyp
         ) * -coupling_forces
-        return weight, slope * dstabilization
 
-    def _energy(self, state: Topology, atoms: Atoms) -> tuple[float, np.ndarray]:
+        # The same chain rule against strain rather than position.  The two sign
+        # flips of the force convention are absent here because virials are
+        # already `+dE/de`: `d(half_gap)/de` is `+0.5 * (W_after - W_before)`
+        # where the force version is `0.5 * (F_before - F_after)`, and the
+        # coupling enters as `+coupling_virial` where it entered as
+        # `-coupling_forces`.
+        dgap_strain = 0.5 * (virial_after - virial_before)
+        dstabilization_strain = (half_gap / hyp - np.sign(half_gap)) * dgap_strain + (
+            coupling / hyp
+        ) * coupling_virial
+        return weight, slope * dstabilization, slope * dstabilization_strain
+
+    def _energy(
+        self, state: Topology, atoms: Atoms
+    ) -> tuple[float, np.ndarray, np.ndarray]:
         """Diabatic energy and forces of one state at the current geometry.
 
 
@@ -421,19 +452,22 @@ class EVBBasis:
             ]
         )
 
-        energy, local_forces = self.bonded_ff(
+        energy, local_forces, virial = self.bonded_ff(
             atoms.positions[nodes], atoms.pbc, atoms.cell, term_dict
         )
         forces = np.zeros_like(atoms.positions)
         forces[nodes] = local_forces
 
-        result = (energy, forces)
+        # The virial needs no scatter: it is a 3x3 sum over the state's own
+        # pairs, so the restriction to `nodes` that makes this call cheap does
+        # not change it.
+        result = (energy, forces, virial)
         self._energy_cache[key] = result
         return result
 
     def _coupling(
         self, atoms: Atoms, reaction: Reaction, mapping: dict
-    ) -> tuple[float, np.ndarray]:
+    ) -> tuple[float, np.ndarray, np.ndarray]:
         """Off-diagonal coupling for one reaction channel, in global order.
 
         Row k of the live geometry is compared against row k of the stored
@@ -450,7 +484,7 @@ class EVBBasis:
 
         order = [mapping[k] for k in sorted(mapping)]
         ensemble = np.stack([frame.positions for frame in reaction.atoms])
-        energy, local_forces = self.coupling_ff(
+        energy, local_forces, virial = self.coupling_ff(
             atoms.positions[order],
             atoms.pbc,
             atoms.cell,
@@ -460,7 +494,7 @@ class EVBBasis:
 
         forces = np.zeros_like(atoms.positions)
         forces[order, :] = local_forces
-        result = (float(energy), forces)
+        result = (float(energy), forces, virial)
         self._coupling_cache[cache_key] = result
         return result
 
@@ -531,7 +565,7 @@ class EVBBasis:
         # equivalent routes, so keep the most strongly coupled representative --
         # choosing on the coupling rather than on enumeration order is what makes
         # the choice independent of how the atoms happen to be labelled.
-        edges: dict[frozenset, tuple[float, np.ndarray, float]] = {}
+        edges: dict[frozenset, tuple[float, np.ndarray, np.ndarray, float]] = {}
         placeholders: dict[str, None] = {}
         capped = False
 
@@ -545,9 +579,17 @@ class EVBBasis:
                 if not broken and not formed:
                     continue  # a no-op template, e.g. H + H -> H + H
 
-                coupling, coupling_forces = self._coupling(atoms, reaction, mapping)
-                weight, dweight = self._channel_weight(
-                    parent, mapping, (broken, formed), coupling, coupling_forces, atoms
+                coupling, coupling_forces, coupling_virial = self._coupling(
+                    atoms, reaction, mapping
+                )
+                weight, dweight, dweight_virial = self._channel_weight(
+                    parent,
+                    mapping,
+                    (broken, formed),
+                    coupling,
+                    coupling_forces,
+                    coupling_virial,
+                    atoms,
                 )
                 if weight <= 0.0:
                     continue
@@ -557,8 +599,14 @@ class EVBBasis:
                 # inconsistent with the energy wherever a channel is ramping.
                 value = weight * coupling
                 gradient = weight * coupling_forces
+                virial_gradient = weight * coupling_virial
                 if dweight is not None:
                     gradient = gradient - coupling * dweight
+                    # `W_eff = d(weight*V)/de = weight*W_V + V*d(weight)/de`.
+                    # The sign is `+` where the force line above is `-`, for the
+                    # same reason as in `_channel_weight`: a force is `-dE/dr`
+                    # and a virial is `+dE/de`.
+                    virial_gradient = virial_gradient + coupling * dweight_virial
 
                 # Only now is the product worth building: `apply` copies the
                 # whole block graph, and so does deriving its state key.
@@ -573,7 +621,7 @@ class EVBBasis:
                 # the matrix: a route with the larger raw coupling but a smaller
                 # weight is the weaker one.
                 if previous is None or abs(value) > abs(previous[0]):
-                    edges[pair] = (value, gradient, weight)
+                    edges[pair] = (value, gradient, virial_gradient, weight)
                 if _is_placeholder(reaction):
                     placeholders[reaction.equation()] = None
 
@@ -606,27 +654,32 @@ class EVBBasis:
         nstates = len(states)
         energies = np.zeros(nstates)
         forces = np.zeros((nstates,) + atoms.positions.shape)
+        virials = np.zeros((nstates, 3, 3))
         for i, state in enumerate(states):
-            energies[i], forces[i] = self._energy(state, atoms)
+            energies[i], forces[i], virials[i] = self._energy(state, atoms)
 
         couplings = np.zeros((nstates, nstates))
         coupling_forces = np.zeros((nstates, nstates) + atoms.positions.shape)
+        coupling_virials = np.zeros((nstates, nstates, 3, 3))
         min_switch = 1.0
-        for pair, (value, gradient, weight) in edges.items():
+        for pair, (value, gradient, virial_gradient, weight) in edges.items():
             keys = tuple(pair)
             if len(keys) != 2 or any(key not in index for key in keys):
                 continue  # an edge to a state the caps refused
             i, j = index[keys[0]], index[keys[1]]
             couplings[i, j] = couplings[j, i] = value
             coupling_forces[i, j] = coupling_forces[j, i] = gradient
+            coupling_virials[i, j] = coupling_virials[j, i] = virial_gradient
             min_switch = min(min_switch, weight)
 
         return Block(
             states=states,
             energies=energies,
             forces=forces,
+            virials=virials,
             couplings=couplings,
             coupling_forces=coupling_forces,
+            coupling_virials=coupling_virials,
             seed_index=index[seed_key],
             depth=max(depths.values()),
             capped=capped,

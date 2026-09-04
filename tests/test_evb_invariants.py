@@ -288,7 +288,7 @@ class TestBasisClosure:
         atoms = reactive()
         system = System(atoms, Topology.from_atoms(atoms), reaction_set)
         block = system.basis.build(atoms, system.topology, BIMOL_CUTOFF)[0]
-        ham, _ = block.hamiltonian()
+        ham, _, _ = block.hamiltonian()
 
         assert np.allclose(ham, ham.T, atol=0.0), "EVB matrix is not symmetric"
 

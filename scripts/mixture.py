@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack a box of H2 and O2 at a chosen composition.
+"""Pack a box of molecules at a chosen composition.
 
 Two ways to set the size, and for a composition sweep they are not
 interchangeable:
@@ -48,9 +48,24 @@ def main():
     parser.add_argument(
         "-r", "--rnet", required=False, default="datasets/HCombustion/HCombustion.json"
     )
-    parser.add_argument("-x", "--ratio", help="H2 to O2 ratio", default="1:1")
     parser.add_argument(
-        "-n", "--number", help="Total number of H2/O2 molecules", type=int, default=100
+        "--formulas",
+        default="H2,O2",
+        help="comma-separated chemical formulas to pack, in the same order as "
+        "--ratio. Looked up in the reaction set by formula, so they must be "
+        "templates it actually carries -- `H2O` against datasets/Water, `H2,O2` "
+        "against datasets/HCombustion. Defaults to the H2/O2 pair this script "
+        "was originally hard-wired to.",
+    )
+    parser.add_argument(
+        "-x",
+        "--ratio",
+        help="ratio between the --formulas species, e.g. `1:2`. A single "
+        "species takes `1`.",
+        default="1:1",
+    )
+    parser.add_argument(
+        "-n", "--number", help="Total number of molecules", type=int, default=100
     )
     size = parser.add_mutually_exclusive_group()
     size.add_argument(
@@ -86,11 +101,18 @@ def main():
     reaction_set = ReactionSet(args.rnet)
 
     # `get_molecules(formulas=...)` yields in the order asked, so `nums` below
-    # lines up with the H2:O2 ratio rather than silently inverting it.
-    mols = reaction_set.get_molecules(formulas=["H2", "O2"])
+    # lines up with the requested ratio rather than silently inverting it.
+    formulas = [f.strip() for f in args.formulas.split(",") if f.strip()]
+    mols = reaction_set.get_molecules(formulas=formulas)
     atoms: list[list[Atoms]] = [[m.atoms] for m in mols]
 
     ratio = [float(r) for r in args.ratio.split(":")]
+    if len(ratio) != len(formulas):
+        parser.error(
+            f"--ratio has {len(ratio)} parts but --formulas has {len(formulas)} "
+            f"({args.ratio!r} against {args.formulas!r}); a single species takes "
+            "`-x 1`"
+        )
     nums = [int(args.number * x / sum(ratio)) for x in ratio]
     density = args.density
 
@@ -99,6 +121,7 @@ def main():
         mols = reaction_set.get_molecules()
         atoms = [[m.atoms] for m in mols]
         nums = [1] * len(atoms)
+        formulas = [a[0].get_chemical_formula() for a in atoms]
         density = 30.0
 
     if density is None:
@@ -112,8 +135,11 @@ def main():
         outfile = args.output
     io.write(outfile, mixture, format="extxyz")
 
+    # Built from `formulas` rather than printed literally, so a water box does
+    # not report itself as H2 + O2.  stderr, so `-o -` keeps stdout clean.
+    composition = " + ".join(f"{n} {f}" for n, f in zip(nums, formulas))
     print(
-        f"{args.ratio:>5}  {nums[0]:>3} H2 + {nums[1]:>3} O2 = {len(mixture):>3} atoms"
+        f"{args.ratio:>5}  {composition} = {len(mixture):>3} atoms"
         f"  box {mixture.cell.lengths()[0]:.3f} A  density {density:.2f} kg/m^3"
         f"  seed {args.seed}",
         file=sys.stderr,

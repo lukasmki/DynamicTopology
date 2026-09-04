@@ -2,22 +2,41 @@ import numpy as np
 from ase import units
 from typing import Callable
 
-# Decay rate of the Morse shape term, `c * s**3 * exp(-SHAPE_DECAY * s)`.
+# Default decay rate of the Morse shape term, `c * s**3 * exp(-b * s)`, used for
+# any bond whose term file predates `b` being a parameter.
 #
-# Fixed, not fitted: it sets *where* the correction acts, and that is a property
-# of the chemistry rather than of any one bond.  The textbook Hulburt-
-# Hirschfelder value is 2, which puts the peak at `s = 1.5`.  Measured across the
-# nineteen HCombustion transition states, the most-stretched bond of a reactant
-# diabat sits at a median `s` of 0.64 -- so at 2 the correction delivers only 9%
-# of `D` where reactions actually happen, having spent its strength on
-# geometries nothing visits.
+# **`b` is now fitted per bond type, and this is only the fallback.**  It was
+# fixed at 4 on the argument that the decay "sets *where* the correction acts,
+# and that is a property of the chemistry rather than of any one bond".  That is
+# measurably false.  Writing `s = a*(r - r0)`, the three populations the shape
+# term has to serve sit in three separate bands:
 #
-# At 4 the peak lands at `s = 0.75`, next to that median, and the available
-# correction there is 39% of `D` -- four times as much, for the same one
-# parameter.  It also relaxes the monotonicity limit on `c` (see
-# `fit.dissociation.DEFAULT_MAX_SHAPE`) from 1.31 to 19.3, because the Morse
-# repulsion now outruns the correction much sooner.  Sweeping 2/3/4/5/6, the
-# delivered correction peaks at 4 and falls off either side.
+#     bonds at their own reference geometry   s = 0.180 - 0.382   (the cost)
+#     metathesis transition states            s = 0.352 - 1.049, median 0.681
+#     homolysis mid-dissociation geometries   s = 1.081 - 1.525, median 1.358
+#
+# and `s**3 exp(-b s)` peaks at `s = 3/b`, so one `b` can be aimed at exactly one
+# of them.  Four was aimed at the second.  Refitting the whole pipeline from the
+# q-force baseline at each fixed `b` -- metathesis channels the coupling fit can
+# invert, root-mean-square error of the reactant diabat against the reference
+# dissociation curve, and the fastest stretching mode:
+#
+#     b     c_max   metathesis   dissociation rms   fastest mode      dt
+#     2.0    1.31      12/13         0.700 eV         4517 cm^-1   0.492 fs
+#     2.5    3.84      13/13         0.783            4402         0.505
+#     3.0    7.80      13/13         1.098            4352         0.511
+#     4.0   19.33      13/13         1.710            4400         0.505
+#     5.0   34.50      13/13         2.660            4402         0.505
+#     6.0   52.20      12/13         3.181            4432         0.502
+#
+# The timestep is flat across the whole range -- the curvature cap absorbs
+# whatever `b` does -- so `b` costs nothing and 4 was simply the worst reachable
+# value for the dissociation curves.  Hence `fit.dissociation` fits it.
+#
+# The bound `c_max(b)` above is the monotonicity limit (`fit.dissociation.
+# shape_bound`), and it is why low `b` is not free either: at 2.0 it is 1.31 and
+# binds on five of eight bonds, so that row is limited by the constraint rather
+# than by the fit.
 SHAPE_DECAY: float = 4.0
 
 
@@ -49,7 +68,7 @@ class QForce:
 
     def __call__(
         self, pos: np.ndarray, pbc: np.ndarray, cell: np.ndarray, term_dict: dict
-    ) -> tuple[float, np.ndarray]:
+    ) -> tuple[float, np.ndarray, np.ndarray]:
         # compute all distance vectors
         # vecs[1, 0] - vector from atom_0 to atom_1
         vecs = pos[:, None, :] - pos[None, :, :]
@@ -63,16 +82,24 @@ class QForce:
         # compute terms
         e = 0.0
         f = np.zeros_like(pos)
+        w = np.zeros((3, 3))
         for term_type, param_dict in term_dict.items():
             fn: Callable | None = getattr(self, f"compute_{term_type}", None)
             if fn is None:
                 continue
-            de, df = fn(vecs, param_dict["atoms"], **param_dict["kwargs"])
+            de, df, dw = fn(vecs, param_dict["atoms"], **param_dict["kwargs"])
             e += de
             f += df
+            w += dw
         e *= units.kJ / units.mol
         f *= units.kJ / units.mol / units.nm
-        return e, f
+        # The virial is an energy, not a force: `v` is already in nm and `dE/dv`
+        # in kJ/mol/nm, so their product carries no length and converts with the
+        # energy factor alone.  Dividing by `units.nm` here as the forces do
+        # would be wrong by a factor of 10 and would show up only as a pressure
+        # that is silently an order of magnitude out.
+        w *= units.kJ / units.mol
+        return e, f, w
 
     def _accumulate_forces(self, f, atoms_col, grad):
         """
@@ -85,12 +112,32 @@ class QForce:
         """
         np.add.at(f, atoms_col, grad)
 
-    def compute_bond(self, vecs, atoms, D, r0, k, c=0.0):
+    @staticmethod
+    def _virial(*pairs):
+        """Sum of `v (x) dE/dv` over a term's internal displacement vectors.
+
+        Every term here is a function of displacement vectors only, so under a
+        homogeneous strain `v -> (I + e) v` and `dE/de_ab = sum v_a (dE/dv)_b`.
+        Each `compute_*` already forms `dE/dv` on its way to scattering the
+        forces -- the sign convention being that `dE/dv` is the gradient with
+        respect to the vector as `vecs` defines it, so it is scattered as `-dE/dv`
+        onto the atom the vector points *to*.  Passing the same arrays here costs
+        one outer product per vector and needs no new derivatives.
+
+        The result is in q-force's own units (kJ/mol, since `v` is in nm and
+        `dE/dv` in kJ/mol/nm); `__call__` converts it.
+        """
+        w = np.zeros((3, 3))
+        for v, dE_dv in pairs:
+            w += np.einsum("na,nb->ab", v, dE_dv)
+        return w
+
+    def compute_bond(self, vecs, atoms, D, r0, k, c=0.0, b=SHAPE_DECAY):
         if self.bond_form == "morse":
-            return self._bond_morse(vecs, atoms, D, r0, k, c)
+            return self._bond_morse(vecs, atoms, D, r0, k, c, b)
         return self._bond_harmonic(vecs, atoms, D, r0, k)
 
-    def _bond_morse(self, vecs, atoms, D, r0, k, c=0.0):
+    def _bond_morse(self, vecs, atoms, D, r0, k, c=0.0, b=SHAPE_DECAY):
         """Morse with a one-sided Hulburt-Hirschfelder shape term.
 
             s = a*max(dr, 0),  a = sqrt(k / 2D)
@@ -126,8 +173,11 @@ class QForce:
         largest single contribution to the stiffness of most of HCombustion's
         bonds.  See `fit.dissociation._bonded_curvature`.
 
-        `b` is `SHAPE_DECAY`, fixed rather than fitted; see its comment for why
-        it is 4 and not the textbook 2.
+        `b` is per bond type and fitted alongside `c`; `SHAPE_DECAY` is only
+        the fallback for a term file written before it was a parameter.  See
+        `SHAPE_DECAY`'s comment for the measurement that made it one, and
+        `fit.dissociation.shape_bound` for the `c <= c_max(b)` constraint
+        that couples the two.
 
         **Why it is one-sided.**  `s**3 * exp(-b*s)` continued to `dr < 0` grows
         without bound against a repulsive wall that only grows like
@@ -149,10 +199,10 @@ class QForce:
         # Stretched branch only; `np.maximum` rather than a mask so that the
         # zero-`c` case stays a single vectorised expression.
         s = al * np.maximum(dr, 0.0)  # (n,)
-        decay = np.exp(-SHAPE_DECAY * s)
+        decay = np.exp(-b * s)
         e = e + D * c * s * s * s * decay
         # d/ds [s**3 exp(-b s)] = (3 s**2 - b s**3) exp(-b s),  ds/dr = al (or 0)
-        de_dr = de_dr + D * c * al * s * s * (3.0 - SHAPE_DECAY * s) * decay
+        de_dr = de_dr + D * c * al * s * s * (3.0 - b * s) * decay
 
         e_tot = np.sum(e)
         # dr/dv = v/r,  v = pos_atom1 - pos_atom0
@@ -163,7 +213,7 @@ class QForce:
         # F = -dE/d(pos)
         np.add.at(f, atoms[:, 0], dv)
         np.add.at(f, atoms[:, 1], -dv)
-        return e_tot, f
+        return e_tot, f, self._virial((v, dv))
 
     def _bond_harmonic(self, vecs, atoms, D, r0, k):
         """Harmonic potential, E = 0.5*k*dr**2.  `D` is unused."""
@@ -181,7 +231,7 @@ class QForce:
         # F = -dE/d(pos)
         np.add.at(f, atoms[:, 0], dv)  # atom0:  v points away from atom1
         np.add.at(f, atoms[:, 1], -dv)  # atom1
-        return e_tot, f
+        return e_tot, f, self._virial((v, dv))
 
     def compute_reference(self, vecs, atoms, E0):
         """Constant per-molecule reference energy (the EVB alpha shift).
@@ -195,7 +245,9 @@ class QForce:
         reference atomization energy and the depth its Morse bonds already
         supply, so it is small and Morse carries the physics.
         """
-        return np.sum(E0), np.zeros((vecs.shape[0], 3))
+        # Geometry-independent, so it is strain-independent too: a constant
+        # shift moves no atom and stores no stress.
+        return np.sum(E0), np.zeros((vecs.shape[0], 3)), np.zeros((3, 3))
 
     def compute_exclusion(self, vecs, atoms, sigma, eps):
         """Cancels the global Lennard-Jones term between near neighbours.
@@ -243,7 +295,7 @@ class QForce:
         # F = -dE/d(pos)
         np.add.at(f, atoms[:, 0], dv)
         np.add.at(f, atoms[:, 1], -dv)
-        return e_tot, f
+        return e_tot, f, self._virial((v, dv))
 
     def compute_angle(self, vecs, atoms, theta0, k):
         va = vecs[atoms[:, 0], atoms[:, 1]]  # (n, 3)
@@ -276,7 +328,7 @@ class QForce:
         np.add.at(f, atoms[:, 0], -dE_dva)
         np.add.at(f, atoms[:, 1], dE_dva + dE_dvb)
         np.add.at(f, atoms[:, 2], -dE_dvb)
-        return e_tot, f
+        return e_tot, f, self._virial((va, dE_dva), (vb, dE_dvb))
 
     def compute_bondbond(self, vecs, atoms, r1_0, r2_0, k):
         v1 = vecs[atoms[:, 0], atoms[:, 1]]  # (n, 3)
@@ -303,7 +355,7 @@ class QForce:
         np.add.at(f, atoms[:, 1], dv1)
         np.add.at(f, atoms[:, 2], -dv2)
         np.add.at(f, atoms[:, 3], dv2)
-        return e_tot, f
+        return e_tot, f, self._virial((v1, dv1), (v2, dv2))
 
     def compute_bondangle(self, vecs, atoms, theta0, r0, k):
         # angle part (atoms 0,1,2)
@@ -349,7 +401,7 @@ class QForce:
         # bond vector: vc = pos[a3]-pos[a4]
         np.add.at(f, atoms[:, 3], -dE_dvc)
         np.add.at(f, atoms[:, 4], dE_dvc)
-        return e_tot, f
+        return e_tot, f, self._virial((va, dE_dva), (vb, dE_dvb), (vc, dE_dvc))
 
     def compute_angleangle(self, vecs, atoms, theta1_0, theta2_0, k):
         va = vecs[atoms[:, 0], atoms[:, 1]]
@@ -395,11 +447,17 @@ class QForce:
         np.add.at(f, atoms[:, 3], -dE_dvc)
         np.add.at(f, atoms[:, 4], dE_dvc + dE_dvd)
         np.add.at(f, atoms[:, 5], -dE_dvd)
-        return e_tot, f
+        return (
+            e_tot,
+            f,
+            self._virial((va, dE_dva), (vb, dE_dvb), (vc, dE_dvc), (vd, dE_dvd)),
+        )
 
     def _dihedral_phi_and_grads(self, va, vb, vc):
         """
-        Returns (phi, dphi/d(pos_a0..3)) for a batch of dihedrals.
+        Returns (phi, dphi/d(pos_a0..3), dphi/d(va, vb, vc)) for a batch of
+        dihedrals -- position-level gradients for the forces, vector-level ones
+        for the virial.
 
         Vector convention:
             va = vecs[a0, a1] = pos_a0 - pos_a1
@@ -448,14 +506,31 @@ class QForce:
         dphi_dpos2 = dphi_dvb - dphi_dvc
         dphi_dpos3 = dphi_dvc
 
-        return phi, dphi_dpos0, dphi_dpos1, dphi_dpos2, dphi_dpos3
+        # The vec-level gradients are returned alongside the position-level
+        # ones because the virial needs them and they would otherwise have to be
+        # rebuilt from the position gradients, which is not possible: the map
+        # from three vectors to four positions is not invertible (it drops the
+        # centre of mass).  The forces use the position form, the virial the
+        # vector form, and both come from the one derivation above.
+        return (
+            phi,
+            dphi_dpos0,
+            dphi_dpos1,
+            dphi_dpos2,
+            dphi_dpos3,
+            dphi_dva,
+            dphi_dvb,
+            dphi_dvc,
+        )
 
     def compute_periodicdihedral(self, vecs, atoms, phi0, n, k):
         va = vecs[atoms[:, 0], atoms[:, 1]]
         vb = vecs[atoms[:, 2], atoms[:, 1]]
         vc = vecs[atoms[:, 3], atoms[:, 2]]
 
-        phi, dp0, dp1, dp2, dp3 = self._dihedral_phi_and_grads(va, vb, vc)
+        phi, dp0, dp1, dp2, dp3, dva, dvb, dvc = self._dihedral_phi_and_grads(
+            va, vb, vc
+        )
 
         e = k * (1 + np.cos(n * phi - phi0))
         e_tot = np.sum(e)
@@ -470,14 +545,20 @@ class QForce:
         np.add.at(f, atoms[:, 1], -dE_dphi * dp1)
         np.add.at(f, atoms[:, 2], -dE_dphi * dp2)
         np.add.at(f, atoms[:, 3], -dE_dphi * dp3)
-        return e_tot, f
+        return (
+            e_tot,
+            f,
+            self._virial((va, dE_dphi * dva), (vb, dE_dphi * dvb), (vc, dE_dphi * dvc)),
+        )
 
     def compute_dihedralbond(self, vecs, atoms, phi0, n, k, r0):
         # dihedral part (atoms 0..3)
         va = vecs[atoms[:, 0], atoms[:, 1]]
         vb = vecs[atoms[:, 2], atoms[:, 1]]
         vc = vecs[atoms[:, 3], atoms[:, 2]]
-        phi, dp0, dp1, dp2, dp3 = self._dihedral_phi_and_grads(va, vb, vc)
+        phi, dp0, dp1, dp2, dp3, dva, dvb, dvc = self._dihedral_phi_and_grads(
+            va, vb, vc
+        )
         cos_term = 1 + np.cos(n * phi - phi0)  # (n,)
 
         # bond part (atoms 4,5)
@@ -502,14 +583,25 @@ class QForce:
         np.add.at(f, atoms[:, 3], -dE_dphi * dp3)
         np.add.at(f, atoms[:, 4], -dE_dvd)  # vd = pos[a4]-pos[a5]
         np.add.at(f, atoms[:, 5], dE_dvd)
-        return e_tot, f
+        return (
+            e_tot,
+            f,
+            self._virial(
+                (va, dE_dphi * dva),
+                (vb, dE_dphi * dvb),
+                (vc, dE_dphi * dvc),
+                (vd, dE_dvd),
+            ),
+        )
 
     def compute_dihedralangle(self, vecs, atoms, phi0, n, k, theta0):
         # dihedral (atoms 0..3)
         va = vecs[atoms[:, 0], atoms[:, 1]]
         vb = vecs[atoms[:, 2], atoms[:, 1]]
         vc = vecs[atoms[:, 3], atoms[:, 2]]
-        phi, dp0, dp1, dp2, dp3 = self._dihedral_phi_and_grads(va, vb, vc)
+        phi, dp0, dp1, dp2, dp3, dva, dvb, dvc = self._dihedral_phi_and_grads(
+            va, vb, vc
+        )
         cos_term = 1 + np.cos(n * phi - phi0)
 
         # angle (atoms 4,5,6)
@@ -544,14 +636,26 @@ class QForce:
         np.add.at(f, atoms[:, 4], -dE_dvp)
         np.add.at(f, atoms[:, 5], dE_dvp + dE_dvq)
         np.add.at(f, atoms[:, 6], -dE_dvq)
-        return e_tot, f
+        return (
+            e_tot,
+            f,
+            self._virial(
+                (va, dE_dphi * dva),
+                (vb, dE_dphi * dvb),
+                (vc, dE_dphi * dvc),
+                (vp, dE_dvp),
+                (vq, dE_dvq),
+            ),
+        )
 
     def compute_dihedralangleangle(self, vecs, atoms, phi0, n, k, theta0_1, theta0_2):
         # dihedral (atoms 0..3)
         va = vecs[atoms[:, 0], atoms[:, 1]]
         vb = vecs[atoms[:, 2], atoms[:, 1]]
         vc = vecs[atoms[:, 3], atoms[:, 2]]
-        phi, dp0, dp1, dp2, dp3 = self._dihedral_phi_and_grads(va, vb, vc)
+        phi, dp0, dp1, dp2, dp3, dva, dvb, dvc = self._dihedral_phi_and_grads(
+            va, vb, vc
+        )
         cos_term = 1 + np.cos(n * phi - phi0)
 
         # angle 1 (atoms 0,1,2) - same vectors as dihedral start
@@ -615,4 +719,17 @@ class QForce:
         np.add.at(f, atoms[:, 1], -dE_ang2_pos1)
         np.add.at(f, atoms[:, 2], -dE_ang2_pos2)
         np.add.at(f, atoms[:, 3], -dE_ang2_pos3)
-        return e_tot, f
+        # The two angles reuse the dihedral's own atoms but not its vectors:
+        # angle 1 shares va/vb, while angle 2 is built from va2 = vecs[a1, a2]
+        # and vb2 = vecs[a3, a2], neither of which is va, vb or vc.  Each
+        # displacement vector is listed once with its own total gradient.
+        w = self._virial(
+            (va, dE_dphi * dva),
+            (vb, dE_dphi * dvb),
+            (vc, dE_dphi * dvc),
+            (va1, dE_dcos1 * dcos1_dva1),
+            (vb1, dE_dcos1 * dcos1_dvb1),
+            (va2, dE_dcos2 * dcos2_dva2),
+            (vb2, dE_dcos2 * dcos2_dvb2),
+        )
+        return e_tot, f, w

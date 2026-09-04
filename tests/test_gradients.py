@@ -115,7 +115,7 @@ class TestQForceGradients:
         def energy_fn(p):
             return self.qf(p, PBC, CELL, term_dict)[0]
 
-        _, f_analytical = self.qf(pos, PBC, CELL, term_dict)
+        _, f_analytical, _ = self.qf(pos, PBC, CELL, term_dict)
         f_fd = finite_difference_forces(energy_fn, pos)
         np.testing.assert_allclose(
             f_analytical,
@@ -167,7 +167,7 @@ class TestQForceGradients:
         def energy_fn(p):
             return qf(p, PBC, CELL, td)[0]
 
-        _, f_analytical = qf(POS_2, PBC, CELL, td)
+        _, f_analytical, _ = qf(POS_2, PBC, CELL, td)
         np.testing.assert_allclose(
             f_analytical,
             finite_difference_forces(energy_fn, POS_2),
@@ -196,9 +196,10 @@ class TestQForceGradients:
     def test_reference(self):
         """Constant per-molecule reference shift contributes energy but no force."""
         td = make_term("reference", [[0]], E0=[-1234.5])
-        energy, forces = self.qf(POS_3, PBC, CELL, td)
+        energy, forces, virial = self.qf(POS_3, PBC, CELL, td)
         assert energy == pytest.approx(-1234.5 * (units.kJ / units.mol))
         np.testing.assert_allclose(forces, np.zeros_like(POS_3), atol=0.0)
+        np.testing.assert_allclose(virial, np.zeros((3, 3)), atol=0.0)
 
     def test_angle(self):
         """Harmonic angle (in cosine)."""
@@ -333,10 +334,10 @@ class TestACKS2Gradients:
         def energy_fn(p):
             v = (p[:, None, :] - p[None, :, :])[sub]
             r = np.sqrt(np.sum(v * v, -1))
-            e, _ = self.acks2.compute_coulomb(Q, r, v)
+            e, _, _ = self.acks2.compute_coulomb(Q, r, v)
             return e
 
-        _, f_analytical = self.acks2.compute_coulomb(Q, rij_ref, vecs_ref)
+        _, f_analytical, _ = self.acks2.compute_coulomb(Q, rij_ref, vecs_ref)
         f_fd = finite_difference_forces(energy_fn, POS_H2O2)
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-3, rtol=1e-3)
 
@@ -366,7 +367,7 @@ class TestACKS2Gradients:
             # reusing one here would be testing the cache, not the gradient.
             return ACKS2()(p, PBC, CELL, term_dict)[0]
 
-        _, f_analytical = acks2(positions, PBC, CELL, term_dict)
+        _, f_analytical, _ = acks2(positions, PBC, CELL, term_dict)
         f_fd = finite_difference_forces(energy_fn, positions)
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
 
@@ -383,7 +384,7 @@ class TestACKS2Gradients:
         permutation = np.random.default_rng(seed).permutation(len(POS_H2O2))
         params = self._TERM_DICT["atom"]["kwargs"]
 
-        reference_e, reference_f = ACKS2()(POS_H2O2, PBC, CELL, self._TERM_DICT)
+        reference_e, reference_f, _ = ACKS2()(POS_H2O2, PBC, CELL, self._TERM_DICT)
 
         # Same molecule, atoms listed in a different order.
         permuted_term_dict = {
@@ -392,7 +393,7 @@ class TestACKS2Gradients:
                 "kwargs": {k: v[permutation] for k, v in params.items()},
             }
         }
-        energy, forces = ACKS2()(POS_H2O2, PBC, CELL, permuted_term_dict)
+        energy, forces, _ = ACKS2()(POS_H2O2, PBC, CELL, permuted_term_dict)
 
         assert energy == pytest.approx(reference_e, abs=1e-10)
         np.testing.assert_allclose(forces, reference_f, atol=1e-10)
@@ -448,7 +449,7 @@ class TestZBLGradients:
         def energy_fn(p):
             return self.zbl(p, numbers, PBC, CELL)[0]
 
-        _, f_analytical = self.zbl(positions, numbers, PBC, CELL)
+        _, f_analytical, _ = self.zbl(positions, numbers, PBC, CELL)
         f_numerical = finite_difference_forces(energy_fn, positions)
         np.testing.assert_allclose(f_analytical, f_numerical, atol=1e-5, rtol=1e-5)
 
@@ -463,7 +464,7 @@ class TestZBLGradients:
         def energy_fn(p):
             return self.zbl(p, numbers, pbc, cell)[0]
 
-        _, f_analytical = self.zbl(positions, numbers, pbc, cell)
+        _, f_analytical, _ = self.zbl(positions, numbers, pbc, cell)
         f_numerical = finite_difference_forces(energy_fn, positions, delta=1e-5)
         np.testing.assert_allclose(f_analytical, f_numerical, atol=1e-4, rtol=1e-4)
 
@@ -560,7 +561,7 @@ class TestLennardJonesGradients:
         def energy_fn(p):
             return self.qf(p, PBC, CELL, td)[0]
 
-        _, f_analytical = self.qf(positions, PBC, CELL, td)
+        _, f_analytical, _ = self.qf(positions, PBC, CELL, td)
         f_fd = finite_difference_forces(energy_fn, positions)
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-3, rtol=1e-3)
 
@@ -587,7 +588,7 @@ class TestLennardJonesGradients:
         global_energy, global_forces = self.lj(
             positions, PBC, CELL, self._atom_terms(n)
         )
-        exclusion_energy, exclusion_forces = self.qf(
+        exclusion_energy, exclusion_forces, _ = self.qf(
             positions, PBC, CELL, make_term("exclusion", rows, sigma=sigma, eps=eps)
         )
         assert abs(global_energy + exclusion_energy) < 1e-9 * max(
@@ -621,7 +622,7 @@ class TestLennardJonesGradients:
         eps = np.sqrt(self.EPS[0] * self.EPS[1])
 
         total, forces = self.lj(pos, PBC, CELL, self._atom_terms(2))
-        cancel, cancel_forces = self.qf(
+        cancel, cancel_forces, _ = self.qf(
             pos,
             PBC,
             CELL,
@@ -677,7 +678,7 @@ class TestEVBCouplingGradients:
         def energy_fn(p):
             return self.coupling(p, PBC, CELL, ensemble, td)[0]
 
-        _, f_analytical = self.coupling(pos, PBC, CELL, ensemble, td)
+        _, f_analytical, _ = self.coupling(pos, PBC, CELL, ensemble, td)
         f_fd = finite_difference_forces(energy_fn, pos)
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-3, rtol=1e-3)
 

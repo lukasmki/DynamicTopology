@@ -94,7 +94,7 @@ class ACKS2:
         return self.solve_charges(rij, params)[0]
 
     def compute_coulomb(self, Q, rij, vecs):
-        """Coulomb energy and forces.  All arguments and results in term order.
+        """Coulomb energy, forces and virial.  All arguments and results in term order.
 
         The charges are held fixed here, so this is only the explicit part of
         the gradient.  `compute_response_forces` supplies the dQ/dr part, and
@@ -116,10 +116,19 @@ class ACKS2:
         nij = vecs / (r[:, :, None])
         f = -nij * self.CCOUL * qiqj[:, :, None] * dkernel_dr[:, :, None]
         f_tot = np.sum(f, 1) * units.eV / units.Angstrom
-        return e_tot, f_tot
+
+        # Virial at fixed `Q`, the explicit half of the strain derivative, in
+        # the same relationship to `e_tot` as `f_tot` is.  A homogeneous strain
+        # maps every minimum-image separation `v -> (I + e) v`, so
+        # `dr_ij/de_ab = v_a v_b / r` and the 0.5 that halves the (i, j)/(j, i)
+        # double count survives -- `v_a v_b` is even under the swap, so unlike
+        # the force it has nothing to cancel against.
+        de_dr = self.CCOUL * qiqj * dkernel_dr
+        w_tot = 0.5 * np.einsum("ij,ija,ijb->ab", de_dr / r, vecs, vecs) * units.eV
+        return e_tot, f_tot, w_tot
 
     def compute_response_forces(self, Q, u, A, rij, vecs, params):
-        """The dQ/dr part of the force.  All arguments and results in term order.
+        """The dQ/dr part of the force, and its virial.  All arguments and results in term order.
 
         The charges are not independent of the geometry: they solve `A(r) x = b`
         with `b` geometry-free, so moving an atom moves every charge.  The
@@ -182,9 +191,25 @@ class ACKS2:
         dE_dr = 0.5 * (coulomb + softness)
 
         nij = vecs / (r[:, :, None])
-        return -2.0 * np.sum(dE_dr[:, :, None] * nij, axis=1)
+        forces = -2.0 * np.sum(dE_dr[:, :, None] * nij, axis=1)
 
-    def __call__(self, pos, pbc, cell, term_dict: dict) -> tuple[float, np.ndarray]:
+        # The response virial, from the same per-pair scalar derivative.  The
+        # factor is 1 rather than the force's 2 and rather than the energy's
+        # 0.5: `2 * dE_dr` is the unhalved per-entry `d/dr` -- that is what the
+        # force line above sums -- and the virial then halves it back, so the
+        # two factors cancel to one.
+        #
+        # That this contraction is legitimate at all is the Hellmann-Feynman
+        # argument in the docstring, applied to strain instead of position: the
+        # charges reach the geometry only through `rij`, so `dQ/de` decomposes
+        # over exactly the pair separations `dE_dr` is already differentiated
+        # against.  No separate strain response solve is needed.
+        virial = np.einsum("ij,ija,ijb->ab", dE_dr / r, vecs, vecs)
+        return forces, virial
+
+    def __call__(
+        self, pos, pbc, cell, term_dict: dict
+    ) -> tuple[float, np.ndarray, np.ndarray]:
         vecs = pos[:, None, :] - pos[None, :, :]
         if np.any(pbc):
             F = vecs @ np.linalg.inv(cell)
@@ -207,12 +232,16 @@ class ACKS2:
             self.Q, self.u, self.A = self.solve_charges(rij, params)
             self.state_hash = state_hash
 
-        e_tot, f_tot = self.compute_coulomb(self.Q, rij, vecs)
-        f_tot = f_tot + self.compute_response_forces(
+        e_tot, f_tot, w_tot = self.compute_coulomb(self.Q, rij, vecs)
+        f_resp, w_resp = self.compute_response_forces(
             self.Q, self.u, self.A, rij, vecs, params
         )
+        f_tot = f_tot + f_resp
+        w_tot = w_tot + w_resp
 
-        # scatter term-ordered forces back to global atom order
+        # scatter term-ordered forces back to global atom order.  The virial
+        # needs no scatter: it is a single 3x3 sum over pairs, not a per-atom
+        # quantity, so term order and global order give the same matrix.
         forces = np.zeros_like(pos)
         forces[indices] = f_tot
-        return e_tot, forces
+        return e_tot, forces, w_tot

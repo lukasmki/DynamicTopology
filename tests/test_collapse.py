@@ -221,7 +221,11 @@ def test_the_collision_collapses_without_the_repulsion(reaction_set, monkeypatch
     monkeypatch.setattr(
         ZBL,
         "__call__",
-        lambda self, pos, numbers, pbc, cell: (0.0, np.zeros_like(pos)),
+        lambda self, pos, numbers, pbc, cell: (
+            0.0,
+            np.zeros_like(pos),
+            np.zeros((3, 3)),
+        ),
     )
 
     closest, _ = collide(reaction_set, SPEEDS[0])
@@ -335,7 +339,11 @@ class TestTheReactiveWall:
         monkeypatch.setattr(
             ZBL,
             "__call__",
-            lambda self, pos, numbers, pbc, cell: (0.0, np.zeros_like(pos)),
+            lambda self, pos, numbers, pbc, cell: (
+                0.0,
+                np.zeros_like(pos),
+                np.zeros((3, 3)),
+            ),
         )
         wall = self._energy(reaction_set, FUSED) - self._energy(reaction_set, FAR)
         assert wall < 0.0, (

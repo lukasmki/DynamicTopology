@@ -137,7 +137,7 @@ class ZBL:
         numbers: np.ndarray,
         pbc: np.ndarray,
         cell: np.ndarray,
-    ) -> tuple[float, np.ndarray]:
+    ) -> tuple[float, np.ndarray, np.ndarray]:
         vecs = pos[:, None, :] - pos[None, :, :]
         if np.any(pbc):
             f = vecs @ np.linalg.inv(cell)
@@ -159,4 +159,15 @@ class ZBL:
         energy = 0.5 * float(np.sum(u))
         nij = vecs / r[:, :, None]
         forces = -np.sum(du_dr[:, :, None] * nij, axis=1)
-        return energy, forces
+
+        # Virial.  Under a homogeneous strain every minimum-image separation
+        # maps `v -> (I + e) v`, so `dr_ij/de_ab = v_a v_b / r` and
+        #
+        #     W_ab = dE/de_ab = 0.5 * sum_ij du_dr * v_a v_b / r
+        #
+        # The 0.5 is the energy's, not the force's: `W` differentiates `energy`
+        # directly, so the (i, j) / (j, i) double counting has to be halved here
+        # exactly as it is two lines above.  It does *not* cancel the way it does
+        # for the forces, because `v_a v_b` is even under swapping i and j.
+        virial = 0.5 * np.einsum("ij,ija,ijb->ab", du_dr / r, vecs, vecs)
+        return energy, forces, virial

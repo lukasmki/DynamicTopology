@@ -308,8 +308,8 @@ class QForce:
         e = 0.5 * k * np.square(costheta - np.cos(theta0))
         e_tot = np.sum(e)
 
-        # dE/d(cos) = 2k*(cos - cos0)
-        dE_dcos = 2 * k * (costheta - np.cos(theta0))  # (n,)
+        # dE/d(cos) = k*(cos - cos0)
+        dE_dcos = k * (costheta - np.cos(theta0))  # (n,)
 
         # d(cos)/d(va) = (nb - cos*na) / |va|
         # d(cos)/d(vb) = (na - cos*nb) / |vb|

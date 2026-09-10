@@ -123,13 +123,25 @@ class MinimumImage:
         self.rij = rij
         self.vecs = vecs
         self.r = rij + np.finfo(np.float64).eps
+        self._derivative = None
 
     def matrix(self):
         return _screened(self.rij, self.r, GAMMA)[0]
 
+    def derivative(self):
+        """`dK_ij/dr_ij`, memoized for the same reason `matrix` is.
+
+        `ACKS2` contracts the kernel twice per force call -- once for the
+        explicit Coulomb force and once for the charge response -- with two
+        different weight matrices against the one geometry, so the kernel's own
+        derivative is the same array both times.
+        """
+        if self._derivative is None:
+            self._derivative = _screened(self.rij, self.r, GAMMA)[1]
+        return self._derivative
+
     def contract(self, W):
-        dk = _screened(self.rij, self.r, GAMMA)[1]
-        return contract_pairs(W * dk, self.vecs, self.r)
+        return contract_pairs(W * self.derivative(), self.vecs, self.r)
 
 
 class Ewald:
@@ -218,6 +230,7 @@ class EwaldKernel:
         self.rij = rij
         self.r = rij + np.finfo(np.float64).eps
         self._matrix = None
+        self._derivative = None
 
         # The structure factor, factorized: cos(k . r_ij) = c_i c_j + s_i s_j
         # turns every k-sum below into a matrix product over atoms, which is
@@ -254,11 +267,16 @@ class EwaldKernel:
         """
         setup = self.setup
 
-        dshort = (
-            _screened(self.rij, self.r, GAMMA)[1]
-            - _screened(self.rij, self.r, setup.kappa)[1]
-        )
-        dS_dr, dS_de = contract_pairs(W * dshort, self.vecs, self.r)
+        if self._derivative is None:
+            # Geometry only, and `ACKS2` contracts the kernel twice per force
+            # call -- once for the explicit Coulomb force and once for the
+            # charge response -- against the same positions, so the real-space
+            # derivative is memoized alongside `matrix`.
+            self._derivative = (
+                _screened(self.rij, self.r, GAMMA)[1]
+                - _screened(self.rij, self.r, setup.kappa)[1]
+            )
+        dS_dr, dS_de = contract_pairs(W * self._derivative, self.vecs, self.r)
 
         Wc = W @ self.cos
         Ws = W @ self.sin

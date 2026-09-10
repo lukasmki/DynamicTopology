@@ -22,6 +22,10 @@ class Reaction:
         self.atoms: list[Atoms] = atoms if isinstance(atoms, list) else [atoms]
         self.term_dict: dict[str, Any] = {}
         self.terms: list[Term] = self.set_terms(terms) if terms else []
+        # (broken, formed) in *template* indices, filled on first use.  The
+        # templates are immutable once loaded, so the diff is a property of the
+        # reaction and not of the topology it is applied to.
+        self._template_changes: tuple[list, list] | None = None
 
     def __repr__(self):
         return f"Reaction({self.equation()})"
@@ -101,10 +105,32 @@ class Reaction:
         being acted upon, so a caller screening many candidates can rewire a
         small fragment with this instead of copying a whole block through
         `apply`.
+
+        Because of that, the *template* diff is computed once and only the
+        relabelling is per call.  Taking the difference through
+        `nx.relabel_nodes` instead built two whole graphs per candidate channel,
+        which on a 64-water box is 3888 pairs of graph copies per force call --
+        more than the couplings they were being screened for.  Nodes absent from
+        `mapping` keep their template index, as `relabel_nodes` left them.
         """
-        R = nx.relabel_nodes(self.reactants.graph, mapping)
-        P = nx.relabel_nodes(self.products.graph, mapping)
-        return R.edges - P.edges, P.edges - R.edges
+        if self._template_changes is None:
+            reactant_edges = {
+                (u, v) if u <= v else (v, u) for u, v in self.reactants.graph.edges()
+            }
+            product_edges = {
+                (u, v) if u <= v else (v, u) for u, v in self.products.graph.edges()
+            }
+            self._template_changes = (
+                sorted(reactant_edges - product_edges),
+                sorted(product_edges - reactant_edges),
+            )
+
+        broken, formed = self._template_changes
+        get = mapping.get
+        return (
+            {(get(u, u), get(v, v)) for u, v in broken},
+            {(get(u, u), get(v, v)) for u, v in formed},
+        )
 
     def apply(
         self, topology: Topology, mapping: dict[int, int], share_atoms: bool = False

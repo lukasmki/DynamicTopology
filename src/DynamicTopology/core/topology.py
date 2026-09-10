@@ -187,8 +187,8 @@ class Topology:
         """
         copy_atoms: bool = copy and all(m.atoms is not None for m in molecules)
         copy_terms: bool = copy and any(len(m.terms) > 0 for m in molecules)
-        graph: nx.Graph = molecules[0].graph.copy()
         if remap:
+            graph: nx.Graph = molecules[0].graph.copy()
             # reindex to be first molecule in topology
             mapping = {n: i for i, n in enumerate(graph)}
             graph: nx.Graph = nx.relabel_nodes(graph, mapping)
@@ -217,8 +217,21 @@ class Topology:
 
             return cls(graph, atoms, terms)
         else:
-            for mol in molecules[1:]:
-                graph: nx.Graph = nx.union(graph, mol.graph)
+            # One pass rather than a fold of `nx.union`, which copies the whole
+            # accumulated graph on every step and so costs O(M^2) node copies to
+            # merge M molecules.  `basis.build` merges every molecule of a block
+            # -- all 64 of a water box -- once per force call, where the fold was
+            # 20 ms of pure copying.  The disjointness the fold enforced is kept.
+            graph = nx.Graph()
+            seen: set = set()
+            for mol in molecules:
+                nodes = mol.graph.nodes
+                if not seen.isdisjoint(nodes):
+                    raise nx.NetworkXError("The node sets of G and H are not disjoint.")
+                seen.update(nodes)
+                graph.graph.update(mol.graph.graph)
+                graph.add_nodes_from(nodes(data=True))
+                graph.add_edges_from(mol.graph.edges(data=True))
             return cls(graph, None, None)
 
     @classmethod

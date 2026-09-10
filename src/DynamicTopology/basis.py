@@ -236,6 +236,8 @@ class EVBBasis:
         # bonded force field already returned and this used to discard; keeping
         # them costs no extra evaluation and is what the switch's gradient needs.
         self._molecule_cache: dict[tuple, tuple[float, list[int], np.ndarray]] = {}
+        self._ensemble_cache: dict[Reaction, np.ndarray] = {}
+        self._inv_cell_cache: np.ndarray | None = None
 
     # -- pieces the closure needs ------------------------------------------
 
@@ -465,38 +467,110 @@ class EVBBasis:
         self._energy_cache[key] = result
         return result
 
+    def _ensemble(self, reaction: Reaction) -> np.ndarray:
+        """The reaction's stored transition-state frames as one (E, n, 3) array.
+
+        Stacked once per reaction template per process rather than once per
+        channel: the frames are immutable template data, and restacking them is
+        pure allocation on a path entered thousands of times per force call.
+        """
+        cached = self._ensemble_cache.get(reaction)
+        if cached is None:
+            cached = np.stack([frame.positions for frame in reaction.atoms])
+            self._ensemble_cache[reaction] = cached
+        return cached
+
+    def _channel_couplings(
+        self, atoms: Atoms, channels: list[tuple[Reaction, dict]]
+    ) -> list[tuple[float, np.ndarray, list[int], np.ndarray]]:
+        """Couplings for many channels at once, as `(energy, forces, order, virial)`.
+
+        The forces are in *channel* order -- row k belongs to atom `order[k]` --
+        and are deliberately not scattered into a system-sized array.  Almost
+        every channel is rejected on `abs(energy) <= eps` without its gradient
+        ever being read, and allocating a (natoms, 3) zero array per channel to
+        hold a seven-row answer cost more than computing it.
+
+        Channels are grouped by reaction template because that is what makes the
+        batch well shaped: one template fixes the fragment size and the
+        transition-state ensemble, so every channel of a template superposes the
+        same number of atoms onto the same reference and `_kabsch` can take them
+        in one stack.
+
+        Row k of the live geometry is compared against row k of the stored
+        reference, so the live indices must be ordered by *template* index.
+        `mapping` is keyed by template index but iterates in the isomorphism
+        matcher's discovery order, so `mapping.values()` is generally a
+        permutation of the wanted order and would superpose atoms onto the wrong
+        reference positions.
+        """
+        results: list[tuple[float, np.ndarray, list[int], np.ndarray] | None]
+        results = [None] * len(channels)
+
+        # Keyed on the reaction *object* and the live indices it acts on.  The
+        # template fixes which key of `mapping` each position of `order` came
+        # from, so the pair identifies the channel exactly, and identity is what
+        # groups the batch anyway -- deriving a key from `reaction.hash()` and a
+        # sorted copy of `mapping.items()` instead sorted every mapping twice
+        # per channel, on a path entered a few thousand times per force call.
+        groups: dict[Reaction, list[int]] = {}
+        orders: list[list[int]] = []
+        keys: list[tuple] = []
+        for i, (reaction, mapping) in enumerate(channels):
+            order = [mapping[k] for k in sorted(mapping)]
+            orders.append(order)
+            key = (id(reaction), tuple(order))
+            keys.append(key)
+            cached = self._coupling_cache.get(key)
+            if cached is not None:
+                results[i] = cached
+            else:
+                groups.setdefault(reaction, []).append(i)
+
+        if groups:
+            inv_cell = self._inv_cell(atoms)
+            positions = atoms.positions
+            for reaction, members in groups.items():
+                energies, forces, virials = self.coupling_ff(
+                    positions[[orders[i] for i in members]],
+                    atoms.pbc,
+                    atoms.cell,
+                    self._ensemble(reaction),
+                    reaction.term_dict,
+                    inv_cell=inv_cell,
+                )
+                for k, i in enumerate(members):
+                    result = (float(energies[k]), forces[k], orders[i], virials[k])
+                    self._coupling_cache[keys[i]] = result
+                    results[i] = result
+
+        return results  # type: ignore[return-value]
+
+    def _inv_cell(self, atoms: Atoms) -> np.ndarray | None:
+        """`inv(cell)` for the current geometry, or None for an open system."""
+        if not np.any(atoms.pbc):
+            return None
+        if self._inv_cell_cache is None:
+            self._inv_cell_cache = np.linalg.inv(atoms.cell)
+        return self._inv_cell_cache
+
     def _coupling(
         self, atoms: Atoms, reaction: Reaction, mapping: dict
     ) -> tuple[float, np.ndarray, np.ndarray]:
         """Off-diagonal coupling for one reaction channel, in global order.
 
-        Row k of the live geometry is compared against row k of the stored
-        transition-state reference, so the live indices must be ordered by
-        *template* index.  `mapping` is keyed by template index but iterates in
-        the isomorphism matcher's discovery order, so `mapping.values()` is
-        generally a permutation of the wanted order and would superpose atoms
-        onto the wrong reference positions.
+        A single-channel view of `_channel_couplings` that pays the scatter into
+        a system-sized force array.  The closure does not use it -- it works in
+        channel order and scatters only what it admits -- but it is the honest
+        statement of what a channel's coupling is, and what a caller comparing
+        one channel against a whole-state evaluation wants.
         """
-        cache_key = (reaction.hash(), tuple(sorted(mapping.items())))
-        cached = self._coupling_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        order = [mapping[k] for k in sorted(mapping)]
-        ensemble = np.stack([frame.positions for frame in reaction.atoms])
-        energy, local_forces, virial = self.coupling_ff(
-            atoms.positions[order],
-            atoms.pbc,
-            atoms.cell,
-            ensemble,
-            reaction.term_dict,
-        )
-
+        energy, local_forces, order, virial = self._channel_couplings(
+            atoms, [(reaction, mapping)]
+        )[0]
         forces = np.zeros_like(atoms.positions)
         forces[order, :] = local_forces
-        result = (float(energy), forces, virial)
-        self._coupling_cache[cache_key] = result
-        return result
+        return energy, forces, virial
 
     def _switch(
         self, parent_energy: float, child_energy: float, coupling: float
@@ -538,6 +612,7 @@ class EVBBasis:
         self._reaction_cache.clear()
         self._coupling_cache.clear()
         self._molecule_cache.clear()
+        self._inv_cell_cache = None
         self._bimol_cutoff = bimol_cutoff
 
         network = self.reaction_set.get_network(seed, bimol_cutoff)
@@ -574,14 +649,48 @@ class EVBBasis:
             parent, depth = frontier.pop(0)
             parent_key = state_key(parent)
 
+            # Every channel of this parent at once.  The couplings are the
+            # dominant cost of the closure and each one is a superposition of a
+            # handful of atoms onto a template, so evaluating them one at a time
+            # spends nearly all of its time in fixed per-call overhead; see
+            # `forcefield.coupling._kabsch`.
+            channels = []
             for reaction, mapping in self._reactions(parent, bimol_cutoff):
                 broken, formed = reaction.edge_changes(mapping)
                 if not broken and not formed:
                     continue  # a no-op template, e.g. H + H -> H + H
+                channels.append((reaction, mapping, broken, formed))
 
-                coupling, coupling_forces, coupling_virial = self._coupling(
-                    atoms, reaction, mapping
-                )
+            couplings = self._channel_couplings(
+                atoms, [(reaction, mapping) for reaction, mapping, _, _ in channels]
+            )
+
+            for (reaction, mapping, broken, formed), (
+                coupling,
+                local_coupling_forces,
+                order,
+                coupling_virial,
+            ) in zip(channels, couplings):
+                # `stab = hypot(h, V) - |h| <= |V|` for every gap `h`, by the
+                # triangle inequality, so a channel whose raw coupling is
+                # already below `eps` cannot clear the gate whatever the gap
+                # turns out to be.  Skipping it here is exact, not a screen:
+                # `_switch` would return 0.0 and the `weight <= 0.0` test below
+                # would drop the channel anyway.  It is worth testing because
+                # the gap is the expensive half -- `_channel_weight` rewires the
+                # fragment and evaluates the bonded energy of both sides -- and
+                # in a condensed phase almost every enumerated channel fails
+                # here: 100% of 3888 on a 64-water box, 94% of 584 on the
+                # H2/O2 mixture, where it is 40% of the force call.
+                if abs(coupling) <= self.eps:
+                    continue
+
+                # Past the gate, and only here, is a system-sized gradient worth
+                # building: `_channel_weight` and the Hamiltonian both want the
+                # coupling's forces in global atom order.
+                coupling_forces = np.zeros_like(atoms.positions)
+                coupling_forces[order, :] = local_coupling_forces
+
                 weight, dweight, dweight_virial = self._channel_weight(
                     parent,
                     mapping,

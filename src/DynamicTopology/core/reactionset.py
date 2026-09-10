@@ -15,6 +15,12 @@ from .network import ReactionNetwork
 
 from .types import Term
 
+# Atom pairs the bimolecular pair scan holds at once.  At 24 bytes a pair (a
+# 3-vector of displacements) this caps its scratch near 25 MB, so the scan stays
+# vectorized on a system of any size instead of trading a Python loop for an
+# allocation that does not fit.
+PAIR_SCRATCH: int = 1 << 20
+
 
 class ReactionSet:
     default_data = {
@@ -348,52 +354,111 @@ class ReactionSet:
             all_terms.extend(remapped)
         return all_terms
 
+    @staticmethod
+    def _molecule_separations(
+        positions: np.ndarray, starts: np.ndarray, cell, pbc
+    ) -> np.ndarray:
+        """(M, M) minimum interatomic distance between every pair of molecules.
+
+        `positions` is ordered molecule by molecule and `starts` holds each
+        molecule's first row, so the (N, N) matrix of squared minimum-image
+        separations reduces to the (M, M) answer with two `minimum.reduceat`
+        passes and no Python-level pair loop.
+
+        This is the same quantity the bimolecular cutoff was always testing,
+        computed the other way round: per pair it is one small numpy expression
+        whose cost is nearly all fixed overhead, and at a hundred molecules
+        there are five thousand such pairs -- a third of the force call.  Rows
+        are chunked so the scratch displacement array stays bounded whatever
+        the system size.
+        """
+        natoms = len(positions)
+        nmol = len(starts)
+        cell = np.asarray(cell)
+        inv_cell = np.linalg.inv(cell) if np.any(pbc) else None
+        ends = np.append(starts[1:], natoms)
+
+        out = np.empty((nmol, nmol))
+        max_rows = max(1, PAIR_SCRATCH // max(natoms, 1))
+        lo = 0
+        while lo < nmol:
+            hi = lo + 1
+            while hi < nmol and ends[hi] - starts[lo] <= max_rows:
+                hi += 1
+            a0, a1 = starts[lo], ends[hi - 1]
+
+            dv = positions[a0:a1, None, :] - positions[None, :, :]
+            if inv_cell is not None:
+                dv = dv - (pbc * np.floor(dv @ inv_cell + 0.5)) @ cell
+            distsq = np.sum(dv * dv, -1)
+
+            columns = np.minimum.reduceat(distsq, starts, axis=1)
+            out[lo:hi] = np.minimum.reduceat(columns, starts[lo:hi] - a0, axis=0)
+            lo = hi
+
+        return np.sqrt(out)
+
     def get_network(self, topology: Topology, bimol_cutoff=4.0) -> ReactionNetwork:
         graph = nx.MultiGraph()
 
-        # Pre-collect once to avoid O(N²) Atoms slicing inside the inner loop
-        mol_list: list[tuple[Topology, any]] = list(
-            topology.molecules(return_atoms=True)
+        mol_list: list[Topology] = list(topology.molecules())
+        # Molecule-major atom order, so the pair scan can reduce over blocks.
+        # Taking the positions straight from the system also avoids the ASE
+        # `Atoms` slice per molecule that `molecules(return_atoms=True)` builds
+        # and that nothing here wanted but the coordinates.
+        nodes = [sorted(mol.graph.nodes()) for mol in mol_list]
+        order = [node for group in nodes for node in group]
+        starts = np.cumsum([0] + [len(group) for group in nodes[:-1]])
+        signatures = [self._molecule_signature(mol) for mol in mol_list]
+
+        separation = self._molecule_separations(
+            topology.atoms.positions[order],
+            starts,
+            topology.atoms.cell,
+            topology.atoms.pbc,
         )
 
-        cell = topology.atoms.cell
-        pbc = topology.atoms.pbc
-        inv_cell = np.linalg.inv(cell) if np.any(pbc) else None
-
-        for i, (imol, iatoms) in enumerate(mol_list):
+        for i, imol in enumerate(mol_list):
             graph.add_node(i, molecule=imol)
 
             # reindex reaction to global indices
             for rxn, mol_map in self._reaction_channels(imol):
                 graph.add_edge(i, i, reaction=rxn, mapping=mol_map)
 
-            for j, (jmol, jatoms) in enumerate(mol_list[:i]):
+            for j in range(i):
                 # neighbor check
-                dv = iatoms.positions[:, None, :] - jatoms.positions[None, :, :]
-                if inv_cell is not None:
-                    df = dv @ inv_cell
-                    dv = dv - (pbc * np.floor(df + 0.5)) @ cell
-                rmin = np.sqrt(np.sum(dv * dv, -1).min())
-                if rmin > bimol_cutoff:
+                if separation[i, j] > bimol_cutoff:
                     continue
 
-                # cache combined topology hash to avoid repeated nx.union + WL hash
-                pair_key = frozenset(
-                    {self.hash_molecule(imol), self.hash_molecule(jmol)}
+                # Two disjoint molecules union to a topology whose signature is
+                # exactly the merge of theirs, so the channel cache can be
+                # probed without building the combined topology at all.  On a
+                # settled trajectory that is the whole of this branch: building
+                # it cost an `nx.union_all` and a fresh signature for every
+                # neighbouring pair on every force call, for an answer already
+                # in the cache.
+                isig, jsig = signatures[i], signatures[j]
+                combined_signature = (
+                    tuple(sorted(isig[0] + jsig[0])),
+                    tuple(sorted(isig[1] + jsig[1])),
                 )
-                if pair_key not in self._bimol_hash_cache:
+                channels = self._channel_cache.get(combined_signature)
+
+                if channels is None:
+                    jmol = mol_list[j]
+                    # cache the combined hash to avoid a repeated WL hash
+                    pair_key = frozenset(
+                        {self.hash_molecule(imol), self.hash_molecule(jmol)}
+                    )
                     ijmol = Topology.from_molecules([imol, jmol], False)
-                    self._bimol_hash_cache[pair_key] = self.hash_molecule(ijmol)
-                combined_hash = self._bimol_hash_cache[pair_key]
-
-                if not self.data["reactions"].get(combined_hash):
-                    continue
-
-                # need the combined topology object to map templates onto it
-                ijmol = Topology.from_molecules([imol, jmol], False)
+                    combined_hash = self._bimol_hash_cache.get(pair_key)
+                    if combined_hash is None:
+                        combined_hash = self.hash_molecule(ijmol)
+                        self._bimol_hash_cache[pair_key] = combined_hash
+                    channels = self._reaction_channels(ijmol, combined_hash)
 
                 # reindex reactions to global indices
-                for rxn, mol_map in self._reaction_channels(ijmol, combined_hash):
+                for rxn, mol_map in channels:
                     graph.add_edge(i, j, reaction=rxn, mapping=mol_map)
 
         return ReactionNetwork(graph)

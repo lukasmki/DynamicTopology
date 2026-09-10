@@ -305,7 +305,7 @@ class QForce:
         na = va / ra  # unit vectors
         nb = vb / rb
         costheta = np.sum(na * nb, -1)  # (n,)
-        e = k * np.square(costheta - np.cos(theta0))
+        e = 0.5 * k * np.square(costheta - np.cos(theta0))
         e_tot = np.sum(e)
 
         # dE/d(cos) = 2k*(cos - cos0)

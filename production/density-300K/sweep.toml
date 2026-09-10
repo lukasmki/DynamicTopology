@@ -21,7 +21,7 @@ seeds = [1, 2, 3]
 # box edge is ~12.4 A, so the half-box is ~6.2 A -- comfortably outside the 3.5 A
 # bimolecular cutoff below, which is what the minimum-image convention needs.
 #
-# **This constrains how far the box may expand.**  Every force field here uses
+# **This constrains how far the box may contract.**  Every force field here uses
 # bare minimum image, so the model stops being well defined if the cell shrinks
 # toward twice the interaction range.  Expansion is safe; contraction is what to
 # watch, and `density.py` reports the final edge for that reason.
@@ -35,10 +35,15 @@ rnet = "datasets/Water/Water.json"
 [md]
 temperature = 300.0  # K
 # 0.5 fs.  `datasets/Water/README.md` measures the fastest mode on this surface
-# at 4386 cm^-1 (the h2o O-H stretch), just under the 4400 cap the fit applies.
+# at 4359 cm^-1 (the h2o O-H stretch), just under the 4400 cap the fit applies.
 # Velocity Verlet wants ~15 steps per period, so
 #
-#     dt_max [fs] = 33356 / (15 * 4386) = 0.51 fs
+#     dt_max [fs] = 33356 / (15 * 4359) = 0.51 fs
+#
+# It was 4386 before the ZBL taper's refit, 4354 after it, and 4359 after the
+# 12-6 was switched back on -- three refits inside 0.7%, which is the atomization
+# condition doing its job: it pins each template's energy exactly and leaves the
+# curvature nearly free, so a change to the repulsion moves this hardly at all.
 #
 # Re-read that number after any refit rather than carrying this one across; see
 # the same discussion in `../stoichiometry-3000K/sweep.toml`.

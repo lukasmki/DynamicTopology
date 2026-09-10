@@ -393,8 +393,9 @@ class TestMorseShape:
         for r in (0.03, 0.05, 0.07, self.R0):
             assert self._curve(r, 1.3) == pytest.approx(self._curve(r, 0.0), abs=1e-12)
 
-    @pytest.mark.parametrize("b", [DEFAULT_MIN_DECAY, 2.0, 2.5, 3.0, 4.0, 6.0,
-                                   DEFAULT_MAX_DECAY])
+    @pytest.mark.parametrize(
+        "b", [DEFAULT_MIN_DECAY, 2.0, 2.5, 3.0, 4.0, 6.0, DEFAULT_MAX_DECAY]
+    )
     def test_the_bound_is_where_dissociation_stops_being_downhill(self, b):
         """`shape_bound(b)` must bind exactly, in both directions, at every `b`.
 
@@ -596,23 +597,54 @@ class TestStretchCurvature:
             "something else changed."
         )
 
-    def test_the_cap_binds_on_the_modes_that_set_the_timestep(self, templates):
-        """The rows the stand-in is exact on are the rows the cap acts on.
+    # How far the stand-in may be from the measured curvature on the one row
+    # where they differ, in cm^-1.  The cap is applied to the stand-in, so this
+    # is the amount by which the fit can be wrong about where the cap binds.
+    CAP_ERROR = 200.0
 
-        The whole argument for using an approximation inside the objective is
-        that it is exact where it matters: the cap binds on X-H stretches, which
-        are the fast modes, and the row it is inexact on is a heavy-atom mode
-        far below any cap worth setting.  If a refit ever brought H2O2's O-O up
-        near the cap, that reasoning would lapse silently.
+    def test_the_cap_is_applied_to_a_number_close_enough_to_the_truth(self, templates):
+        """H2O2's O-O is now near the cap, so the error there has to be bounded.
+
+        **This assertion was re-derived when `forcefield/lj.py` came back.**  It
+        used to require H2O2's O-O to stay under 3500 cm^-1, on the argument that
+        the cap binds only on X-H stretches -- the rows the stand-in reproduces
+        to 1e-3 -- while the one inexact row was a slow heavy-atom mode nowhere
+        near any cap.  The 12-6 refit ended that: the 12-6 is 0.30 eV at H2O2's
+        1.45 A O-O and steeply varying, the fit answered by stiffening the bond,
+        and the mode went **3228 -> 4285 cm^-1**.  It is now the second-fastest
+        in the dataset and the cap does bind on it.
+
+        So the old argument is gone and this asserts what actually has to be
+        true instead: not that the inexact row is far from the cap, but that the
+        inexact row is not very inexact.  Measured on the shipped parameters,
+
+            bond_curvatures     540.200 eV/A**2   4285.2 cm^-1
+            stretch_curvatures  518.653 eV/A**2   4198.9 cm^-1
+                                                    86.3 cm^-1, 2.0%
+
+        so `--max-wavenumber 4200` is being enforced against a number 86 cm^-1
+        low, and the timestep that follows is 0.529 fs where the truth is
+        0.515 fs.  `production/*/sweep.toml` runs at 0.5 fs, which covers both,
+        and that margin is the reason this is recorded rather than fixed by
+        putting `bond_curvatures` in the objective -- it costs a hundred times
+        more per evaluation.  If this ever fails, that trade has stopped paying.
         """
         for name, atoms, terms in templates:
             if name != "mol_06":
                 continue
-            oxygen_oxygen = stretch_curvatures(atoms, terms)[0]
-            assert total_wavenumber(oxygen_oxygen, 15.999, 15.999) < 3500.0, (
-                "H2O2's O-O has come up near the wavenumber cap, and it is the "
-                "one bond type the objective's curvature is inexact on. Either "
-                "cap it with `bond_curvatures` or re-derive the approximation."
+            cheap = total_wavenumber(
+                stretch_curvatures(atoms, terms)[0], 15.999, 15.999
+            )
+            measured = total_wavenumber(
+                bond_curvatures(atoms, terms)[0], 15.999, 15.999
+            )
+            assert abs(measured - cheap) < self.CAP_ERROR, (
+                f"H2O2's O-O reads {cheap:.1f} cm^-1 through the objective's "
+                f"stand-in and {measured:.1f} cm^-1 measured, a gap of "
+                f"{measured - cheap:+.1f}. The cap binds on this mode now, so "
+                "the fit is enforcing it against the wrong number by that much. "
+                "Either put `bond_curvatures` in the objective or re-derive the "
+                "approximation."
             )
 
     def test_the_two_wavenumber_entry_points_agree(self):

@@ -107,17 +107,89 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # curvature on the surface by a factor of three and leave a box's energy where
 # it was.  Nothing in this file, or in `test_reference_energies.py`, could have
 # noticed.  `TestTemplateFrequencies` is what notices now.
+#
+# And again when `ZBL` acquired its taper (`forcefield/zbl.py`) and both datasets
+# were refit against it.  This is the largest move in the file's history, and the
+# two boxes move by wildly different amounts -- which is the whole point of
+# having two:
+#
+#     d30  (dilute)   -504.277 -> -507.901 eV      -3.62 eV
+#     d250 (dense)    -460.463 -> -507.058 eV     -46.60 eV
+#     ACKS2                 identical           identical
+#     blocks                identical           identical
+#
+# Before the taper these two boxes differed by 43.8 eV; after it they differ by
+# 0.84 eV.  Nearly the whole density dependence of this force field's energy was
+# the untapered ZBL tail summed over intermolecular pairs -- 200 atoms squeezed
+# into the d250 box paid 46.6 eV for contacts that a screened *nuclear*
+# potential has no business charging for at 2-3 A.  It is the same term, on the
+# same geometries, that made a 64-water box read +251 kbar.
+#
+# `energy_bonded` moves by +44.7 eV on both boxes and by nearly the same amount
+# on each, because it is dominated by intramolecular pairs and the refit
+# re-absorbed a slightly smaller ZBL into the Morse depths.  ACKS2 is untouched
+# to the last digit, as it must be, and so is the block partition.
+# And again when `forcefield/lj.py` was switched back on -- the 12-6, with
+# `lj.switch` holding it off at bond lengths so that it needs no exclusions --
+# and both datasets were refit against it.  **This is the entry where the two
+# boxes are supposed to diverge, and they do:**
+#
+#     d30  (dilute)   -507.901 -> -508.150 eV      -0.25 eV
+#     d250 (dense)    -507.058 -> -503.214 eV      +3.84 eV
+#     ACKS2                 identical           identical
+#     blocks                identical           identical
+#
+# The dense box goes *up* and the dilute one barely moves, which is what a
+# restored intermolecular wall looks like and is the opposite of every previous
+# entry here.  Read as a density dependence: the two boxes differed by 43.8 eV
+# before the ZBL taper, 0.84 eV after it -- with no wall left, energy had almost
+# stopped depending on density at all -- and **4.94 eV now**, of which the 12-6
+# supplies 4.09 (17.95 eV on d30 against 22.05 on d250).  That number is the
+# reason a 64-water box stopped collapsing; see
+# `production/density-300K/README.md`.
+#
+# `energy_bonded` moves by -18.20 eV on *both* boxes, to five figures the same
+# on each, which is the signature of a change absorbed intramolecularly: the
+# refit took the new term's ~0.03-0.35 eV per bond back into the Morse depths,
+# and every template still reproduces its own reference energy to 1e-13.  ACKS2
+# is identical to the last digit and so is the block partition, as they must be
+# -- the 12-6 touches neither the charge equilibration nor which molecules are
+# near which.
+#
+# And again when `ACKS2` learned to sum its charge kernel over periodic images
+# (`forcefield/ewald.py`).  **This is the first entry in this file where ACKS2
+# is the thing that moves, and it is the only thing that moves:**
+#
+#     d30  (dilute, 45.49 A)   -508.14962 -> -508.14968 eV     -6.17e-05 eV
+#     d250 (dense,  22.44 A)   -503.21391 -> -503.22271 eV     -8.80e-03 eV
+#     energy_bonded                  identical          identical
+#     blocks                         identical          identical
+#
+# Both boxes are `pbc = T T T`, so before this they were being handed an
+# electrostatic energy that stopped at the nearest image -- the one term of the
+# three nonbonded ones for which that is not merely an approximation but a
+# different sum, since a charge kernel is not short ranged the way a tapered ZBL
+# or a switched 12-6 is.  The correction is downward on both boxes and 143 times
+# larger on the dense one.
+#
+# **No refit, and that is the point of the `energy_bonded` row.**  Unlike the
+# ZBL taper and the 12-6 switch above -- both of which invalidated every
+# `.jsonl` in both datasets, because `fit/dissociation.py` solves against
+# `E_QForce + E_nonbonded` -- every dataset template carries `pbc="F F F"`, so
+# the fit sees the open-boundary kernel, which is unchanged to the last bit.
+# `energy_bonded` being *bit-identical* on both boxes is the evidence: a term
+# that had reached the fit could not have left it so.
 REFERENCE = {
     "tests/data/mix-n100-d30.xyz": (
-        -504.27727899414504,
-        -1227.521496119292,
-        0.04131595744415656,
+        -508.1496794273134,
+        -1201.0110654266937,
+        0.041254295990371045,
         87,
     ),
     "tests/data/mix-n100-d250.xyz": (
-        -460.4629502872532,
-        -1227.606831502965,
-        0.8564090549456548,
+        -503.22270719522555,
+        -1201.104399596257,
+        0.8476084009425316,
         28,
     ),
 }

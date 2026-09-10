@@ -143,6 +143,88 @@ two. The channels are all still fitted; three amplitudes are no longer large eno
 diabat at their own transition states. `tests/geometry.py` moved to `rxn_13` and `rxn_14` because of
 it, and carries the survey.
 
+### The ZBL taper changed this dataset again, and this one did cost channels
+
+`forcefield/zbl.py` now switches ZBL off with a Fermi function at 1.5 Å, because used unmodified it
+was worth +0.72 eV at a water dimer's hydrogen bond and +251 kbar in a water box — a screened
+*nuclear* potential evaluated an order of magnitude outside the range it was fitted in. Both datasets
+were refit against the tapered form.
+
+**The cost lands here rather than on water.** A transition state is where close intermolecular
+contacts are, and therefore where the removed tail was largest, so the taper lowers the diabats
+exactly at the geometries the coupling fit is inverted at. The channel count went from **14 of 19 to
+12 of 19** — `rxn_06`, `rxn_11` and `rxn_16` are now decoupled — and two of those three had margins
+under 0.1 eV before it. It is not a knob setting: `--frequency-weight` at 200× the default buys none
+of them back.
+
+The cap also had to tighten. The tapered surface is stiffer for H₂, and at `--max-wavenumber 4400`
+the fit landed at 4602 cm⁻¹ — over its own cap. At **4200** it lands at 4325 cm⁻¹ (0.514 fs at 15
+steps per period), and that tightening cost no further channels. `sweep.toml`'s 0.5 fs still holds,
+with less margin than before.
+
+The two datasets were regenerated with:
+
+```sh
+uv run python scripts/fit.py -r datasets/Water/Water.json --force-constants
+uv run python scripts/fit.py -r datasets/HCombustion/HCombustion.json \
+    --force-constants --max-wavenumber 4200
+```
+
+`fit.py` is **not idempotent** — `--max-k-scale` is relative to the `.jsonl` as they stand, so
+re-running over already-fitted output compounds the bound and loses channels on its own. The
+untapered form re-run over already-fitted files gives 15 of 19, not the 14 recorded above, which is
+that effect and not a real difference. Refit once from the previous committed state; do not iterate.
+
+Nothing in `output/` predates this: the sweep has not been run. If it had been, these runs would need
+redoing — the force field is a different one.
+
+### Re-enabling the 12-6 changed it again, and this time cost no channels
+
+`forcefield/lj.py` is back in the force field. The taper above left the model with no intermolecular
+wall at all above 1.5 Å and no dispersion anywhere, and a 64-water box came out a quarter too dense
+as a result; the 12-6 is what supplies both. What makes it usable in a *reactive* model — it was
+retired four times over — is `lj.switch`, a Fermi function that takes it from 500–1400 eV at a bond
+length to 0.03–0.35 eV, small enough that it needs no exclusions and so is identical on every
+diabatic state. See `forcefield/lj.py` and `DYNAMICTOPOLOGY.md` §2.2.1.
+
+Both datasets were refit against it, and **the channel count did not move: 13 of 19, before and
+after, losing exactly the same six.** Most surviving margins improved — `rxn_12`'s pre-fit margin
+went from −0.71 to +0.02 eV, `rxn_19`'s from −0.71 to −0.34 — which is the opposite of what the ZBL
+taper did, and for the mirror-image reason: the taper *removed* repulsion at transition-state
+geometries and lowered the diabats there, while the 12-6 *adds* it back at exactly the intermolecular
+contacts a transition state is made of.
+
+**Read the 13 carefully — the pre-taper section above says 14, and both are right.** 13 is what the
+*unchanged* pipeline produces when re-run over the current `.jsonl`, measured by disabling the new
+term (`lj.SWITCH_RADIUS = 1e6` makes the 12-6 identically zero) and running the same two commands.
+The 12 recorded in the taper section was the count on the previous pass. `fit.py` is not idempotent,
+so a before/after quoted across two different input states is not a measurement of anything; 13 → 13
+is.
+
+What it did cost is a frequency, and the cost is on a mode the fit does not measure exactly.
+**H₂O₂'s O–O stretch went from 3228 to 4285 cm⁻¹** — the 12-6 is 0.30 eV at that 1.45 Å bond and
+steeply varying, so the fit stiffened it — and it is now the second-fastest mode in the dataset and
+the one bond type `fit.dissociation.stretch_curvatures` is inexact on. The cap is applied through
+that stand-in, which reads 4198.9 cm⁻¹ against 4285.2 measured, so `--max-wavenumber 4200` is being
+enforced 86 cm⁻¹ (2.0%) low. The timestep that follows is 0.515 fs measured against 0.529 claimed;
+`sweep.toml`'s 0.05 fs here and 0.5 fs in `density-300K` both cover it. `tests/test_fit.py`
+:`test_the_cap_is_applied_to_a_number_close_enough_to_the_truth` bounds the gap, and its old form —
+"H₂O₂'s O–O must stay below 3500 cm⁻¹" — is what caught this.
+
+The fastest mode overall is 4314 cm⁻¹ (mol_06 O–H), down slightly from 4326. The regeneration
+commands are unchanged:
+
+```sh
+uv run python scripts/fit.py -r datasets/Water/Water.json --force-constants
+uv run python scripts/fit.py -r datasets/HCombustion/HCombustion.json \
+    --force-constants --max-wavenumber 4200
+```
+
+`tests/geometry.py` moved again, and this time in the good direction: `SWITCHING_PATH_START` went
+from 0.2 to 0.1 because **recrossing came back**. On the tapered surface no channel recrossed at all;
+`rxn_12` at 0.1 now switches 3, 3 and 1 times on three seeds. Nine of the thirteen fitted channels
+still never switch at any start.
+
 ### Where the frequencies stop
 
 Every X–H stretch now sits *on* the repulsion's own curvature — H2 at 34.2 eV/Å² against ZBL's 33.9,

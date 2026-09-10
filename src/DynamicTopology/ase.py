@@ -66,6 +66,7 @@ class DynamicTopology(Calculator):
             "energy_bonded": results["energy_bonded"],
             "energy_nonbonded": results["energy_nonbonded"],
             "energy_zbl": results["energy_zbl"],
+            "energy_lj": results["energy_lj"],
             "blocks": results["blocks"],
             "topology_changed": self.topology_changed,
         }

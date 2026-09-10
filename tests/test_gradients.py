@@ -83,6 +83,19 @@ POS_4 = np.array(
 )
 
 # H2O2-like geometry (4 atoms, non-planar)
+# Three atoms astride `lj.SWITCH_RADIUS`: pairs at 2.05, 2.28 and 2.40 A, where
+# the switch runs 0.22 -> 0.82 and `dg/dr` is largest.  The Lennard-Jones cases
+# need it because every other geometry here sits inside the switch, where the
+# term is ~1e-3 eV and a finite-difference check asserts nothing.
+POS_CONTACT = np.array(
+    [
+        [0.00, 0.00, 0.00],
+        [2.05, 0.00, 0.00],
+        [0.40, 2.25, 0.00],
+    ]
+)
+
+
 POS_H2O2 = np.array(
     [
         [-0.705, 0.142, 0.10],
@@ -371,6 +384,36 @@ class TestACKS2Gradients:
         f_fd = finite_difference_forces(energy_fn, positions)
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
 
+    @pytest.mark.parametrize("positions", [POS_3, POS_H2O2], ids=["n3", "h2o2"])
+    def test_call_forces_periodic(self, positions):
+        """The same, with the Ewald lattice sum carrying the electrostatics.
+
+        Every other case in this class runs at `PBC = False`, where the kernel
+        is the nearest-image one and the reciprocal-space force does not exist.
+        That force is not a pair term -- it is a sum over reciprocal vectors of
+        the structure factor's derivative -- so nothing in the open-boundary
+        tests constrains it, and it enters the charge response as well as the
+        explicit gradient.  The cell is small enough (9 A, as in
+        `test_stress.py`) that the images contribute rather than merely being
+        present.
+        """
+        params = self._TERM_DICT["atom"]["kwargs"]
+        term_dict = {
+            "atom": {
+                "atoms": np.array([[i] for i in range(len(positions))]),
+                "kwargs": {k: v[: len(positions)] for k, v in params.items()},
+            }
+        }
+        pbc = np.ones(3, dtype=bool)
+        cell = np.eye(3) * 9.0
+
+        def energy_fn(p):
+            return ACKS2()(p, pbc, cell, term_dict)[0]
+
+        _, f_analytical, _ = ACKS2()(positions, pbc, cell, term_dict)
+        f_fd = finite_difference_forces(energy_fn, positions)
+        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
+
     @pytest.mark.parametrize("seed", [0, 1, 2])
     def test_invariant_under_atom_relabeling(self, seed):
         """Relabeling atoms must not change the energy, only permute the forces.
@@ -515,6 +558,16 @@ class TestLennardJonesGradients:
 
     `POS_2` sits at 0.856 A, well inside sigma, so these run on the steep
     repulsive branch where a sign error in `du/dr` cannot hide.
+
+    **`POS_CONTACT` is the case that is not vacuous.**  Since `pair_potential`
+    acquired `lj.switch`, the term is ~1e-3 eV at every separation in `POS_2`
+    and `POS_3` -- the switch is there precisely to make it so -- and a
+    finite-difference check against `atol=1e-3` on a force of 1e-5 eV/A passes
+    whatever the analytic gradient says.  `POS_CONTACT` puts its pairs at
+    2.0-2.4 A, astride `lj.SWITCH_RADIUS`, which is both where the term does its
+    physical work and where `dg/dr` is largest, so it is the geometry in which
+    a dropped product-rule term is unmissable.  Adding the switch without it
+    left every one of these tests green.
     """
 
     lj = LennardJones()
@@ -534,7 +587,9 @@ class TestLennardJonesGradients:
         )
 
     @pytest.mark.parametrize(
-        "positions", [POS_2, POS_3, POS_4, POS_H2O2], ids=["n2", "n3", "n4", "h2o2"]
+        "positions",
+        [POS_2, POS_3, POS_4, POS_H2O2, POS_CONTACT],
+        ids=["n2", "n3", "n4", "h2o2", "contact"],
     )
     def test_all_pairs(self, positions):
         td = self._atom_terms(len(positions))
@@ -542,7 +597,7 @@ class TestLennardJonesGradients:
         def energy_fn(p):
             return self.lj(p, PBC, CELL, td)[0]
 
-        _, f_analytical = self.lj(positions, PBC, CELL, td)
+        _, f_analytical, _ = self.lj(positions, PBC, CELL, td)
         f_fd = finite_difference_forces(energy_fn, positions)
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-3, rtol=1e-3)
 
@@ -566,7 +621,9 @@ class TestLennardJonesGradients:
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-3, rtol=1e-3)
 
     @pytest.mark.parametrize(
-        "positions", [POS_2, POS_3, POS_4, POS_H2O2], ids=["n2", "n3", "n4", "h2o2"]
+        "positions",
+        [POS_2, POS_3, POS_4, POS_H2O2, POS_CONTACT],
+        ids=["n2", "n3", "n4", "h2o2", "contact"],
     )
     def test_the_two_forms_cancel(self, positions):
         """One small molecule: every pair is a near neighbour, so the sum is zero.
@@ -585,7 +642,7 @@ class TestLennardJonesGradients:
                 sigma.append(np.sqrt(self.SIGMA[i % 2] * self.SIGMA[j % 2]))
                 eps.append(np.sqrt(self.EPS[i % 2] * self.EPS[j % 2]))
 
-        global_energy, global_forces = self.lj(
+        global_energy, global_forces, _ = self.lj(
             positions, PBC, CELL, self._atom_terms(n)
         )
         exclusion_energy, exclusion_forces, _ = self.qf(
@@ -621,7 +678,7 @@ class TestLennardJonesGradients:
         sigma = np.sqrt(self.SIGMA[0] * self.SIGMA[1])
         eps = np.sqrt(self.EPS[0] * self.EPS[1])
 
-        total, forces = self.lj(pos, PBC, CELL, self._atom_terms(2))
+        total, forces, _ = self.lj(pos, PBC, CELL, self._atom_terms(2))
         cancel, cancel_forces, _ = self.qf(
             pos,
             PBC,

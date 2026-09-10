@@ -73,14 +73,41 @@ REACTION = "rxn_13"
 # states with every channel at full strength, and far enough past the ramp that
 # a small change in the surface does not put it back inside one.
 REACTION_PATH_TS = 0.16
-# Squarely inside the admission ramp: three states, `min_switch` = 0.58, so the
+# Squarely inside the admission ramp: three states, `min_switch` = 0.59, so the
 # switch's own gradient is reachable and a pivot-invariance test has something
-# to be invariant about.  See the table above for the window either side.
+# to be invariant about.
 #
 # A stale value here does not fail loudly -- it makes every test that depends on
 # a channel being mid-ramp pass vacuously -- which is why each of them asserts
 # `min_switch` is strictly inside (0, 1) rather than trusting this number.
-REACTION_PATH_RAMP = 0.13
+#
+# **The ramp is about two hundredths of `t` wide, so this constant is fragile by
+# nature.**  Rescanned twice now: once when `ZBL` acquired its taper, and again
+# when `forcefield/lj.py` was switched back on and both datasets were refit
+# against it.  The whole window on the current surface:
+#
+#     t       states   min_switch
+#     0.0950       2     1.000000     <- the third state is not yet admitted
+#     0.0975       3     0.000013
+#     0.1000       3     0.007985
+#     0.1025       3     0.051354
+#     0.1050       3     0.153067
+#     0.1075       3     0.320305
+#     0.1100       3     0.537102   <- chosen, nearest a half-open switch
+#     0.1125       3     0.760882
+#     0.1150       3     0.930226
+#     0.1175       3     0.997439
+#     0.1200       3     1.000000
+#
+# The window is the same width as before (0.02 in `t`) and has moved bodily
+# inward by about 0.027, which is what a refit does to it: the admission gate is
+# an energy test, so it moves wherever the diabats move.
+#
+# Scanning `t` and taking the point nearest `min_switch` = 0.5 is the maintenance
+# that follows a refit.  Scan at 0.0025 or finer: a 0.01 grid lands at most one
+# point inside this window and can miss it altogether, at which point every test
+# downstream reports that no geometry exercises the switch.
+REACTION_PATH_RAMP = 0.11
 
 
 def reaction_path(name: str, t: float, cell: float) -> Atoms:
@@ -154,7 +181,7 @@ def with_spectator(atoms: Atoms, template: Atoms, gap: float) -> Atoms:
 # topology, so they satisfy the guard while testing nothing -- which is the
 # exact failure this survey exists to avoid.
 #
-# **This has now moved twice, and both times for the same structural reason.**
+# **This has now moved three times, and always for the same structural reason.**
 # Was `rxn_02` at 0.1, which stopped switching when the couplings were refitted
 # against `ZBL`: rxn_02's amplitude went from -72 eV -- an artefact of a
 # Lennard-Jones wall standing between two atoms its transition state has 0.916 A
@@ -163,11 +190,48 @@ def with_spectator(atoms: Atoms, template: Atoms, gap: float) -> Atoms:
 # `fit.dissociation`.  Which channels recross is a property of the fitted
 # amplitudes, so any refit can move it, and re-running the survey above is the
 # maintenance that follows a refit.
-SWITCHING_REACTION = "rxn_14"
+#
+# **Then `rxn_14` at 0.2, which stopped when `ZBL` acquired its taper.**  That
+# refit decoupled 7 of the 19 channels outright (their reference barriers now lie
+# above a diabat, so no real amplitude reproduces them), and it changed the
+# character of the ones that survive: re-running the survey, *no* channel on that
+# surface recrossed at all.  Every candidate switched exactly once and stayed,
+# and the count did not move with a longer run or a hotter one --
+#
+#     rxn_13 at 0.2, seeds 0/1/2, switches in  300 steps at 1000 K:  1  1  1
+#                                              1200 steps at 1000 K:  1  1  1
+#                                              1200 steps at 2000 K:  1  1  1
+#
+# -- so it was the barrier back, not the sampling.  `rxn_12` at 0.2 was chosen
+# from that survey (3 switches pooled over three seeds / 3 distinct basis sizes).
+#
+# **And rescanned again when `forcefield/lj.py` was switched back on**, which put
+# recrossing back.  Same protocol -- 13 fittable channels, starts 0.1/0.2/0.3,
+# 300 steps at 1000 K, scored `switches pooled over three seeds / distinct basis
+# sizes` -- and the rows that clear both floors:
+#
+#     rxn_12 at 0.1    7 / 3     <- chosen; per seed 3, 3, 1
+#     rxn_10 at 0.2    4 / 3        per seed 0, 3, 1 -- one seed never switches
+#     rxn_12 at 0.3    3 / 3
+#     rxn_14 at 0.2    3 / 3
+#     rxn_12 at 0.2    3 / 2        the previous choice
+#     rxn_04 at 0.2    3 / 2
+#
+# Nine of the thirteen channels still never switch at any start.  What changed is
+# that the best row now recrosses on two seeds of three rather than on none, so
+# the constant moved along the path rather than to another channel.
+#
+# `rxn_04`, `rxn_14` and `rxn_18` raise `ValueError` at t = 0.1: the geometry
+# perceives as a bridged species that is neither reactant nor product, which
+# `ReactionSet.get_terms` correctly refuses.  That is a property of scanning a
+# path, not of the surface, and those rows are simply unavailable.
+SWITCHING_REACTION = "rxn_12"
 
 # Where along `SWITCHING_REACTION`'s path to start a trajectory that has to
 # cross a topology change.  Not the transition state itself: sitting exactly on
-# it, the trajectory commits one way and stays.  A fifth of the way towards the
-# reactant it recrosses at least four times on every seed tried, so the
-# anti-vacuity guard downstream is not riding on a lucky random number.
-SWITCHING_PATH_START = 0.2
+# it, the trajectory commits one way and stays.  A tenth of the way towards the
+# reactant it switches on every seed tried, so the anti-vacuity guard downstream
+# is not riding on a lucky random number, and on two seeds of three it recrosses;
+# see the survey above.  Moved from 0.2 when the 12-6 came back and 0.1 became
+# the better row on both scores.
+SWITCHING_PATH_START = 0.1

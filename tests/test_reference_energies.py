@@ -158,19 +158,66 @@ class TestTemplateEnergies:
             )
 
 
-class TestTheRetiredLennardJones:
-    """`forcefield/lj.py` is out of the active force field but still has to work.
+class TestTheLennardJones:
+    """`forcefield/lj.py` is back in the active force field, and on new terms.
 
-    It is kept whole so that the surface it produced can be reproduced -- the
-    numbers in its docstring, and in `fit/dissociation.py`'s, are the argument
-    for why the repulsion is `ZBL` instead.  An argument nobody can re-run is
-    not worth keeping, so the identity the whole decomposition rested on is
-    still asserted here.
+    It supplies the intermolecular wall and the dispersion, which the model had
+    neither of once `zbl.taper` cut the screened-nuclear form off at 1.5 A.
+    What makes that possible is `lj.switch`: the term is now ~1e-2 eV at a bond
+    length instead of ~1e3, so it can be applied to every pair with **no
+    exclusions**, which is what makes it identical on every diabatic state and
+    puts it structurally where `ZBL` already is.  The four failure modes in that
+    module's docstring all descended from a broken bond paying hundreds of eV
+    for an exclusion it had lost; with nothing excluded there is nothing to
+    lose.
 
-    Its exclusions are built explicitly through `with_exclusions`, because
-    `ReactionSet.load` no longer derives them: nothing in the calculator needs
-    them any more.
+    So the decomposition identity below is no longer what the calculator relies
+    on -- `ReactionSet.load` derives no exclusions and `with_exclusions` builds
+    them only here.  It is kept because it is the sharpest available check that
+    `LennardJones.__call__` and `QForce.compute_exclusion` still evaluate the
+    same function of the same numbers, switch included, and because a dataset
+    shipping explicit `exclusion` terms would still be honoured.
     """
+
+    # What `lj.switch` has to hold the term under at a bond length.  Not a
+    # tolerance on a converged quantity: it is the design claim.  Unswitched,
+    # these templates carry 400-1400 eV per bond, which is the number that made
+    # the term unusable in a reactive model.
+    BONDED_CEILING: float = 1.0
+
+    def test_the_switch_keeps_it_off_at_bond_lengths(self, reaction_set):
+        """No isolated template may carry more than `BONDED_CEILING` of 12-6.
+
+        This is the load-bearing property of the whole re-enablement and it is
+        the one that a change to `lj.SWITCH_RADIUS` would break silently.  An
+        isolated template has only bonded and 1-3 pairs, so whatever it carries
+        here is pure contamination -- it is absorbed by the fitted Morse depths
+        the way `ZBL`'s +2 to +11.6 eV is, but only while it stays this size.
+
+        Measured at `SWITCH_RADIUS = 0.22` nm: 0.061 eV for water, and the
+        worst template in either dataset is the O2 bond at 0.35 eV.  At the
+        complementary radius 0.15 nm -- the tidy choice, matching `zbl.taper` --
+        water alone reads **+20.6 eV**, which is what this pins against.
+        """
+        errors = {}
+        for stem in _entries("molecules"):
+            frame = io.read(stem.with_suffix(".xyz"))
+            atoms = isolate(frame, False)
+            topology = Topology.from_atoms(atoms)
+            topology.set_terms(reaction_set.get_terms(topology))
+            if "lennardjones" not in topology.term_dict:
+                continue
+            total, _, _ = LennardJones()(
+                atoms.positions, atoms.pbc, atoms.cell, topology.term_dict
+            )
+            if abs(total) > self.BONDED_CEILING:
+                errors[stem.name] = f"{frame.get_chemical_formula()}: {total:+.4f} eV"
+        assert not errors, (
+            "the switched 12-6 is not off at bond lengths; `lj.SWITCH_RADIUS` "
+            f"has moved inward or `lj.switch` has stopped biting (ceiling "
+            f"{self.BONDED_CEILING} eV):\n  "
+            + "\n  ".join(f"{k}  {v}" for k, v in sorted(errors.items()))
+        )
 
     def test_the_sum_cancels_on_an_isolated_template(self, reaction_set):
         """`E_LJ(state) = sum_all_pairs - sum_per_molecule_pairs`.
@@ -194,7 +241,7 @@ class TestTheRetiredLennardJones:
                 assert len(atoms) == 1, f"{stem.name} has no exclusion terms"
                 continue
 
-            total, forces = LennardJones()(
+            total, forces, _ = LennardJones()(
                 atoms.positions, atoms.pbc, atoms.cell, term_dict
             )
             cancel, cancel_forces, _ = QForce()(

@@ -38,6 +38,7 @@ import pytest
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.acks2 import ACKS2
 from DynamicTopology.forcefield.zbl import ZBL
+from DynamicTopology.forcefield.lj import LennardJones
 
 from DynamicTopology.forcefield.coupling import EVBCoupling
 
@@ -47,6 +48,7 @@ from test_gradients import (
     POS_3,
     POS_4,
     POS_H2O2,
+    POS_CONTACT,
 )
 from geometry import REACTION, REACTION_PATH_RAMP, reaction_path
 
@@ -166,6 +168,91 @@ class TestZBLStress:
         _, _, w = self.zbl(positions, numbers, PBC, CELL)
         pressure = -np.trace(w) / (3 * np.linalg.det(CELL))
         assert pressure > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Lennard-Jones
+# ---------------------------------------------------------------------------
+
+
+class TestLennardJonesStress:
+    """The switched 12-6, which is the term that carries the intermolecular wall.
+
+    It is the one nonbonded term whose sign is *not* fixed: repulsive inside
+    sigma, attractive outside it.  So `test_the_sign_follows_the_branch` checks
+    both, which `TestZBLStress.test_repulsion_is_a_positive_pressure` cannot do
+    for a purely repulsive form -- and a virial that had the dispersion pushing
+    outward would still be symmetric and would still match a finite difference
+    taken through the same error.
+    """
+
+    lj = LennardJones()
+
+    SIGMA = [0.296, 0.196]
+    EPS = [0.71128, 0.184]
+
+    def _atom_terms(self, n):
+        return make_term(
+            "lennardjones",
+            [[i] for i in range(n)],
+            sigma=[self.SIGMA[i % 2] for i in range(n)],
+            eps=[self.EPS[i % 2] for i in range(n)],
+        )
+
+    @pytest.mark.parametrize(
+        "positions",
+        [POS_2, POS_3, POS_4, POS_H2O2, POS_CONTACT],
+        ids=["n2", "n3", "n4", "h2o2", "contact"],
+    )
+    def test_all_pairs(self, positions):
+        td = self._atom_terms(len(positions))
+
+        def energy_fn(p, c):
+            return self.lj(p, PBC, c, td)[0]
+
+        _, _, w = self.lj(positions, PBC, CELL, td)
+        w_fd = finite_difference_virial(energy_fn, positions, CELL)
+        assert_symmetric(w)
+        np.testing.assert_allclose(w, w_fd, atol=1e-5, rtol=1e-5)
+
+    def test_dense_periodic_box(self):
+        """A box tight enough that the minimum-image branch does real work."""
+        rng = np.random.default_rng(11)
+        cell = np.eye(3) * 6.0
+        positions = rng.uniform(0.0, 6.0, (10, 3))
+
+        def energy_fn(p, c):
+            return self.lj(p, PBC, c, self._atom_terms(10))[0]
+
+        _, _, w = self.lj(positions, PBC, cell, self._atom_terms(10))
+        w_fd = finite_difference_virial(energy_fn, positions, cell)
+        assert_symmetric(w)
+        np.testing.assert_allclose(w, w_fd, atol=1e-5, rtol=1e-4)
+
+    @pytest.mark.parametrize(
+        "separation,sign",
+        [(2.2, +1.0), (4.0, -1.0)],
+        ids=["repulsive", "dispersive"],
+    )
+    def test_the_sign_follows_the_branch(self, separation, sign):
+        """Inside sigma the pressure is positive; outside it, negative.
+
+        `sigma_OO` is 2.96 A, so 2.2 A is up the wall and 4.0 A is out in the
+        dispersion.  The whole reason this term was re-enabled is the first
+        column -- `zbl.taper` left the model with no intermolecular repulsion at
+        all -- and the whole reason it is not free is the second, which is the
+        only attraction in the force field that is not electrostatic.
+        """
+        positions = np.array([[0.0, 0.0, 0.0], [separation, 0.0, 0.0]])
+        td = make_term(
+            "lennardjones", [[0], [1]], sigma=[0.296, 0.296], eps=[0.71128, 0.71128]
+        )
+        _, _, w = self.lj(positions, PBC, CELL, td)
+        pressure = -np.trace(w) / (3 * np.linalg.det(CELL))
+        assert np.sign(pressure) == sign, (
+            f"a pair at {separation} A gives pressure {pressure:.3e}, expected "
+            f"{'positive' if sign > 0 else 'negative'}"
+        )
 
 
 # ---------------------------------------------------------------------------

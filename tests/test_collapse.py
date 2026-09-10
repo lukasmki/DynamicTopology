@@ -43,13 +43,53 @@ STEPS = 400
 
 # Closest approach that counts as "did not interpenetrate".  Two water
 # molecules in contact sit around 1.4-1.5 A at the closest H...O; anything under
-# this is inside the electron density of both and is where ACKS2 starts
-# diverging.  Measured here: 1.81 A at the slower speed, 1.24 A at the faster.
-CONTACT = 1.15
+# this is inside the electron density of both and is where ACKS2's contact funnel
+# takes over.
+#
+# **Lowered from 1.15 when `ZBL` acquired its taper** (`forcefield/zbl.py`), which
+# is the one place in this file the taper is visible.  Measured, against the same
+# run with the repulsion stubbed out entirely:
+#
+#     speed   KE_in     with wall   no wall
+#     0.25    1.13 eV     1.287 A     0.818 A     (was 1.81 A untapered)
+#     0.50    4.50 eV     1.105 A     0.807 A     (was 1.24 A untapered)
+#
+# **Re-measured when `forcefield/lj.py` was switched back on**, which moved it
+# the other way and is left at 1.05 with the extra margin rather than tightened:
+#
+#     wall in play        speed 0.25   speed 0.50
+#     ZBL + 12-6            1.423 A      1.129 A     <- what ships
+#     ZBL alone             1.267 A      1.131 A
+#     12-6 alone            0.808 A      0.817 A
+#     neither               0.834 A      0.812 A
+#
+# The third row is the one worth reading: **the 12-6 contributes nothing to this
+# collision at all**, and cannot, because `lj.switch` has taken it to zero by
+# 1.5 A and these molecules are at 1.1 A when they turn around.  What it buys is
+# in the first column -- it slows the approach out at 2-3 A, so less kinetic
+# energy arrives -- which is why the slow case gains 0.16 A and the fast one is
+# unchanged to within noise.  The inner wall is `ZBL`'s alone and this file is
+# still a test of `ZBL`; `test_the_wall_rises_monotonically` is where the 12-6
+# is visible.
+#
+# The taper removes the outer wall between roughly 1.6 and 3 A and leaves the
+# inner one alone -- it retains 99% of ZBL at the O-H bond length and 90% at
+# 1.24 A -- so what changed is the *approach*, not the barrier: the molecules no
+# longer pay on the way in and arrive with more kinetic energy, then turn around
+# against a wall that is still there.  A 4.5 eV head-on is 17 kT at 3000 K, so
+# the faster of these two is well outside anything a production run samples.
+#
+# The margin to `COLLAPSED` is thinner than it was, and that is a real cost of
+# the taper rather than a bookkeeping change.  It is widest where it matters: the
+# anti-vacuity check below runs `SPEEDS[0]`, where the wall still buys 1.287 A
+# against 0.818 A.
+CONTACT = 1.05
 
-# What the same run does with the repulsion removed: 0.81 A.  The anti-vacuity
-# check below requires it to go under this, so a collapse test that passes
-# without the term it exists to test cannot go unnoticed.
+# What the same run does with the repulsion removed: 0.818 A at `SPEEDS[0]` and
+# 0.807 A at `SPEEDS[1]`.  The anti-vacuity check below requires it to go under
+# this, so a collapse test that passes without the term it exists to test cannot
+# go unnoticed.  Unmoved by the taper, as it must be -- with `ZBL` stubbed there
+# is nothing left for a taper to modify.
 COLLAPSED = 1.0
 
 # Bond length, in Angstrom, past which an O-H has genuinely come apart rather
@@ -316,17 +356,52 @@ class TestTheReactiveWall:
             "will fuse"
         )
 
+    # Where the dispersion well is allowed to be, and how deep.  Outside
+    # `WELL_INSIDE` the approach may be downhill, because since
+    # `forcefield/lj.py` came back there is an attractive `-r**-6` tail and a
+    # potential that rose monotonically from 4 A would mean it was missing.
+    # Inside, nothing may be.
+    WELL_INSIDE = 2.5  # A -- the minimum must lie outside this
+    WELL_DEPTH = 0.05  # eV -- and be no deeper than this
+
     def test_the_wall_rises_monotonically(self, reaction_set):
-        """No plateau, and therefore a restoring force at every separation.
+        """No plateau inside the dispersion well, so a restoring force throughout.
 
         A wall that is bounded but flat satisfies the test above and still lets
         atoms drift through, because the force vanishes inside the plateau.  A
         19 eV plateau on rxn_16's reaction path is exactly what the last design
         produced, by removing a fraction of a wall rather than all or none of it.
+
+        **This used to start at `FAR` and now starts at the well minimum.**  The
+        old form asserted the approach was uphill from 4.0 A all the way in,
+        which was true only while every nonbonded term was repulsive.  It is not
+        any more: the 12-6's `-r**-6` tail makes 4.0 -> 3.0 A downhill by
+        3.0 meV, and that is the term doing its job rather than the wall failing.
+        Asserting the well's *shape* instead is strictly stronger than the old
+        assertion -- it pins the depth and the position as well as the
+        monotonicity, so a dispersion tail that had grown into a trap deep enough
+        to hold two molecules together at contact would fail here, where under
+        the old form it would merely have failed to be uphill.
         """
-        gaps = [FAR, 3.0, 2.0, 1.5, 1.2, 0.9, FUSED]
+        gaps = [FAR, 3.5, 3.0, 2.5, 2.0, 1.5, 1.2, 0.9, FUSED]
         energies = [self._energy(reaction_set, gap) for gap in gaps]
-        for near, far, e_near, e_far in zip(gaps[1:], gaps, energies[1:], energies):
+
+        floor = int(np.argmin(energies))
+        assert gaps[floor] >= self.WELL_INSIDE, (
+            f"the potential still falls at {gaps[floor]} A, inside "
+            f"{self.WELL_INSIDE} A; that is not a dispersion well, it is the "
+            "wall giving way"
+        )
+        well = energies[0] - energies[floor]
+        assert well < self.WELL_DEPTH, (
+            f"the well at {gaps[floor]} A is {well:.4f} eV deep against a "
+            f"ceiling of {self.WELL_DEPTH} eV. Two H2 + O2 that bound this "
+            "hard would never come apart"
+        )
+
+        for near, far, e_near, e_far in zip(
+            gaps[floor + 1 :], gaps[floor:], energies[floor + 1 :], energies[floor:]
+        ):
             assert e_near > e_far, (
                 f"closing from {far} A to {near} A costs {e_near - e_far:+.4f} eV; "
                 "the wall is flat or falling there and nothing pushes back"

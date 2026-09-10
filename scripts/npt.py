@@ -265,6 +265,7 @@ def main() -> int:
                     "energy_bonded": float(diagnostics["energy_bonded"]),
                     "energy_nonbonded": float(diagnostics["energy_nonbonded"]),
                     "energy_zbl": float(diagnostics["energy_zbl"]),
+                    "energy_lj": float(diagnostics["energy_lj"]),
                     "topology_changed": bool(diagnostics["topology_changed"]),
                     "nblocks": len(blocks),
                     "max_nstates": max((b["nstates"] for b in blocks), default=0),

@@ -125,6 +125,7 @@ from DynamicTopology.core.types import Term
 from DynamicTopology.forcefield.acks2 import ACKS2
 from DynamicTopology.forcefield.qforce import SHAPE_DECAY, QForce
 from DynamicTopology.forcefield.zbl import ZBL
+from DynamicTopology.forcefield.lj import LennardJones
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -299,6 +300,7 @@ DEFAULT_CURVATURE_WEIGHT: float = 1e-2
 # thousands of times.
 _ACKS2 = ACKS2()
 _ZBL = ZBL()
+_LJ = LennardJones()
 
 
 class DissociationFitError(ValueError):
@@ -336,10 +338,11 @@ def _scaled(terms: list[Term], scale: float) -> list[Term]:
 # Memo for the nonbonded half of a template's energy and forces, keyed by the
 # geometry and the ACKS2 parameters it was computed from.
 #
-# **Why this is safe, and why it matters.**  Both nonbonded terms are functions
-# of the geometry alone -- `ZBL` reads only atomic numbers, and `ACKS2` reads
-# the `atom` terms, which no part of this module fits.  The fit moves `D`, `r0`,
-# `k` and `c`, every one of them bonded.  So across an entire
+# **Why this is safe, and why it matters.**  All three nonbonded terms are
+# functions of the geometry alone -- `ZBL` reads only atomic numbers, `ACKS2`
+# reads the `atom` terms and `LennardJones` the `lennardjones` terms, and no
+# part of this module fits either.  The fit moves `D`, `r0`, `k` and `c`, every
+# one of them bonded.  So across an entire
 # `fit_force_constants` run, at a fixed template geometry, this pair of numbers
 # never changes.
 #
@@ -356,22 +359,37 @@ _NONBONDED_CACHE: dict[tuple, tuple[float, np.ndarray]] = {}
 
 
 def _nonbonded_key(atoms: Atoms, term_dict: dict) -> tuple:
-    acks2 = term_dict.get("atom", {})
+    def _params(name: str) -> tuple:
+        block = term_dict.get(name, {})
+        return (
+            tuple(
+                (key, np.asarray(value).tobytes())
+                for key, value in sorted(block.get("kwargs", {}).items())
+            ),
+            np.asarray(block.get("atoms", ())).tobytes(),
+        )
+
     return (
         atoms.positions.tobytes(),
         atoms.numbers.tobytes(),
         atoms.cell.array.tobytes(),
         tuple(atoms.pbc),
-        tuple(
-            (name, np.asarray(value).tobytes())
-            for name, value in sorted(acks2.get("kwargs", {}).items())
-        ),
-        np.asarray(acks2.get("atoms", ())).tobytes(),
+        # Both parameter sets the memoized terms read, for the reason above:
+        # neither is fitted here, but a caller that fitted one should miss the
+        # cache rather than read a stale number out of it.
+        _params("atom"),
+        _params("lennardjones"),
     )
 
 
 def _nonbonded(atoms: Atoms, term_dict: dict) -> tuple[float, np.ndarray]:
-    """ACKS2 + ZBL energy and forces at `atoms`, memoized on the geometry."""
+    """ACKS2 + ZBL + 12-6 energy and forces at `atoms`, memoized on the geometry.
+
+    All three of the terms `System.calculate` adds outside the EVB, and for the
+    same reason: this has to be the *same* sum, or a template stops reproducing
+    its own reference energy through the calculator that it was fitted through.
+    The 12-6 was absent here for as long as it was absent there.
+    """
     key = _nonbonded_key(atoms, term_dict)
     hit = _NONBONDED_CACHE.get(key)
     if hit is None:
@@ -379,7 +397,11 @@ def _nonbonded(atoms: Atoms, term_dict: dict) -> tuple[float, np.ndarray]:
         zbl_energy, zbl_forces, _ = _ZBL(
             atoms.positions, atoms.numbers, atoms.pbc, atoms.cell
         )
-        hit = (float(energy + zbl_energy), forces + zbl_forces)
+        lj_energy, lj_forces, _ = _LJ(atoms.positions, atoms.pbc, atoms.cell, term_dict)
+        hit = (
+            float(energy + zbl_energy + lj_energy),
+            forces + zbl_forces + lj_forces,
+        )
         _NONBONDED_CACHE[key] = hit
     return hit
 
@@ -409,14 +431,17 @@ def bonded_energy(atoms: Atoms, terms: list[Term]) -> float:
 
 
 def nonbonded_energy(atoms: Atoms, term_dict: dict) -> float:
-    """ACKS2 plus whole-system ZBL, at `atoms`' geometry, in eV.
+    """ACKS2 plus whole-system ZBL plus the switched 12-6, in eV.
 
-    Both are topology-independent, and in the strong sense: ACKS2 evaluated at
-    each of the nineteen transition-state geometries under the reactant's and
-    the product's parameter sets gives the same number to every printed digit,
-    and `ZBL` does not consult the topology at all -- it reads atomic numbers
-    off the `Atoms`.  So both are added once outside the EVB Hamiltonian, which
-    is exactly what `System.calculate` does, rather than sitting on the diagonal.
+    All three are topology-independent, and in the strong sense: ACKS2 evaluated
+    at each of the nineteen transition-state geometries under the reactant's and
+    the product's parameter sets gives the same number to every printed digit;
+    `ZBL` does not consult the topology at all, reading atomic numbers off the
+    `Atoms`; and `LennardJones` reads per-*element* parameters and, since
+    `lj.switch`, carries no exclusions, which is what removed the last path by
+    which it could have differed between states.  So all three are added once
+    outside the EVB Hamiltonian, which is exactly what `System.calculate` does,
+    rather than sitting on the diagonal.
 
     This is the sum a reference atomization energy has to be matched against.
     Fitting the Morse depths against the bonded part alone left every
@@ -426,7 +451,10 @@ def nonbonded_energy(atoms: Atoms, term_dict: dict) -> float:
     hole for the homonuclear templates too: it is nonzero on every bonded pair
     (+2.0 eV at the H2 bond length, +11.6 at O2's), so leaving it out here would
     reintroduce the same class of error on exactly the two templates the old
-    version of this bug hid behind.
+    version of this bug hid behind.  The 12-6 is the smallest of the three at a
+    bond length by design -- `lj.switch` holds it to 0.031 eV on an O-H and
+    0.35 eV on O2 -- but it is not zero, and it is not zero at the *stretched*
+    geometries either, which is where it reaches the couplings.
     """
     return _nonbonded(atoms, term_dict)[0]
 
@@ -759,26 +787,36 @@ def stretch_curvatures(
     nonbonded terms and stops.  Measured against it on the shipped parameters:
 
         template  bond   bond_curvatures   this   difference
-        H2        H-H            115.118  115.120     0.001
-        O2        O-O            792.475  792.506     0.031
-        HO        O-H            477.132  477.172     0.039
-        H2O       O-H            109.498  109.498     0.000
-        HO2       O-O            104.347  104.335     0.011
-        HO2       O-H             94.195   94.195     0.000
-        H2O2      O-O            269.782  247.671    22.111
-        H2O2      O-H             81.477   81.477     0.000
+        H2        H-H             33.661   33.660     0.001
+        O2        O-O            472.040  472.042    -0.003
+        HO        O-H             60.366   60.365     0.000
+        H2O       O-H             61.731   61.729     0.002
+        HO2       O-O            417.618  417.609     0.010
+        HO2       O-H             59.628   59.628     0.000
+        H2O2      O-O            540.200  518.653    21.547
+        H2O2      O-H             64.909   64.907     0.002
 
     One row differs and it is the one row that can: H2O2's O-O is the only bond
-    here whose displaced atom carries both another bond and a dihedral.  Of the
-    22.1, about 15.9 is the O-H Morse on the moved oxygen and 6.2 is the angle
-    and dihedral terms.
+    here whose displaced atom carries both another bond and a dihedral.  Most of
+    the 21.5 is the O-H Morse on the moved oxygen; the rest is the angle and
+    dihedral terms.
 
-    That is tolerable *for the use this has* and for no other.  The cap the
-    objective applies binds on X-H stretches -- they are the fast modes, and
-    they are exactly the rows that agree to 1e-3 -- while the row that differs
-    is a 2967 cm^-1 heavy-atom mode, 8% wrong and nowhere near a cap of 4400.
-    Anything that wants the real number should call `bond_curvatures`, which is
-    what the report does.
+    **The argument for tolerating it has changed, and it is weaker than it was.**
+    It used to be that the cap binds only on X-H stretches -- the rows that agree
+    to 1e-3 -- while this row was a 2967 cm^-1 heavy-atom mode nowhere near a cap
+    of 4400.  Re-enabling `forcefield/lj.py` ended that: the 12-6 is 0.30 eV at
+    H2O2's 1.45 A O-O and steeply varying there, the fit answered by stiffening
+    the bond, and the mode is now **4285 cm^-1** -- the second fastest in the
+    dataset, and the cap does bind on it.
+
+    What is left is that the error is small in the units the cap is stated in:
+    4198.9 cm^-1 here against 4285.2 measured, 86.3 cm^-1 or 2.0%.  So a
+    `--max-wavenumber 4200` is enforced against a number 86 cm^-1 low and the
+    timestep that follows is 0.529 fs where the truth is 0.515.  Both are covered
+    by the 0.5 fs the production sweeps use, which is the margin this is trading
+    on; `tests/test_fit.py` bounds the gap so that trade stays visible.  Anything
+    that wants the real number should call `bond_curvatures`, which is what the
+    report does.
     """
     if nonbonded is None:
         nonbonded = nonbonded_curvatures(atoms, terms)

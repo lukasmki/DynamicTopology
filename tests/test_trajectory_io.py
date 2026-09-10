@@ -85,7 +85,24 @@ class TestRecordedTopology:
             io.write(target, atoms, format="extxyz", append=True)
             dyn.run(1)
 
-        assert switches >= 2, (
+        # One, not two.  The assertion below needs the trajectory to *reach* a
+        # second topology, which one switch does; two was asking it to recross,
+        # which is strictly more than this test uses.  That extra margin stopped
+        # being available when `ZBL` acquired its taper and the couplings were
+        # refit -- no channel on that surface recrossed on any seed, at any
+        # length of run or temperature tried.  `tests/geometry.py`
+        # :SWITCHING_REACTION carries the survey.  Unlike
+        # `test_energy_conservation.py:TestTopologyChangeContinuity`, this test
+        # runs a single seed and cannot pool its way back over a floor of two.
+        #
+        # **Recrossing came back when `forcefield/lj.py` did**, and this floor
+        # deliberately did not follow it up.  Measured under exactly the protocol
+        # above -- seed 0, 0.1 fs, 1000 K -- the run switches **twice**, so a
+        # floor of two would pass on a margin of exactly zero and would fail on
+        # the next refit that moved anything.  One is what the assertion needs
+        # and one is what it asks for; the recrossing is recorded in
+        # `geometry.py` and guarded there, where three seeds are pooled.
+        assert switches >= 1, (
             f"only {switches} topology switches; this test asserts nothing unless "
             "the trajectory actually changes bonding"
         )

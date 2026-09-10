@@ -1,4 +1,5 @@
 from DynamicTopology.forcefield.acks2 import ACKS2
+from DynamicTopology.forcefield.lj import LennardJones
 from DynamicTopology.forcefield.zbl import ZBL
 from DynamicTopology.forcefield.qforce import QForce
 from typing import Any
@@ -39,6 +40,7 @@ class EVBSystem:
         self.hardness: float = hardness
         self.nonbonded_ff = ACKS2()
         self.zbl_ff = ZBL()
+        self.lj_ff = LennardJones()
         self.bonded_ff = QForce()
 
     def update(self, atoms: Atoms | None = None):
@@ -67,15 +69,17 @@ class EVBSystem:
         # diagonal and a common shift does not pass through it.  They are added
         # once, outside the Hamiltonian, below.
         #
-        # `ZBL` is topology-independent in exactly the same way and is placed the
-        # same way, outside.  Its predecessor, the Lennard-Jones sum, had to go
-        # *on* the diagonal instead, because the pairs it should not have counted
-        # were cancelled by `exclusion` terms that were already there and
-        # splitting a cancelling pair across the two sides is ruinous here: it
-        # left a water molecule's diagonal at -1833 eV against a bonded energy of
-        # -9.87, and a coupling of sqrt(1.95 * 1833 * 1829) = 2560 eV followed.
-        # `ZBL` has no exclusions to be split from, so the question does not
-        # arise and it joins the electrostatics.
+        # `ZBL` and `LennardJones` are topology-independent in exactly the same
+        # way and are placed the same way, outside.  The Lennard-Jones sum used
+        # to have to go *on* the diagonal instead, because the pairs it should
+        # not have counted were cancelled by `exclusion` terms that were already
+        # there, and splitting a cancelling pair across the two sides is ruinous
+        # here: it left a water molecule's diagonal at -1833 eV against a bonded
+        # energy of -9.87, and a coupling of sqrt(1.95 * 1833 * 1829) = 2560 eV
+        # followed.  Now that `lj.switch` has taken the term to zero at bond
+        # lengths there are no exclusions to be split from -- `ReactionSet.load`
+        # derives none -- so neither term raises the question and both join the
+        # electrostatics.
         #
         # `System.calculate` also adds both outside its Hamiltonian, and for a
         # different reason: its couplings come from `EVBCoupling` and do not
@@ -139,12 +143,23 @@ class EVBSystem:
         # virials are discarded here rather than threaded through.
         en_zbl, fr_zbl, _ = self.zbl_ff(pos, self.atoms.numbers, pbc, cell)
 
+        # The switched 12-6, found through the same representative state as the
+        # electrostatics and for the same reason: it reads per-atom parameters
+        # out of a `term_dict`, and every state of a given system carries the
+        # same ones because they are per element.
+        en_lj, fr_lj = 0.0, np.zeros_like(pos)
+        for state in self.states:
+            if state.term_dict:
+                en_lj, fr_lj, _ = self.lj_ff(pos, pbc, cell, state.term_dict)
+                break
+
         results: dict[str, Any] = {
-            "energy": energy + en_nb + en_zbl,
-            "forces": forces + fr_nb + fr_zbl,
+            "energy": energy + en_nb + en_zbl + en_lj,
+            "forces": forces + fr_nb + fr_zbl + fr_lj,
             "energy_bonded": energy,
             "energy_nonbonded": en_nb,
             "energy_zbl": en_zbl,
+            "energy_lj": en_lj,
             "statevec": statevecsq,
         }
         return results

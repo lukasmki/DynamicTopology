@@ -14,6 +14,7 @@ from DynamicTopology.core.topology import Topology
 from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.acks2 import ACKS2
+from DynamicTopology.forcefield.lj import LennardJones
 from DynamicTopology.forcefield.zbl import ZBL
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ class System:
         self.bonded_ff = QForce()
         self.nonbonded_ff = ACKS2()
         self.zbl_ff = ZBL()
+        self.lj_ff = LennardJones()
         self.coupling = EVBCoupling()
         # `evb` passes `EVBBasis`'s own knobs -- `eps`, `switch_width`,
         # `max_states`, `max_depth` -- straight through, defaults untouched when
@@ -171,6 +173,24 @@ class System:
         forces += fr_zbl
         virial += w_zbl
 
+        # 12-6 over every pair, switched on exactly where ZBL switches off, and
+        # -- like ZBL and unlike every earlier attempt at this term -- with no
+        # exclusions.  It can be applied to bonded pairs because `lj.switch` has
+        # already taken it to zero there, which is the whole reason the four
+        # failure modes in `forcefield/lj.py`'s docstring cannot recur: they all
+        # descended from a broken bond paying hundreds of eV for a pair at the
+        # bond length, and the term is worth ~1e-3 eV there now.  Being the same
+        # number for every diabatic state, it shifts every EVB diagonal equally
+        # and leaves the eigenvectors alone, exactly as ZBL does.
+        #
+        # This is the term that supplies the intermolecular wall and the
+        # dispersion.  ZBL's taper removed the first and the model never had the
+        # second; see `production/density-300K/README.md`.
+        en_lj, fr_lj, w_lj = self.lj_ff(pos, pbc, cell, self.topology.term_dict)
+        energy += en_lj
+        forces += fr_lj
+        virial += w_lj
+
         # combine block topologies
         new_topo = Topology.from_molecules(final_states, remap=False)
         new_topo.set_atoms(self.atoms)
@@ -183,6 +203,7 @@ class System:
             "energy_bonded": energy_bonded,
             "energy_nonbonded": en_nb,
             "energy_zbl": en_zbl,
+            "energy_lj": en_lj,
             "blocks": blocks,
         }
 

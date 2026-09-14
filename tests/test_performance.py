@@ -179,16 +179,41 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # the fit sees the open-boundary kernel, which is unchanged to the last bit.
 # `energy_bonded` being *bit-identical* on both boxes is the evidence: a term
 # that had reached the fit could not have left it so.
+#
+# And again when the angle potential acquired its missing factor of 1/2
+# (`qforce.compute_angle`, commits 4c111dd and 6f7ea89) and both datasets were
+# refit against it.  **This is the mirror image of the entry above: bonded is
+# the only row that moves, and the nonbonded terms are the bit-identical ones.**
+#
+#     d30  (dilute)   -508.14968 -> -508.14451 eV     +5.17e-03 eV
+#     d250 (dense)    -503.22271 -> -503.21791 eV     +4.80e-03 eV
+#     energy_nonbonded       identical          identical
+#     blocks                 identical          identical
+#
+# The angle term is bonded and lives on the EVB diagonal, so no nonbonded sum
+# could move; that `energy_nonbonded` is unchanged to the last bit is the check
+# on that, the same argument the Ewald entry above makes in the other direction.
+#
+# **The move is four orders of magnitude smaller than any other refit in this
+# file, and that is the atomization condition again** -- the same effect the
+# first entry describes.  Halving the angle stiffness is not a small change to
+# the surface (it moved four HCombustion channels' feasibility and shifted the
+# admission ramp in `tests/geometry.py`), but the refit pins each template's
+# energy at its own reference geometry, and `test_reference_energies` now passes
+# to 1e-13.  What is left here is only what the box's geometries deviate from
+# those templates, and an H2/O2 mixture carries few angles to begin with.  A
+# box energy that barely moves is not evidence that the surface barely moved;
+# `TestTemplateFrequencies` and the channel counts in `scripts/fit.py` are.
 REFERENCE = {
     "tests/data/mix-n100-d30.xyz": (
-        -508.1496794273134,
-        -1201.0110654266937,
+        -508.14451150328017,
+        -1201.0058975026604,
         0.041254295990371045,
         87,
     ),
     "tests/data/mix-n100-d250.xyz": (
-        -503.22270719522555,
-        -1201.104399596257,
+        -503.21790950781804,
+        -1201.0996019088495,
         0.8476084009425316,
         28,
     ),

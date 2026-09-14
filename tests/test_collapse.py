@@ -83,7 +83,37 @@ STEPS = 400
 # the taper rather than a bookkeeping change.  It is widest where it matters: the
 # anti-vacuity check below runs `SPEEDS[0]`, where the wall still buys 1.287 A
 # against 0.818 A.
-CONTACT = 1.05
+#
+# **Re-measured again when the angle potential acquired its missing factor of
+# 1/2** (`qforce.compute_angle`) and both datasets were refit against it.  This
+# is the first entry here where nothing about the *wall* changed -- `ZBL` and
+# `lj` are untouched -- and the molecules still arrive closer:
+#
+#     wall in play        speed 0.25   speed 0.50
+#     ZBL + 12-6            1.385 A      1.040 A     <- what ships
+#     ZBL alone             1.206 A      1.036 A
+#     12-6 alone            0.841 A      0.821 A
+#     neither               0.813 A      0.819 A
+#
+# What moved is the *projectile*, not the barrier.  q-force emits its angle
+# parameters for `0.5*k*(cos(theta)-cos(theta0))^2` -- the energy expression is
+# in the `<CustomAngleForce>` of every `tests/data/*_qforce.xml` -- so before the
+# fix this force field was running every angle at twice its intended stiffness.
+# A water molecule that is no longer artificially rigid deforms on impact
+# instead of bouncing as a unit, and the closest H...O gets 0.09 A nearer at the
+# fast speed.  The `neither` row is unchanged to within noise, as it must be:
+# with both terms stubbed there is no wall for a stiffer or softer molecule to
+# hit.
+#
+# **Lowered to 1.03, and the margin to `COLLAPSED` is now genuinely thin** --
+# 0.03 A at `SPEEDS[1]`, against 0.22 A of wall over the stubbed run at the same
+# speed.  The wall is still doing its job and the bar is still above what a
+# stubbed run reaches, but this constant no longer has room to absorb another
+# change of this size; the next thing that moves it should widen the gap rather
+# than step the bar down again.  `SPEEDS[1]` is a 4.5 eV head-on, 17 kT at
+# 3000 K and well outside what a production run samples -- `SPEEDS[0]`, which is
+# inside it, still clears the bar by 0.36 A.
+CONTACT = 1.03
 
 # What the same run does with the repulsion removed: 0.818 A at `SPEEDS[0]` and
 # 0.807 A at `SPEEDS[1]`.  The anti-vacuity check below requires it to go under

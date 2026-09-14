@@ -73,7 +73,7 @@ REACTION = "rxn_13"
 # states with every channel at full strength, and far enough past the ramp that
 # a small change in the surface does not put it back inside one.
 REACTION_PATH_TS = 0.16
-# Squarely inside the admission ramp: three states, `min_switch` = 0.59, so the
+# Squarely inside the admission ramp: three states, `min_switch` = 0.48, so the
 # switch's own gradient is reachable and a pivot-invariance test has something
 # to be invariant about.
 #
@@ -82,32 +82,35 @@ REACTION_PATH_TS = 0.16
 # `min_switch` is strictly inside (0, 1) rather than trusting this number.
 #
 # **The ramp is about two hundredths of `t` wide, so this constant is fragile by
-# nature.**  Rescanned twice now: once when `ZBL` acquired its taper, and again
+# nature.**  Rescanned three times now: once when `ZBL` acquired its taper, again
 # when `forcefield/lj.py` was switched back on and both datasets were refit
-# against it.  The whole window on the current surface:
+# against it, and again when the angle potential acquired its factor of 1/2 and
+# both datasets were refit against that.  The whole window on the current
+# surface:
 #
 #     t       states   min_switch
-#     0.0950       2     1.000000     <- the third state is not yet admitted
-#     0.0975       3     0.000013
-#     0.1000       3     0.007985
-#     0.1025       3     0.051354
-#     0.1050       3     0.153067
-#     0.1075       3     0.320305
-#     0.1100       3     0.537102   <- chosen, nearest a half-open switch
-#     0.1125       3     0.760882
-#     0.1150       3     0.930226
-#     0.1175       3     0.997439
-#     0.1200       3     1.000000
+#     0.0875       2     1.000000     <- the third state is not yet admitted
+#     0.0900       3     0.000037
+#     0.0925       3     0.010782
+#     0.0950       3     0.065528
+#     0.0975       3     0.189897
+#     0.1000       3     0.387212
+#     0.1010       3     0.481318   <- chosen, nearest a half-open switch
+#     0.1025       3     0.628640
+#     0.1050       3     0.851449
+#     0.1075       3     0.980291
+#     0.1100       3     1.000000
 #
 # The window is the same width as before (0.02 in `t`) and has moved bodily
-# inward by about 0.027, which is what a refit does to it: the admission gate is
-# an energy test, so it moves wherever the diabats move.
+# inward by about 0.01, which is what a refit does to it: the admission gate is
+# an energy test, so it moves wherever the diabats move.  The 1/2 halves the
+# angle term, so the diabats that carry one moved and the gate moved with them.
 #
 # Scanning `t` and taking the point nearest `min_switch` = 0.5 is the maintenance
 # that follows a refit.  Scan at 0.0025 or finer: a 0.01 grid lands at most one
 # point inside this window and can miss it altogether, at which point every test
 # downstream reports that no geometry exercises the switch.
-REACTION_PATH_RAMP = 0.11
+REACTION_PATH_RAMP = 0.101
 
 
 def reaction_path(name: str, t: float, cell: float) -> Atoms:

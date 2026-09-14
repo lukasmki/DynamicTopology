@@ -1,6 +1,6 @@
 {
-  "run_id": "s1",
-  "seed": 1,
+  "run_id": "s2",
+  "seed": 2,
   "input": "/pscratch/sd/l/lkim/dt/DynamicTopology/production/density-300K/inputs/w64.xyz",
   "rnet": "datasets/Water/Water.json",
   "molecules": 64,

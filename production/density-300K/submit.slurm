@@ -1,5 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=water-density
+#SBATCH --account=m2834
+#SBATCH --qos=shared
+#SBATCH --constraint=cpu
 #SBATCH --array=0-2
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
@@ -33,5 +36,6 @@
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
-srun uv run python production/density-300K/run_one.py \
+source .venv/bin/activate
+python production/density-300K/run_one.py \
     "${SLURM_ARRAY_TASK_ID}" "$@"

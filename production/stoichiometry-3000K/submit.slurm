@@ -1,5 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=h2o2-stoich
+#SBATCH --account=m2834
+#SBATCH --qos=shared
+#SBATCH --constraint=cpu
 #SBATCH --array=0-24
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
@@ -37,5 +40,6 @@
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
-srun uv run python production/stoichiometry-3000K/run_one.py \
+source .venv/bin/activate
+python production/stoichiometry-3000K/run_one.py \
     "${SLURM_ARRAY_TASK_ID}" "$@"

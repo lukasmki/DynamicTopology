@@ -1,0 +1,14 @@
+{
+  "run_id": "r8_1_s3",
+  "ratio": "8:1",
+  "seed": 3,
+  "input": "/pscratch/sd/l/lkim/dt/DynamicTopology/production/stoichiometry-3000K/inputs/8_1.xyz",
+  "temperature": 3000.0,
+  "timestep": 0.5,
+  "friction": 0.01,
+  "steps": 200000,
+  "interval": 50,
+  "rnet": "datasets/HCombustion/HCombustion.json",
+  "box": 22.44,
+  "molecules": 100
+}

@@ -205,7 +205,7 @@ class EVBBasis:
         bonded_ff,
         coupling_ff,
         eps: float = 1e-3,
-        max_states: int = 64,
+        max_states: int = 128,
         max_depth: int | None = None,
         switch_width: float | None = None,
     ):
@@ -680,8 +680,36 @@ class EVBBasis:
                 # the gap is the expensive half -- `_channel_weight` rewires the
                 # fragment and evaluates the bonded energy of both sides -- and
                 # in a condensed phase almost every enumerated channel fails
-                # here: 100% of 3888 on a 64-water box, 94% of 584 on the
-                # H2/O2 mixture, where it is 40% of the force call.
+                # here: 100% of 3888 on a 64-water box, 88% of 584 on the H2/O2
+                # mixture, where it is 40% of the force call.
+                #
+                # **The fission couplings cost the mixture figure and not the
+                # water one,** measured by zeroing their amplitudes over the same
+                # boxes rather than against an older baseline: 584 channels on
+                # `mix-n100-d250` go from 100% rejected to 88.4%, and 252 on
+                # `mix-n100-d30` from 100% to 71.4%.  A bond-length Gaussian is
+                # wide where an RMSD one is narrow -- 2.3 A^-2 against 123 -- so a
+                # stretched bond anywhere near a crossing now reaches the gap
+                # evaluation instead of being screened out.  The water box is
+                # untouched because `fit_twobody` quenches at the reactant's own
+                # *found* minimum, so an O-H sitting at 0.95 A is exactly at `eps`
+                # and still rejected; the Water dataset has no fission channel at
+                # all, its three reactions all being transfers.
+                #
+                # **This is exact for a bond fission too, and did not used to
+                # be.**  A fission has no saddle, so inverting a reference
+                # barrier for it returns `A = 0` identically -- and a channel
+                # with no amplitude is dropped here at every geometry, which is
+                # what made H2, OH and H2O unable to come apart at all.  The fix
+                # was a separate admission route that offered the product past a
+                # bare distance prescreen with no off-diagonal; it is gone
+                # because `fit.coupling.fit_twobody` asks the fission a question
+                # it can answer, fitting a Gaussian in the breaking bond's length
+                # centred on the crossing of its two diabats.  At a crossing the
+                # diabats are degenerate, so `stab = |V|`, and a Gaussian centred
+                # there is at its maximum: the channel clears this gate by
+                # construction at exactly the geometry where the topology
+                # decision is taken.
                 if abs(coupling) <= self.eps:
                     continue
 

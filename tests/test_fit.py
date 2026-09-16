@@ -71,7 +71,7 @@ from DynamicTopology.fit.dissociation import (
     wavenumber,
 )
 from DynamicTopology.forcefield.coupling import EVBCoupling
-from DynamicTopology.forcefield.qforce import SHAPE_DECAY, QForce
+from DynamicTopology.forcefield.qforce import BOND_ASYMPTOTE, SHAPE_DECAY, QForce
 from DynamicTopology.io.json import read_jsonl
 
 
@@ -365,8 +365,16 @@ class TestMorseShape:
     @pytest.mark.parametrize("c", [0.0, 0.5, 1.3, -0.8])
     @pytest.mark.parametrize("b", [2.0, SHAPE_DECAY, 8.0])
     def test_the_shape_term_moves_neither_the_well_nor_the_limit(self, c, b):
+        """Both ends, in q-force units: `-D` at the minimum, `BOND_ASYMPTOTE` far out.
+
+        The limit is not zero.  `qforce.BOND_ASYMPTOTE` lifts the dissociated end
+        of every Morse off the free-fragment energy so that a bonded diabat and
+        its own fragments' diabat cross rather than converge -- which is what the
+        claim here has to be stated against, since `c` leaving the limit alone is
+        a statement about the shape term and not about where the limit is.
+        """
         assert self._curve(self.R0, c, b) == pytest.approx(-self.D, abs=1e-9)
-        assert self._curve(2.0, c, b) == pytest.approx(0.0, abs=1e-9)
+        assert self._curve(2.0, c, b) == pytest.approx(BOND_ASYMPTOTE, abs=1e-9)
 
     @pytest.mark.parametrize("c", [0.0, 0.5, 1.3, -0.8])
     def test_the_shape_term_moves_no_frequency(self, c):

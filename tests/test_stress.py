@@ -541,6 +541,57 @@ class TestEVBCouplingStress:
         assert_symmetric(w, atol=1e-9)
         np.testing.assert_allclose(w, w_fd, atol=1e-4, rtol=1e-3)
 
+    def test_threebody(self):
+        """The transfer coupling's virial.
+
+        Same argument as `test_twobody`: the generic virial in
+        `EVBCoupling.__call__` is written over absolute positions and is
+        origin-independent only because a term's forces sum to zero, which for
+        this term holds because all three of its coordinates are internal.
+        `test_threebody_forces_sum_to_zero` in `test_gradients.py` is the direct
+        check; this one is that the virial built on top of it is right.
+        """
+        pos = np.array([[0.00, 0.00, 0.00], [1.05, 0.22, 0.10], [2.35, -0.15, 0.05]])
+        td = make_term(
+            "threebody",
+            [[0, 1, 2]],
+            A=[-4.1403],
+            a=[46.8],
+            ra0=[1.21],
+            rb0=[1.29],
+            t0=[np.pi],
+        )
+
+        def energy_fn(p, c):
+            return self.coupling(p, PBC, c, None, td)[0]
+
+        _, _, w = self.coupling(pos, PBC, CELL, None, td)
+        w_fd = finite_difference_virial(energy_fn, pos, CELL, delta=1e-5)
+        assert_symmetric(w, atol=1e-12)
+        np.testing.assert_allclose(w, w_fd, atol=1e-7, rtol=1e-6)
+
+    def test_twobody(self):
+        """The bond-length coupling's virial.
+
+        `EVBCoupling.__call__` builds every coupling's virial from absolute
+        positions, `W = -sum_i pos_i (x) f_i`, which is origin-independent only
+        because the forces of a coupling term sum to zero.  For `compute_rmsd`
+        that holds because the superposition removes the centroid; for this term
+        it holds because a pair term is equal and opposite.  Different reasons,
+        so it is checked separately -- and tightly, since there is no alignment
+        for a finite difference to re-optimize.
+        """
+        pos = np.array([[0.00, 0.00, 0.00], [1.60, 0.15, 0.00]])
+        td = make_term("twobody", [[0, 1]], A=[-0.3511], a=[2.14], r0=[2.393])
+
+        def energy_fn(p, c):
+            return self.coupling(p, PBC, c, None, td)[0]
+
+        _, _, w = self.coupling(pos, PBC, CELL, None, td)
+        w_fd = finite_difference_virial(energy_fn, pos, CELL, delta=1e-5)
+        assert_symmetric(w, atol=1e-12)
+        np.testing.assert_allclose(w, w_fd, atol=1e-7, rtol=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # The assembled surface

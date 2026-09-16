@@ -74,7 +74,43 @@ temperature = 3000.0  # K
 # What to do when the force field is refitted: read the fit's own report, which
 # ends with a "fastest mode ... -> N fs at 15 steps/period" line, and re-measure
 # rather than carrying this number across.  `test_reference_energies.py::
-# TestTemplateFrequencies` fails if a refit takes the fastest mode past 4600.
+# TestTemplateFrequencies` fails if a refit takes the fastest mode past 4700.
+#
+# **`qforce.BOND_ASYMPTOTE` took the fastest mode past what set this number, and
+# it is left at 0.5 fs deliberately rather than by oversight.**  Lifting the
+# Morse's dissociated limit off zero is what lets a bond break at all; it moved
+# the fastest stretch from 4399 cm^-1 (O2's O-O) to 4639 (H2's H-H, where the
+# repulsion alone already accounts for 97% of the real stiffness), so the rule
+# above now gives
+#
+#     dt_max = 33356 / (15 * 4639) = 0.479 fs
+#
+# against the 0.5 here -- 14.4 steps per period instead of 15.2.  There is no
+# asymptote that avoids this: the mode passes 4600 at 0.80 eV and `rxn_16` needs
+# 0.90 to be fittable at all, so the window is empty.
+#
+# Re-measured rather than recomputed, as this comment asks.  NVE from a 200-atom
+# box, drift over a common 20 fs window:
+#
+#   0.5 fs     +0.405 eV   101.3 meV/atom/ps   )
+#   0.25 fs    +0.099 eV    24.8 meV/atom/ps   ) ratios 4.09, 4.00
+#   0.125 fs   +0.025 eV     6.2 meV/atom/ps   )
+#
+# Ratios of four again, so the drift is still integrator error and not force
+# inconsistency -- which is the thing a surface that now breaks bonds could have
+# broken, and did not.  The kink where two uncoupled diabats cross is continuous
+# in the energy (`tests/test_dissociation.py::test_the_energy_is_continuous_
+# through_the_break`); only the force jumps, and that costs accuracy, not
+# conservation.
+#
+# **What is not re-measured is the Langevin temperature bias, and that is the
+# open item.** The 49 K cool bias tabulated above was measured at 4399 cm^-1; at
+# 4639 with the same step it will be larger, and whether it is still inside the
+# 150 K this sweep is willing to spend has not been checked. Until it has, treat
+# the 3000 K here as good to ~150 K and no better. Dropping to 0.45 fs restores
+# the 15-step rule and costs 11% more compute (about 12.3 h per run against 11);
+# that is a compute-budget call, not a correctness one, so it is left explicit
+# here rather than made silently.
 timestep = 0.5        # fs
 friction = 0.01       # 1/fs
 # 100 ps, unchanged in simulated time.  Ignition is a rare event: a barrier

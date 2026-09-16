@@ -2,10 +2,13 @@
 
 `QForce` writes a bond as
 
-    E = D * (1 - exp(-a * dr))**2 - D,    a = sqrt(k / 2D)
+    E = Dw * (1 - exp(-a * dr))**2 - D,    Dw = D + BOND_ASYMPTOTE,
+                                          a  = sqrt(k / 2Dw)
 
-which is zero at dissociation and -D at the minimum, so the well depths a
-molecule's bonds carry *are* its atomization energy -- if they add up to it.
+which is -D at the minimum, so the well depths a molecule's bonds carry *are*
+its atomization energy -- if they add up to it.  It is `BOND_ASYMPTOTE` rather
+than zero at dissociation, which is what makes a bonded diabat and its own
+fragments' diabat cross instead of converging; see that constant.
 As fitted by q-force they do not: each bond is parameterized locally, and for
 the HCombustion set the sum is off by -0.44 to +2.59 eV per template.
 
@@ -123,7 +126,7 @@ from scipy.optimize import brentq, minimize
 
 from DynamicTopology.core.types import Term
 from DynamicTopology.forcefield.acks2 import ACKS2
-from DynamicTopology.forcefield.qforce import SHAPE_DECAY, QForce
+from DynamicTopology.forcefield.qforce import BOND_ASYMPTOTE, SHAPE_DECAY, QForce
 from DynamicTopology.forcefield.zbl import ZBL
 from DynamicTopology.forcefield.lj import LennardJones
 
@@ -549,11 +552,14 @@ def _morse_stretch_force(r, D: float, r0, k: float, c: float, b: float):
     hour.
     """
     dr = np.asarray(r, dtype=float) - np.asarray(r0, dtype=float)
-    al = np.sqrt(k / (2 * D))
+    # `Dw`, not `D`: the well the exponential climbs is the depth plus the
+    # asymptote, on the stretched branch only.  See `qforce.BOND_ASYMPTOTE`.
+    Dw = np.where(dr > 0.0, D + BOND_ASYMPTOTE, D)
+    al = np.sqrt(k / (2 * Dw))
     exp_term = np.exp(-al * dr)
-    de_dr = 2 * D * (1 - exp_term) * al * exp_term
+    de_dr = 2 * Dw * (1 - exp_term) * al * exp_term
     s = al * np.maximum(dr, 0.0)
-    de_dr = de_dr + (D * c * al * s * s * (3.0 - b * s) * np.exp(-b * s))
+    de_dr = de_dr + (Dw * c * al * s * s * (3.0 - b * s) * np.exp(-b * s))
     return -de_dr
 
 
@@ -700,13 +706,21 @@ def _bonded_curvature(kwargs: dict, r: float) -> float:
     c = kwargs.get("c", 0.0)
     b = kwargs.get("b", SHAPE_DECAY)
     dr = r / 10.0 - kwargs["r0"]  # nm
-    al = np.sqrt(k / (2 * D))
+    # `Dw`, not `D`, and on the stretched branch only.  The curvature *at the
+    # minimum* is `k` either way, which is what makes the asymptote free of the
+    # fitted frequencies -- but `fit_bond_lengths` displaces `r0` *inside* the
+    # reference bond length, so the bond sits at `dr > 0` and this is exactly
+    # where the two differ.  See `qforce.BOND_ASYMPTOTE`.
+    Dw = D + BOND_ASYMPTOTE if dr > 0.0 else D
+    al = np.sqrt(k / (2 * Dw))
 
     exp_term = np.exp(-al * dr)
-    curvature = 2 * D * al * al * exp_term * (2 * exp_term - 1)
+    curvature = 2 * Dw * al * al * exp_term * (2 * exp_term - 1)
 
     s = al * max(dr, 0.0)
-    curvature += D * c * al * al * (6 * s - 6 * b * s**2 + b**2 * s**3) * np.exp(-b * s)
+    curvature += (
+        Dw * c * al * al * (6 * s - 6 * b * s**2 + b**2 * s**3) * np.exp(-b * s)
+    )
     # kJ/mol/nm**2 -> eV/A**2
     return float(curvature * units.kJ / units.mol / units.nm**2)
 
@@ -1704,6 +1718,45 @@ def fit_force_constants(
 
     fitted = refit(solution)
     install_templates(reaction_set, templates, fitted)
+    margins = reaction_margins(reaction_set, reactions)
+
+    # **Refuse a solution that reproduces fewer channels than it started with.**
+    #
+    # The objective is not monotone in the channel count and was never going to
+    # be: the hinge is `max(0, margin - margin_target)**2`, so a channel already
+    # past the target contributes exactly nothing and the regularizer is free to
+    # spend it.  That is the right trade when the margin bought is another
+    # channel's feasibility and the wrong one when it is only frequency, and the
+    # objective cannot tell the difference -- the note above the optimizer call
+    # records the count wandering between 14 and 15 while the objective improved.
+    #
+    # It was unreachable while the starting point was poor, because there was
+    # always more to gain by fixing an infeasible channel than to save by
+    # dropping a feasible one.  `qforce.BOND_ASYMPTOTE` made the starting point
+    # good -- 16 of 19 before any force-constant fit at all -- and `mode="k"`
+    # then traded `rxn_16` from +0.191 to -0.095 for the frequency term, giving
+    # up the one channel the asymptote had just bought.
+    #
+    # `before` is measured at `refit(start)`, so this compares the solution
+    # against the same point the search began from rather than against the
+    # dataset on disk, and the fallback is a point already inside the box.
+    feasible = sum(value > 0.0 for value in margins.values())
+    baseline = sum(value > 0.0 for value in before.values())
+    if feasible < baseline:
+        logger.warning(
+            "force-constant fit reproduced %d channels against %d at its "
+            "starting point; keeping the starting point. The hinge is blind to "
+            "a margin already past --margin, so the regularizer can spend one; "
+            "lower --frequency-weight or raise --margin to make the fit value "
+            "what it is giving up.",
+            feasible,
+            baseline,
+        )
+        solution = start
+        fitted = refit(solution)
+        install_templates(reaction_set, templates, fitted)
+        margins = reaction_margins(reaction_set, reactions)
+
     curvatures = [
         value
         for (_, atoms, _), terms in zip(templates, fitted)
@@ -1736,7 +1789,7 @@ def fit_force_constants(
         ),
         mode=mode,
         curvatures=curvatures,
-        margins=reaction_margins(reaction_set, reactions),
+        margins=margins,
         margins_before=before,
         depths={
             (name, r0, k): depth

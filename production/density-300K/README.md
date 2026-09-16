@@ -135,21 +135,61 @@ Then the checks that say whether to believe it, and each has a specific failure 
 - `submit.slurm` / `run_all_local.sh` — the two ways to run all three.
 - `inputs/w64.xyz` — the packed starting box (tracked; it is what every number descends from).
 
-## Status: two changes to the repulsion, and the density crossed 997 from both sides
+## Status: four force fields, and the last one is the first to sit at 997
 
-This directory's history is three force fields, and the number it measures has been badly wrong in
-both directions before landing near the right one.
+This directory's history is four force fields, and the number it measures has been badly wrong in
+both directions before landing on the right one.
 
 | | equilibrium ρ (kg/m³) | vs. experiment (997) | what was wrong |
 |---|---|---|---|
 | untapered ZBL | ~250–350 | 3–4× too low | a keV-stopping potential charging +251 kbar at 2–3 Å |
 | **+ `zbl.taper`** | ≳1250 | ≥25% too high | the taper removed the wall and nothing replaced it |
-| **+ `lj.switch`** | **900–960** | **4–10% too low** | under-attractive: no depth to the hydrogen bond |
+| **+ `lj.switch`** | 900–960 | 4–10% too low | under-attractive: no depth to the hydrogen bond |
+| **+ the ACKS2 retune** | **~1000** | **within noise** | — |
 
-The last row is a band rather than a figure because the two independent readings do not quite
-agree: the equation-of-state crossing is 898 kg/m³ corrected to 300 K, and a 600 fs NPT run
-settles at 953. Both are short and both are noisy; see **The NPT run** below for why neither
-deserves three digits.
+The third row's deficit was never the repulsion. It was the charges: `q_H = +0.224` and a 1.258 D
+gas-phase dipole, roughly half what any working water model carries, and the electrostatic part of
+a hydrogen bond goes as `mu²`. `datasets/Water/README.md` has the diagnosis and the retune —
+`eta × 0.75`, `sigma_H → 0`, `sigma_O 2.96 → 3.05 Å`. **The parameters are Water's alone;
+HCombustion is untouched**, so nothing in this directory's HCombustion history is affected.
+
+### The fourth row is an NVT pressure, not an NPT density
+
+It is quoted differently from the three above it and should not be read as a fifth independent
+measurement of the same kind. What was measured is the **pressure of a fixed 997 kg/m³ box**
+(`examples/water-n64.xyz`, 64 neutral waters, 300 K Langevin, averaged over the second half of a
+5 ps run):
+
+    eta 1.00, sigma_O 2.96      +1320 ± 121 bar
+    eta 0.75, sigma_O 2.96      -1736 ± 110 bar     the retune alone overshoots
+    eta 0.75, sigma_O 3.05        -76 ± 155 bar  <- ships
+
+A vanishing pressure at 997 kg/m³ is the same statement as an equilibrium density of 997, and it
+is far cheaper than an equation-of-state scan — but it is one box, one 5 ps window, and ±155 bar
+is ±0.7% of density through a ~22 kbar bulk modulus. **It has not been confirmed by an NPT run or
+an EOS crossing, which is what the three rows above it are**, so "~1000" is deliberately two
+significant figures.
+
+The method checks out against this directory's own earlier work: the first row, +1320 bar, predicts
+942 kg/m³ through that bulk modulus, and the 900–960 band below was measured independently.
+
+### What the retune did not fix
+
+The structure is right at the first shell and wrong beyond it:
+
+    O-O g(r)            before    after     experiment
+    first peak          3.07 Å    2.82 Å    2.80 Å
+    peak height         2.27      2.98      ~2.9
+    first minimum       4.67 Å    4.37 Å    ~3.4 Å
+    O-O within 3.5 Å    6.04      6.04      4.3-4.5
+
+Six neighbours inside 3.5 Å with a first minimum that never drops below 0.79 is a close-packed
+liquid that happens to have the right nearest-neighbour distance — not a tetrahedral one. The
+density being right is therefore a weaker result than it looks: it is the right volume per
+molecule reached through the wrong local structure. The cause is structural and is documented
+under "The ceiling" in `datasets/Water/README.md` — charge equilibration gives water an
+out-of-plane polarizability of exactly zero and a +0.6% condensed-phase dipole enhancement against
+a real +40–60%, so there is no cooperativity to make hydrogen bonding directional.
 
 ### 1. The ZBL taper (previous entry, kept for the record)
 

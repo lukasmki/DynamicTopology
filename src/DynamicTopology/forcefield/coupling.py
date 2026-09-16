@@ -165,3 +165,110 @@ class EVBCoupling:
         # line up by accident at E = 1 or E = 3.
         f = (-1 * e * -a * 2 * rmsd)[..., None, None] * drmsd
         return np.mean(e, axis=-1), np.mean(f, axis=1)
+
+    def compute_twobody(self, pos, ensemble, atoms, A, a, r0):
+        """Gaussian in the length of one bond, centred on its crossing.
+
+            V(r) = A * exp(-a * (r - r0)**2)
+
+        This is the coupling for a **bond fission or recombination**, where
+        `compute_rmsd`'s reference geometry does not exist.  A homolytic fission
+        has no saddle, so the middle frame of a `rxn_*.xyz` is an arbitrary point
+        on a monotone path and an RMSD to it is a Gaussian centred nowhere in
+        particular -- which is what left `A = 0` as the only fit available and
+        made `basis.EVBBasis` need a separate admission route for these channels.
+
+        The two diabats of a fission differ by exactly one bond term: every
+        nonbonded contribution -- `ZBL`, `LennardJones`, `ACKS2` -- is on the
+        whole system and identical on both states, and for a fission there is no
+        second bonded difference either.  So the gap is a function of the
+        breaking bond's length alone, it is monotone in it, and it crosses zero at
+        one separation.  `r0` is that crossing, which is what "centred on the
+        dissociation point" means here and why this form needs no ensemble: the
+        reaction coordinate *is* the bond length.  `ensemble` is accepted for the
+        uniform `compute_*` signature and unused.
+
+        Centring there is what makes the ordinary gate sufficient.  At a crossing
+        the diabats are degenerate, so `basis`'s stabilization is `hypot(0, V) -
+        0 = |V|`, and a Gaussian centred on the crossing is at its maximum `|A|`
+        exactly there.  A fission channel therefore passes `stab > eps` at the
+        one geometry where the topology decision is taken, by construction rather
+        than by luck -- see `fit.coupling.fit_twobody` for the two conditions
+        that then fix `A` and `a`.
+        """
+        i, j = atoms[:, 0], atoms[:, 1]
+        v = pos[:, j, :] - pos[:, i, :]  # (m, t, 3)  vec from atom0 -> atom1
+        r = np.sqrt(np.sum(v * v, -1))  # (m, t)
+        dr = r - r0
+        e = A * np.exp(-a * dr**2)
+        # dE/dr = -2*a*dr*E, and dr/dpos_j = +v/r, so f_j = -dE/dpos_j = +2*a*dr*E*v/r.
+        dv = (2.0 * a * dr * e / r)[..., None] * v
+        f = np.zeros_like(pos)
+        np.add.at(f, (slice(None), j), dv)
+        np.add.at(f, (slice(None), i), -dv)
+        return np.sum(e, axis=-1), f
+
+    def compute_threebody(self, pos, ensemble, atoms, A, a, ra0, rb0, t0):
+        """Gaussian in the transferring atom's own triangle.
+
+            g = (ra - ra0)**2 + (rb - rb0)**2 + (d - d0)**2
+            V = A * exp(-a * g)
+
+        for an atom transfer `D-H + A -> D + H-A`, with `ra = |H - D|`,
+        `rb = |H - A|` and `d = |A - D|`; `atoms` is `(donor, proton, acceptor)`
+        with the transferring atom central, as `QForce.compute_angle` orders a
+        vertex.  `t0` is the reference `D-H-A` angle in radians, and `d0` follows
+        from it by the law of cosines -- stored as an angle because that is the
+        readable parameter, used as a length so that one width `a` is
+        dimensionally consistent across all three.
+
+        **The three sides are a complete description of the triangle** and a
+        non-redundant one, so this is the transfer's full geometry and not a
+        projection of it: `(ra, rb, d)` fixes `D`, `H` and `A` up to a rigid
+        motion, exactly as `(ra0, rb0, t0)` fixes the reference.
+
+        Like `compute_twobody` this is centred on a geometry rather than measured
+        against one, so `ensemble` is accepted for the uniform `compute_*`
+        signature and unused.  The centre is the *transition state's* triangle,
+        where `g = 0` and so `V = A` exactly -- which is what keeps
+        `fit.coupling.fit_amplitude` valid for this form: a transfer does have a
+        saddle and a reference barrier, and that barrier is real data worth
+        fitting to, unlike a fission's.
+
+        **What this fixes is the width, not the amplitude.**  `compute_rmsd`
+        measures the distance to the whole reference geometry, so its width is a
+        tolerance on all `3N` coordinates at once and any spectator switches the
+        coupling off: `h2o-autoionization` fitted to `a = 642 1/A**2`, live only
+        within 0.11 A RMSD, and `datasets/Water/README.md` records the
+        consequence -- a 64-water box never admits a single diabatic state, at any
+        `eps`, because neutral water at 300 K never puts all `3N` coordinates that
+        close at once.  A proton that *is* at the transfer geometry should couple
+        whatever the other hydrogens are doing, and that is what measuring the
+        triangle instead of the geometry buys.
+        """
+        d_i, h_i, a_i = atoms[:, 0], atoms[:, 1], atoms[:, 2]
+        va = pos[:, h_i, :] - pos[:, d_i, :]  # (m, t, 3)  donor  -> proton
+        vb = pos[:, h_i, :] - pos[:, a_i, :]  # acceptor -> proton
+        vd = pos[:, a_i, :] - pos[:, d_i, :]  # donor -> acceptor
+        ra = np.sqrt(np.sum(va * va, -1))
+        rb = np.sqrt(np.sum(vb * vb, -1))
+        d = np.sqrt(np.sum(vd * vd, -1))
+
+        # Law of cosines on the reference triangle.  `t0` is the angle at the
+        # proton, so the side opposite it is the donor-acceptor separation.
+        d0 = np.sqrt(ra0**2 + rb0**2 - 2.0 * ra0 * rb0 * np.cos(t0))
+
+        g = (ra - ra0) ** 2 + (rb - rb0) ** 2 + (d - d0) ** 2
+        e = A * np.exp(-a * g)
+
+        # dE/dg = -a*E, and dg/dra = 2*(ra - ra0), so the force along each side
+        # is `2*a*E*(r - r0)/r` times that side's vector.
+        ca = (2.0 * a * e * (ra - ra0) / ra)[..., None]
+        cb = (2.0 * a * e * (rb - rb0) / rb)[..., None]
+        cd = (2.0 * a * e * (d - d0) / d)[..., None]
+
+        f = np.zeros_like(pos)
+        np.add.at(f, (slice(None), h_i), ca * va + cb * vb)
+        np.add.at(f, (slice(None), d_i), -ca * va - cd * vd)
+        np.add.at(f, (slice(None), a_i), -cb * vb + cd * vd)
+        return np.sum(e, axis=-1), f

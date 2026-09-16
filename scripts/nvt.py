@@ -21,6 +21,8 @@ Two outputs, with different jobs:
               that say whether to believe the rest.
 """
 
+from ase.optimize import FIRE2
+
 import json
 from argparse import ArgumentParser
 from pathlib import Path
@@ -162,6 +164,7 @@ def main() -> int:
         "where it did are flagged `ncapped` in the log.",
     )
     parser.add_argument("--max-depth", type=int, default=None)
+    parser.add_argument("--minimize", default=False, action="store_true")
     args = parser.parse_args()
 
     if args.output.exists() and not args.restart:
@@ -323,6 +326,11 @@ def main() -> int:
             )
         log_file.write(json.dumps(record) + "\n")
         log_file.flush()  # a killed cluster job must still leave usable output
+
+    if args.minimize:
+        minim = FIRE2(atoms)
+        minim.attach(write_frame, args.interval, atoms, minim)
+        minim.run()
 
     dyn = Langevin(
         atoms,

@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from ase import units
 
-from DynamicTopology.forcefield.qforce import QForce
+from DynamicTopology.forcefield.qforce import BOND_ASYMPTOTE, QForce
 from DynamicTopology.forcefield.acks2 import ACKS2
 from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.lj import LennardJones
@@ -203,8 +203,11 @@ class TestQForceGradients:
             f"Morse ({e_morse:.3f} eV) should saturate well below harmonic "
             f"({e_harm:.3f} eV) at a badly stretched bond"
         )
-        # Morse is bounded above by its asymptote, which sits at +D over the well.
-        assert e_morse <= 0.0
+        # Morse is bounded above by its asymptote, which sits at `BOND_ASYMPTOTE`
+        # over the free-fragment limit rather than on it -- that offset is what
+        # makes a bonded diabat cross its own fragments' instead of converging to
+        # them.  Harmonic has no asymptote at all, which is the point here.
+        assert e_morse <= BOND_ASYMPTOTE * units.kJ / units.mol
 
     def test_reference(self):
         """Constant per-molecule reference shift contributes energy but no force."""
@@ -738,6 +741,133 @@ class TestEVBCouplingGradients:
         _, f_analytical, _ = self.coupling(pos, PBC, CELL, ensemble, td)
         f_fd = finite_difference_forces(energy_fn, pos)
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize(
+        ("r0", "a"),
+        [(1.2, 2.14), (2.393, 2.14), (3.333, 1.05)],
+        ids=["inside", "at-centre", "outside"],
+    )
+    def test_twobody(self, r0, a):
+        """Bond-length Gaussian coupling: A * exp(-a * (r - r0)^2).
+
+        Tighter than `test_rmsd` on purpose: this form carries no superposition,
+        so the analytic gradient is exact and a finite difference has nothing to
+        re-optimize.  The caveat in the class docstring does not apply to it, and
+        a tolerance loose enough for the RMSD term would hide a factor of two
+        here.
+
+        The three centres put the pair inside the Gaussian, on it, and outside
+        it, at `(r0, a)` pairs `fit_twobody` actually returns for `rxn_05` and
+        `rxn_08`.  `at-centre` is the one that could pass vacuously -- `dV/dr` is
+        zero at the peak by construction -- so the pair sits at 1.61 A against it
+        rather than on it, which is where `2*a*dr*V` is near its largest.  The
+        two asserts below are not decoration: a centre far outside a narrow
+        Gaussian puts the energy at 7e-5 eV, where a finite difference agrees
+        with anything.
+        """
+        pos = np.array([[0.00, 0.00, 0.00], [1.60, 0.15, 0.00]])
+        td = make_term("twobody", [[0, 1]], A=[-0.3511], a=[a], r0=[r0])
+
+        def energy_fn(p):
+            return self.coupling(p, PBC, CELL, None, td)[0]
+
+        energy, f_analytical, _ = self.coupling(pos, PBC, CELL, None, td)
+        assert abs(energy) > 1e-4, "geometry does not exercise the term"
+        assert np.abs(f_analytical).max() > 1e-4, "geometry has no force to check"
+        f_fd = finite_difference_forces(energy_fn, pos)
+        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-7, rtol=1e-6)
+
+    @pytest.mark.parametrize(
+        ("ra0", "rb0", "t0", "a"),
+        [
+            (1.21, 1.29, np.pi, 46.8),
+            (1.21, 1.29, 2.0, 46.8),
+            (0.98, 1.80, np.pi, 5.0),
+        ],
+        ids=["linear", "bent", "off-centre"],
+    )
+    def test_threebody(self, ra0, rb0, t0, a):
+        """Transfer coupling: A * exp(-a * [dra^2 + drb^2 + dd^2]).
+
+        Tight for the same reason as `test_twobody`: no superposition, so the
+        analytic gradient is exact.  The three cases matter because the term has
+        three sides and a bug in any one of them is invisible in the others --
+        `off-centre` in particular puts the proton well away from the midpoint, so
+        `ra` and `rb` carry very different deviations and a swapped pair shows up.
+
+        `bent` is the case that checks `d0` is coming from the law of cosines
+        rather than being assumed collinear: at `t0 = 2.0` rad the reference
+        `d0` is 2.10 A against the 2.50 a linear triangle would give, so an
+        assumed `ra0 + rb0` would put the third side's deviation badly wrong.
+
+        `off-centre` carries a wider `a` because it has to: 0.39 A**2 from its
+        reference against the fitted 46.8 1/A**2 puts the term at 5e-8 eV, where
+        a finite difference agrees with anything.  The asserts below are what
+        caught that.
+        """
+        pos = np.array(
+            [
+                [0.00, 0.00, 0.00],  # donor
+                [1.05, 0.22, 0.10],  # transferring proton
+                [2.35, -0.15, 0.05],  # acceptor
+            ]
+        )
+        td = make_term(
+            "threebody",
+            [[0, 1, 2]],
+            A=[-4.1403],
+            a=[a],
+            ra0=[ra0],
+            rb0=[rb0],
+            t0=[t0],
+        )
+
+        def energy_fn(p):
+            return self.coupling(p, PBC, CELL, None, td)[0]
+
+        energy, f_analytical, _ = self.coupling(pos, PBC, CELL, None, td)
+        assert abs(energy) > 1e-4, "geometry does not exercise the term"
+        assert np.abs(f_analytical).max() > 1e-4, "geometry has no force to check"
+        f_fd = finite_difference_forces(energy_fn, pos)
+        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-7, rtol=1e-6)
+
+    def test_threebody_forces_sum_to_zero(self):
+        """Translation invariance, which the virial in `__call__` depends on.
+
+        `EVBCoupling.__call__` builds every virial from *absolute* positions, so
+        it is origin-independent only if a term's forces sum to zero.  For this
+        term that holds because all three sides are internal coordinates; it is
+        asserted rather than assumed because a sign error on the `d` side would
+        break it while leaving the energy correct.
+        """
+        pos = np.array([[0.00, 0.00, 0.00], [1.05, 0.22, 0.10], [2.35, -0.15, 0.05]])
+        td = make_term(
+            "threebody",
+            [[0, 1, 2]],
+            A=[-4.1403],
+            a=[46.8],
+            ra0=[1.21],
+            rb0=[1.29],
+            t0=[np.pi],
+        )
+        _, forces, _ = self.coupling(pos, PBC, CELL, None, td)
+        np.testing.assert_allclose(forces.sum(axis=0), 0.0, atol=1e-12)
+
+    def test_twobody_needs_no_ensemble(self):
+        """The bond-length form is independent of the transition-state ensemble.
+
+        This is the property that lets a fission be coupled at all: it has no
+        saddle, so there is no reference geometry for `compute_rmsd` to measure
+        against, and a form that quietly depended on one would be back to
+        measuring an RMSD to an arbitrary mid-path frame.
+        """
+        pos = np.array([[0.00, 0.00, 0.00], [1.60, 0.15, 0.00]])
+        td = make_term("twobody", [[0, 1]], A=[-0.3511], a=[2.14], r0=[2.393])
+        reference = self.coupling(pos, PBC, CELL, None, td)
+        for ensemble in (pos[np.newaxis], (pos + 0.7)[np.newaxis]):
+            other = self.coupling(pos, PBC, CELL, ensemble, td)
+            assert other[0] == reference[0]
+            np.testing.assert_array_equal(other[1], reference[1])
 
 
 # ---------------------------------------------------------------------------

@@ -72,9 +72,12 @@ from DynamicTopology.fit.dissociation import (
     total_wavenumber,
 )
 from DynamicTopology.fit.coupling import (
+    DEFAULT_BIMOL_CUTOFF,
     DEFAULT_EPS,
     CouplingFitError,
     fit_coupling,
+    fit_threebody,
+    fit_twobody,
 )
 from DynamicTopology.forcefield.qforce import QForce, SHAPE_DECAY
 from DynamicTopology.io.json import read_jsonl, write_jsonl
@@ -85,6 +88,107 @@ from DynamicTopology.io.json import read_jsonl, write_jsonl
 # a wavenumber is printed to and are kept because the report also needs a
 # fallback for an element that is not in a template.
 MASSES: dict[str, float] = {"H": 1.008, "C": 12.011, "N": 14.007, "O": 15.999}
+
+
+def _is_barrierless(frames) -> bool:
+    """Is this reaction a bond fission or recombination rather than a saddle?
+
+    One bond changed, in one direction.  Such a channel has no transition state
+    to couple through, so inverting a reference barrier for it cannot succeed --
+    see `fit.coupling.fit_twobody`, which is what these channels are fitted with
+    instead.  A metathesis both breaks and forms and does have a real saddle.
+
+    Kept alongside `_fission`, which answers the same question and also returns
+    the bond and the fragments: this one is what the *report* needs, where a
+    channel has fallen through to the decoupled path and the advice printed for it
+    has to be the right advice.
+
+    Read from the endpoint connectivity, which every dataset frame ships.
+    """
+    from DynamicTopology.core.topology import Topology
+
+    def edges(atoms):
+        graph = Topology.from_atoms(atoms).graph
+        return {frozenset(edge) for edge in graph.edges()}
+
+    reactant, product = edges(frames[0]), edges(frames[-1])
+    broken, formed = reactant - product, product - reactant
+    return (len(broken) == 1 and not formed) or (len(formed) == 1 and not broken)
+
+
+def _fission(frames):
+    """The breaking bond, the fragment to pull away, and which frame is bonded.
+
+    `(pair, moving, bonded)` for a bond fission or recombination, or None for
+    anything else.  `pair` and `moving` are template indices -- the two atoms of
+    the bond that changes, and the connected component of the *separated*
+    topology that contains the second of them -- and `bonded` indexes the frame
+    whose connectivity still holds the bond, which is the reactant for a fission
+    and the product for a recombination.
+
+    This is what `fit.coupling.fit_twobody` needs and all it needs: the bond
+    whose length is the reaction coordinate, and a rigid way to walk along it.
+    No transition state and no reference energy, which is the point -- a
+    barrierless channel has neither.
+    """
+    import networkx as nx
+
+    from DynamicTopology.core.topology import Topology
+
+    graphs = [
+        Topology.from_atoms(frames[0]).graph,
+        Topology.from_atoms(frames[-1]).graph,
+    ]
+    edges = [{frozenset(edge) for edge in graph.edges()} for graph in graphs]
+    broken, formed = edges[0] - edges[1], edges[1] - edges[0]
+    if len(broken) == 1 and not formed:
+        bonded, changed = 0, broken
+    elif len(formed) == 1 and not broken:
+        bonded, changed = -1, formed
+    else:
+        return None
+
+    first, second = sorted(next(iter(changed)))
+    separated = graphs[-1 if bonded == 0 else 0]
+    moving = next(c for c in nx.connected_components(separated) if second in c)
+    if first in moving:
+        # Both ends stay in one fragment, so this bond change does not separate
+        # anything -- a ring opening, not a fission.  It keeps a saddle and
+        # belongs to the RMSD route.
+        return None
+    return (first, second), sorted(moving), bonded
+
+
+def _transfer(frames):
+    """The transferring atom and the two heavy atoms it moves between.
+
+    `(donor, proton, acceptor)` in template indices for an atom transfer -- one
+    bond broken and one formed, sharing the atom that moves -- or None for
+    anything else.  `fit.coupling.fit_threebody` needs exactly this triple, and
+    the transition state and reference energy the frames already carry.
+
+    A transfer is *not* barrierless: it has a real saddle between two real
+    diabats, so its amplitude still comes from inverting the reference barrier
+    and only the coupling's *width* is measured differently -- in the
+    transferring atom's own triangle rather than in the RMSD to a whole geometry.
+    Two independent bond changes that share no atom are not a transfer and keep
+    the RMSD form, having no single coordinate to be a function of.
+    """
+    from DynamicTopology.core.topology import Topology
+
+    def edges(atoms):
+        return {frozenset(edge) for edge in Topology.from_atoms(atoms).graph.edges()}
+
+    reactant, product = edges(frames[0]), edges(frames[-1])
+    broken, formed = reactant - product, product - reactant
+    if len(broken) != 1 or len(formed) != 1:
+        return None
+    gone, made = next(iter(broken)), next(iter(formed))
+    shared = gone & made
+    if len(shared) != 1:
+        return None
+    proton = next(iter(shared))
+    return (next(iter(gone - shared)), proton, next(iter(made - shared)))
 
 
 def load_templates(
@@ -255,6 +359,16 @@ def main() -> int:
     parser.add_argument("-r", "--rnet", default="datasets/HCombustion/HCombustion.json")
     parser.add_argument("--eps", type=float, default=DEFAULT_EPS)
     parser.add_argument(
+        "--bimol-cutoff",
+        type=float,
+        default=DEFAULT_BIMOL_CUTOFF,
+        help="separation (A) past which a bimolecular channel stops being "
+        "enumerated. Must match what the calculation will run with: "
+        "`fit_twobody` quenches a fission's coupling here, because past it "
+        "there is no state left to couple to. Raising it is what a channel "
+        "reported as cutoff-limited below needs.",
+    )
+    parser.add_argument(
         "--amplitude",
         type=float,
         default=None,
@@ -264,6 +378,14 @@ def main() -> int:
         "this value.",
     )
     parser.add_argument("-n", "--dry-run", action="store_true")
+    parser.add_argument(
+        "--rmsd-width",
+        action="store_true",
+        help="keep the RMSD width for atom-transfer channels instead of measuring "
+        "it in the transferring atom's triangle. The amplitude is identical "
+        "either way; this only changes which coordinates switch the coupling "
+        "off, so it is the way to reproduce a pre-`fit_threebody` baseline.",
+    )
     parser.add_argument(
         "--bonds",
         action="store_true",
@@ -417,8 +539,10 @@ def main() -> int:
 
     qforce = QForce()
 
-    print(f"{'reaction':<16}{'A (eV)':>12}{'a (1/A^2)':>12}  source")
+    print(f"{'reaction':<16}{'A (eV)':>12}{'a (1/A^2)':>12}{'r0 (A)':>9}  source")
     fitted = skipped = decoupled = preserved = 0
+    barrierless: list[str] = []
+    cutoff_limited: list[tuple[str, float, float]] = []
     for entry in manifest["reactions"]:
         stem = manifest_path.parent / entry["path"]
         frames = io.read(stem.with_suffix(".xyz"), index=":")
@@ -436,12 +560,50 @@ def main() -> int:
             if stored and stored[0].get("provenance") == "manual":
                 manual = stored[0]["kwargs"]["A"]
 
+        fission = _fission(frames)
+
         try:
             if manual is not None:
                 terms = fit_coupling(frames, amplitude=manual, eps=args.eps)
                 terms[0]["provenance"] = "manual"
                 source = "kept (manual; --refit-manual to replace)"
                 preserved += 1
+            elif fission is not None:
+                # A fission has no saddle, so the reference barrier this channel
+                # carries is an energy at an arbitrary point on a monotone path
+                # and inverting it is what returned `A = 0` however the diabats
+                # were fitted.  Ask the diabats where they cross instead: that
+                # needs no transition state and no reference energy, and it is
+                # checked *before* the branch below so a stored TS energy does
+                # not pull the channel back onto a fit that cannot succeed.
+                pair, moving, bonded = fission
+                bonded_frame = frames[bonded]
+                separated_frame = frames[-1 if bonded == 0 else 0]
+
+                def diabats(positions, a=bonded_frame, b=separated_frame):
+                    return (
+                        diabatic_energy(reaction_set, qforce, a, positions),
+                        diabatic_energy(reaction_set, qforce, b, positions),
+                    )
+
+                terms = fit_twobody(
+                    bonded_frame.positions,
+                    pair,
+                    moving,
+                    diabats,
+                    eps=args.eps,
+                    bimol_cutoff=args.bimol_cutoff,
+                )
+                source = "fitted from the diabatic crossing (bond length)"
+                # A channel quenched against the cutoff rather than against its
+                # own reactant has its crossing close to the edge of the region
+                # where its recombination is enumerated at all, so its amplitude
+                # is smaller than the surface would otherwise support.  Worth
+                # reporting, because the fix is a larger cutoff and not a refit.
+                if terms[0].get("limited_by") == "cutoff":
+                    cutoff_limited.append(
+                        (stem.name, terms[0]["kwargs"]["r0"], terms[0]["kwargs"]["A"])
+                    )
             elif transition.calc is not None:
                 energies = (
                     diabatic_energy(
@@ -451,8 +613,20 @@ def main() -> int:
                         reaction_set, qforce, frames[-1], transition.positions
                     ),
                 )
-                terms = fit_coupling(frames, diabatic_energies=energies, eps=args.eps)
-                source = "fitted from TS energy"
+                transfer = None if args.rmsd_width else _transfer(frames)
+                if transfer is not None:
+                    # Same amplitude, from the same reference barrier; only the
+                    # width is measured in the transferring atom's own triangle
+                    # instead of in the RMSD to the whole transition state.
+                    terms = fit_threebody(
+                        frames, transfer, diabatic_energies=energies, eps=args.eps
+                    )
+                    source = "fitted from TS energy (transfer triangle)"
+                else:
+                    terms = fit_coupling(
+                        frames, diabatic_energies=energies, eps=args.eps
+                    )
+                    source = "fitted from TS energy"
             elif args.amplitude is not None:
                 terms = fit_coupling(frames, amplitude=args.amplitude, eps=args.eps)
                 source = "width only (--amplitude)"
@@ -475,12 +649,39 @@ def main() -> int:
             terms = fit_coupling(frames, amplitude=amplitude, eps=args.eps)
             source = f"{terms[0]['provenance']} ({error.args[0][:52]}...)"
             decoupled += 1
+            if _is_barrierless(frames):
+                barrierless.append(stem.name)
 
         kwargs = terms[0]["kwargs"]
-        print(f"{stem.name:<16}{kwargs['A']:>12.4f}{kwargs['a']:>12.2f}  {source}")
+        # `r0` is the bond-length form's crossing; the RMSD form is centred on a
+        # geometry rather than a distance and has none.
+        centre = f"{kwargs['r0']:>9.3f}" if "r0" in kwargs else f"{'-':>9}"
+        print(
+            f"{stem.name:<16}{kwargs['A']:>12.4f}{kwargs['a']:>12.2f}{centre}  {source}"
+        )
         if not args.dry_run:
             write_jsonl(stem.with_suffix(".jsonl"), terms, exist_ok=True)
         fitted += 1
+
+    if cutoff_limited:
+        print(
+            f"\n{len(cutoff_limited)} fission channel(s) have their coupling width "
+            f"set by --bimol-cutoff ({args.bimol_cutoff:.1f} A) rather than by their "
+            "own reactant, because the crossing is nearer the cutoff than the "
+            "reactant minimum. The coupling has to be off where the state stops "
+            "being enumerated, so the amplitude is capped below what the surface "
+            "would otherwise support:"
+        )
+        for name, centre, amplitude in cutoff_limited:
+            print(
+                f"    {name:<12} crossing {centre:.3f} A, "
+                f"{args.bimol_cutoff - centre:.3f} A inside the cutoff, "
+                f"A = {amplitude:+.4f} eV"
+            )
+        print(
+            "  Raising --bimol-cutoff (and `System`'s to match) is what these "
+            "need; refitting the force field will not move them."
+        )
 
     verb = "would write" if args.dry_run else "wrote"
     print(
@@ -489,18 +690,31 @@ def main() -> int:
         f"{decoupled} decoupled, {preserved} manual and kept); {skipped} skipped"
     )
     if decoupled:
-        # Worth stating loudly, because it is invisible at run time: a decoupled
-        # channel never enters a basis, so it never reaches
-        # `Block.placeholder_channels` either.  This line is the only place the
-        # count is reported.
-        print(
-            f"\n{decoupled} channel(s) carry A = 0 and are switched off entirely: the "
-            "force field's diabatic energies at the transition-state geometry lie "
-            "below the reference barrier, so no real coupling reproduces it. They "
-            "will not appear in any EVB basis and will not be reported at run time. "
-            "The fix is a better diabatic force field -- try --force-constants, or a "
-            "looser --frequency-weight if it is already on."
-        )
+        underfit = decoupled - len(barrierless)
+        if underfit:
+            print(
+                f"\n{underfit} channel(s) carry A = 0 because the force field's "
+                "diabatic energies at the transition-state geometry lie below the "
+                "reference barrier, so no real coupling reproduces it. The fix is a "
+                "better diabatic force field -- try --force-constants, or a looser "
+                "--frequency-weight if it is already on."
+            )
+        if barrierless:
+            # Separated because the advice above is wrong for these, and following
+            # it costs a pipeline run to learn so.
+            print(
+                f"\n{len(barrierless)} of those are barrierless, and inverting a "
+                f"reference barrier was never going to fit them: "
+                f"{', '.join(barrierless)}. A bond fission has no saddle -- the "
+                "bound diabat is the ground state along the whole path -- so a "
+                "perfect reactant diabat puts the reference barrier exactly on it "
+                "and the discriminant vanishes identically. No refit reaches it. "
+                "Such a channel should have gone to `fit.coupling.fit_twobody`, "
+                "which fits a Gaussian in the breaking bond's length centred on "
+                "where its two diabats cross and needs no barrier at all; reaching "
+                "this message means `_fission` did not recognise it, or that fit "
+                "raised as well -- its own error text says which."
+            )
     return 1 if skipped else 0
 
 

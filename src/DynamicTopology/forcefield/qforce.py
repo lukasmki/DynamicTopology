@@ -40,6 +40,66 @@ from typing import Callable
 SHAPE_DECAY: float = 4.0
 
 
+# How far above the free-fragment limit a broken bond's diabat sits (kJ/mol).
+#
+# **A dissociated bond is not worth zero.**  The Morse used to be written
+# `D (1 - exp(-a dr))**2 - D`, which is `-D` at the minimum and exactly zero at
+# infinity, so a molecule's diabat and its own fragments' diabat converged to the
+# same number.  That is the correct *adiabatic* statement -- pulling H2 apart
+# does cost exactly its atomization energy -- and the wrong *diabatic* one.  A
+# diabat is one bonding pattern scored everywhere, and the pattern "these two
+# atoms are bonded" is not a description of two atoms 6 A apart at all.  Held to
+# zero it stayed infinitesimally the lower state at every separation, the two
+# diabats never crossed, and there was nothing for an EVB off-diagonal to
+# interpolate between: `fit.coupling.fit_amplitude`'s discriminant vanishes
+# identically in that limit, which is why all three of HCombustion's fission
+# channels fitted to `A = 0` however the force constants were refitted.
+#
+# Splitting the asymptote from the depth costs no accuracy anywhere it is
+# already right.  The minimum stays at `-D`, and the curvature there stays
+# `k = 2 Dw a**2` exactly, because `a = sqrt(k / 2 Dw)` is solved against the
+# same `Dw` the well now has -- so every fitted bond length and every vibrational
+# frequency is where q-force put it.  Only the stretched branch moves.
+#
+# **1.0 eV is read off the channels, not chosen.**  Margins against the
+# reference barriers, with the depth refit `fit.dissociation` requires at each
+# value folded in:
+#
+#     asymptote     0.00    0.50    0.75    1.00    1.50    2.00
+#     fittable        14      15      15      16      16      16
+#     rxn_16      -0.402  -0.152  -0.028  +0.093  +0.333  +0.567
+#     rxn_11      +0.086  +0.426  +0.591  +0.753  +1.068  +1.371
+#     rxn_15      +0.144  +0.416  +0.549  +0.680  +0.938  +1.190
+#
+# 1.0 is the first value at which `rxn_16` -- a genuine saddle, and the only
+# channel that was ever a fitting failure rather than a barrierless one -- comes
+# out fittable.  It is not bought from anywhere: `rxn_11` and `rxn_15` were the
+# two thin margins a force-constant refit kept spending, and they improve by
+# 0.67 and 0.54 eV on the way.  Past 1.5 nothing further is fittable, so raising
+# it further buys only a later crossing.
+#
+# And it is what makes a fission cross at a chemically sensible distance rather
+# than an asymptotic one.  Where the bonded diabat overtakes the dissociated one:
+#
+#     asymptote      H2      HO     H2O
+#     0.00 eV      never   never   never
+#     0.75         2.53    3.15    4.05
+#     1.00         2.38    2.93    3.74
+#
+# All three are inside `ReactionSet.get_network`'s 4.0 A bimolecular cutoff at
+# 1.0, so the reverse channel is enumerated where the forward one hands over and
+# recombination needs no separate mechanism.
+#
+# **Changing this invalidates every `.jsonl` in every dataset,** for the same
+# reason the three nonbonded radii do: `fit.dissociation` solves each template's
+# depth scale against its reference atomization energy, and moving the asymptote
+# moves that solve.  Re-run `scripts/fit.py --bonds` for both datasets.  The
+# rescale is small -- at most 0.37% at 1.0 eV, which restores every template to
+# its reference energy to 5e-12 eV -- but it is not optional: without it the
+# templates read up to 73 meV high.
+BOND_ASYMPTOTE: float = 1.0 * units.mol / units.kJ
+
+
 class QForce:
     """Bonded force field.  Works internally in nm and kJ/mol, converts to ASE
     units (eV, Angstrom) at the end of `__call__`; the per-term `compute_*`
@@ -143,9 +203,11 @@ class QForce:
             s = a*max(dr, 0),  a = sqrt(k / 2D)
             E = D * [ (1 - exp(-a*dr))**2 - 1 + c * s**3 * exp(-b*s) ]
 
-        The `-D` offset puts the dissociated limit at zero, so a topology's
-        energy carries the depth of the bonds it contains and breaking a bond
-        costs `+D` rather than nothing.
+        The `-D` offset puts the minimum at `-D`, so a topology's energy carries
+        the depth of the bonds it contains and breaking a bond costs `+D` rather
+        than nothing.  The *dissociated* limit is `BOND_ASYMPTOTE` above zero,
+        not at it, and the well the exponential climbs is `D + BOND_ASYMPTOTE`
+        deep -- see that constant for why the two are not the same number.
 
         **Why the third parameter exists.**  Plain Morse (`c = 0`) is exact at
         the minimum and at dissociation and has nothing left over in between:
@@ -190,19 +252,39 @@ class QForce:
         v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3)  vec from atom0->atom1
         r = np.sqrt(np.sum(v * v, -1))  # (n,)
         dr = r - r0
-        al = np.sqrt(k / (2 * D))  # (n,)  1/nm
+        # The depth of the well and the height of the asymptote are separate
+        # numbers.  `D` is the fitted atomization depth and fixes the *minimum*
+        # at `-D`; `Dw` is what the exponential climbs, and fixes the
+        # dissociated limit at `Dw - D = BOND_ASYMPTOTE`.  Setting them equal is
+        # the old behaviour and puts that limit at zero.
+        #
+        # **Stretched branch only, like the shape term and for a related reason.**
+        # The asymptote is a statement about dissociation, so it has no business
+        # on the compressed side -- and it does not arrive there harmlessly.  A
+        # deeper well at fixed `k` is a *narrower* exponent, `a = sqrt(k / 2Dw)`,
+        # which softens compression: `exp(-a dr)` for `dr < 0` grows more slowly,
+        # so a molecule squeezed head-on deforms further.  Applied to both
+        # branches it cost 0.03 A of intermolecular closest approach in
+        # `test_collapse.py`, against a bar with 0.03 A of margin left.
+        #
+        # The join is C2, so the forces never see it: both branches are `-D` at
+        # `dr = 0` with zero slope, and the curvature there is `2 Dw a**2 = k`
+        # whatever `Dw` is -- which is the same identity that keeps the asymptote
+        # free of every fitted frequency.  Only the third derivative jumps.
+        Dw = np.where(dr > 0.0, D + BOND_ASYMPTOTE, D)  # (n,)
+        al = np.sqrt(k / (2 * Dw))  # (n,)  1/nm
         exp_term = np.exp(-al * dr)  # (n,)
-        e = D * (1 - exp_term) ** 2 - D
-        # dE/dr  =  2*D*(1 - exp)*al*exp
-        de_dr = 2 * D * (1 - exp_term) * al * exp_term  # (n,)
+        e = Dw * (1 - exp_term) ** 2 - D
+        # dE/dr  =  2*Dw*(1 - exp)*al*exp
+        de_dr = 2 * Dw * (1 - exp_term) * al * exp_term  # (n,)
 
         # Stretched branch only; `np.maximum` rather than a mask so that the
         # zero-`c` case stays a single vectorised expression.
         s = al * np.maximum(dr, 0.0)  # (n,)
         decay = np.exp(-b * s)
-        e = e + D * c * s * s * s * decay
+        e = e + Dw * c * s * s * s * decay
         # d/ds [s**3 exp(-b s)] = (3 s**2 - b s**3) exp(-b s),  ds/dr = al (or 0)
-        de_dr = de_dr + D * c * al * s * s * (3.0 - b * s) * decay
+        de_dr = de_dr + Dw * c * al * s * s * (3.0 - b * s) * decay
 
         e_tot = np.sum(e)
         # dr/dv = v/r,  v = pos_atom1 - pos_atom0

@@ -204,16 +204,38 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # those templates, and an H2/O2 mixture carries few angles to begin with.  A
 # box energy that barely moves is not evidence that the surface barely moved;
 # `TestTemplateFrequencies` and the channel counts in `scripts/fit.py` are.
+# And again when `qforce.BOND_ASYMPTOTE` lifted the dissociated limit of the
+# Morse off zero (so a bonded diabat crosses its own fragments' diabat instead of
+# converging to it) and both datasets were refit against it.  **The same mirror
+# image as the entry above, for the same reason:** the asymptote is a bonded term
+# on the EVB diagonal, so `energy_nonbonded` cannot move and being bit-identical
+# is the check on that.
+#
+#     d30  (dilute)   -508.14451 -> -508.13593 eV     +8.58e-03 eV
+#     d250 (dense)    -503.21791 -> -503.21063 eV     +7.28e-03 eV
+#     energy_nonbonded       identical          identical
+#     blocks                 identical          identical
+#
+# **Three meV per atom, against a surface that now breaks bonds at all.**  The
+# atomization condition is why: `fit.dissociation` re-solves each template's
+# depth scale against its own reference energy, so the minima are pinned exactly
+# where they were -- at most a 0.48% rescale -- and what is left here is only how
+# far this box's geometries sit off those minima.  The change that matters is at
+# *stretched* geometries, which an equilibrium-ish box barely samples, so as with
+# the angle refit a box energy that barely moves is not evidence that the surface
+# barely moved.  `TestTemplateFrequencies`, `tests/test_dissociation.py` and the
+# channel counts in `scripts/fit.py` are; the fastest stretch moved 4399 ->
+# 4639 cm^-1 and three channels that could not react now do.
 REFERENCE = {
     "tests/data/mix-n100-d30.xyz": (
-        -508.14451150328017,
-        -1201.0058975026604,
+        -508.1359318992392,
+        -1200.9973178986195,
         0.041254295990371045,
         87,
     ),
     "tests/data/mix-n100-d250.xyz": (
-        -503.21790950781804,
-        -1201.0996019088495,
+        -503.2106293396529,
+        -1201.0923217406844,
         0.8476084009425316,
         28,
     ),

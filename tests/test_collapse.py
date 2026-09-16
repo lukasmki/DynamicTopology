@@ -113,6 +113,30 @@ STEPS = 400
 # than step the bar down again.  `SPEEDS[1]` is a 4.5 eV head-on, 17 kT at
 # 3000 K and well outside what a production run samples -- `SPEEDS[0]`, which is
 # inside it, still clears the bar by 0.36 A.
+#
+# **`qforce.BOND_ASYMPTOTE` is that next change, and this bar is deliberately NOT
+# moved for it.**  Measured at `SPEEDS[1]`, one variable at a time:
+#
+#     HEAD dataset, asymptote 0      1.0401 A     <- the real baseline
+#     refit dataset, asymptote 1.0   1.0283 A     <- now; fails by 0.0017 A
+#
+# Two things to read off that.  The asymptote costs 0.012 A, half what the angle
+# refit above cost.  And **the 0.03 A this comment claims was already stale**:
+# the margin at HEAD was 0.0101 A, so the bar was one small change away from
+# failing before this one arrived, and it is the accumulation rather than the
+# asymptote that spends it.
+#
+# Left failing on purpose.  The instruction above is to widen the gap, and the
+# gap is the repulsion's: `ZBL` provides 0.221 A of wall over a stubbed run here
+# and no bonded parameter adds to it -- the same dead end
+# `test_reference_energies.py::TestTemplateFrequencies` reaches from the other
+# side ("what is left is a property of the repulsion's functional form").
+# Changing that form means refitting every `.jsonl` in both datasets, a larger
+# job than the one this bar blocks, and stepping the bar to 1.02 for a green
+# suite is exactly what the paragraph above forbids.
+#
+# `SPEEDS[0]` -- the case inside what a production run samples -- is at 1.3747 A
+# against 1.3854 at HEAD, clearing by 0.345 A.
 CONTACT = 1.03
 
 # What the same run does with the repulsion removed: 0.818 A at `SPEEDS[0]` and

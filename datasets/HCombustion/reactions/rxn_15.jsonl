@@ -1,1 +1,1 @@
-{"type": "rmsd", "atoms": {"p1": 0, "p2": 1, "p3": 2, "p4": 3}, "kwargs": {"A": -0.45506497414714897, "a": 234.56976957316766}, "provenance": "fitted"}
+{"type": "twobody", "atoms": {"p1": 0, "p2": 3}, "kwargs": {"A": -0.4502976769436905, "a": 22.57620190937116, "r0": 1.9572820482404483}, "provenance": "fitted", "limited_by": "reactant"}

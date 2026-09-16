@@ -69,11 +69,16 @@ HCOMBUSTION = Path("datasets/HCombustion/HCombustion.json").resolve()
 # the bar.
 REACTION = "rxn_13"
 
-# Fraction of the way from the transition state towards the reactant.  Three
+# Fraction of the way from the transition state towards the reactant.  Four
 # states with every channel at full strength, and far enough past the ramp that
 # a small change in the surface does not put it back inside one.
+#
+# Three until `fit.coupling.fit_twobody` gave the fission channels a real
+# amplitude.  Their couplings had been `A = 0`, so they were dropped at the `eps`
+# gate at every geometry and could not be part of any basis; a fourth diabat here
+# is that channel becoming visible, not the gate loosening.
 REACTION_PATH_TS = 0.16
-# Squarely inside the admission ramp: three states, `min_switch` = 0.48, so the
+# Squarely inside the admission ramp: four states, `min_switch` = 0.54, so the
 # switch's own gradient is reachable and a pivot-invariance test has something
 # to be invariant about.
 #
@@ -82,35 +87,35 @@ REACTION_PATH_TS = 0.16
 # `min_switch` is strictly inside (0, 1) rather than trusting this number.
 #
 # **The ramp is about two hundredths of `t` wide, so this constant is fragile by
-# nature.**  Rescanned three times now: once when `ZBL` acquired its taper, again
+# nature.**  Rescanned four times now: once when `ZBL` acquired its taper, again
 # when `forcefield/lj.py` was switched back on and both datasets were refit
-# against it, and again when the angle potential acquired its factor of 1/2 and
-# both datasets were refit against that.  The whole window on the current
+# against it, again when the angle potential acquired its factor of 1/2 and both
+# datasets were refit against that, and again when `fit.coupling.fit_twobody`
+# replaced the fission channels' `A = 0`.  The whole window on the current
 # surface:
 #
 #     t       states   min_switch
-#     0.0875       2     1.000000     <- the third state is not yet admitted
-#     0.0900       3     0.000037
-#     0.0925       3     0.010782
-#     0.0950       3     0.065528
-#     0.0975       3     0.189897
-#     0.1000       3     0.387212
-#     0.1010       3     0.481318   <- chosen, nearest a half-open switch
-#     0.1025       3     0.628640
-#     0.1050       3     0.851449
-#     0.1075       3     0.980291
-#     0.1100       3     1.000000
+#     0.1175       2     1.000000     <- the upper states are not yet admitted
+#     0.1200       4     0.000976
+#     0.1225       4     0.025917
+#     0.1250       4     0.114692
+#     0.1275       4     0.289452
+#     0.1300       4     0.536780   <- chosen, nearest a half-open switch
+#     0.1325       4     0.795054
+#     0.1350       4     0.966248
+#     0.1375       4     1.000000
 #
 # The window is the same width as before (0.02 in `t`) and has moved bodily
-# inward by about 0.01, which is what a refit does to it: the admission gate is
-# an energy test, so it moves wherever the diabats move.  The 1/2 halves the
-# angle term, so the diabats that carry one moved and the gate moved with them.
+# outward by about 0.03.  Two states arrive together at its lower edge now rather
+# than one, because a fission channel that used to be dropped at the `eps` gate
+# for having no amplitude at all is now fitted and enters alongside the channel
+# that was already there.
 #
 # Scanning `t` and taking the point nearest `min_switch` = 0.5 is the maintenance
 # that follows a refit.  Scan at 0.0025 or finer: a 0.01 grid lands at most one
 # point inside this window and can miss it altogether, at which point every test
 # downstream reports that no geometry exercises the switch.
-REACTION_PATH_RAMP = 0.101
+REACTION_PATH_RAMP = 0.130
 
 
 def reaction_path(name: str, t: float, cell: float) -> Atoms:
@@ -224,6 +229,28 @@ def with_spectator(atoms: Atoms, template: Atoms, gap: float) -> Atoms:
 # that the best row now recrosses on two seeds of three rather than on none, so
 # the constant moved along the path rather than to another channel.
 #
+# **And rescanned again when `qforce.BOND_ASYMPTOTE` lifted the dissociated limit
+# of the Morse off zero** and both datasets were refit against it.  That put three
+# more channels on fitted amplitudes (16 of 19 against 13) and it made this
+# constant stale in a way the switch count alone would not have shown: rxn_12 at
+# 0.1 went *up* to 17 switches pooled, recrossing on all three seeds, while its
+# basis stopped changing size at all -- so the row scored 17 / 1 and tripped the
+# size floor rather than the switch floor.  Same protocol, extended to starts in
+# 0.05 steps because no row in the original 0.1/0.2/0.3 grid cleared both:
+#
+#     rxn_13 at 0.10   14 / 2     per seed 4, 4, 6 -- but rxn_13 is `REACTION`
+#     rxn_04 at 0.20   10 / 2     per seed 1, 6, 3
+#     rxn_18 at 0.20    6 / 2     per seed 0, 4, 2 -- one seed never switches
+#     rxn_12 at 0.20    5 / 3     <- chosen; per seed 1, 3, 1
+#     rxn_14 at 0.20    4 / 5     per seed 2, 1, 1
+#     rxn_12 at 0.10   17 / 1        the previous choice, now size-vacuous
+#
+# `rxn_13` scores best and is not available: it is what `REACTION` already names
+# in `test_energy_conservation.py`, and the point of this constant is to exercise
+# a *different* channel from the one the gate cases use.  So the constant has
+# moved along the path again rather than to another channel, and the basis is
+# richer than it was -- three distinct sizes against one.
+#
 # `rxn_04`, `rxn_14` and `rxn_18` raise `ValueError` at t = 0.1: the geometry
 # perceives as a bridged species that is neither reactant nor product, which
 # `ReactionSet.get_terms` correctly refuses.  That is a property of scanning a
@@ -236,5 +263,6 @@ SWITCHING_REACTION = "rxn_12"
 # reactant it switches on every seed tried, so the anti-vacuity guard downstream
 # is not riding on a lucky random number, and on two seeds of three it recrosses;
 # see the survey above.  Moved from 0.2 when the 12-6 came back and 0.1 became
-# the better row on both scores.
-SWITCHING_PATH_START = 0.1
+# the better row on both scores, and back to 0.2 when `qforce.BOND_ASYMPTOTE`
+# left 0.1 recrossing freely but with a basis that never changes size.
+SWITCHING_PATH_START = 0.2

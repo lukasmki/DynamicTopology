@@ -77,7 +77,24 @@ SEED = 0
 # The two tests that use this assert `basis_changes > 0` themselves, so a value
 # that stops crossing fails loudly rather than passing vacuously -- which is how
 # the move from rxn_10 to rxn_13 was caught.
-GATE_START = 0.12
+#
+# **Moved from 0.12 when `qforce.BOND_ASYMPTOTE` made bonds able to break.**  The
+# dt-halving case below needs the crossing isolated -- it has to measure the ramp
+# and nothing else -- and at 0.12 the run now also breaks a bond, which is a
+# second event in the same window.  Rescanned for a start that crosses a gate and
+# leaves the topology alone, over the ladder rather than the 200-step run, since
+# that is the case with the requirement:
+#
+#     start t         0.06  0.08  0.10  0.12  0.14  0.16  0.20
+#     basis changes      0     0     1     1     3     3     3
+#     topology change  yes   yes   yes   yes    no    no    no
+#
+# Everything from 0.14 on qualifies and they are equivalent on the ratios
+# (3.98-4.05); 0.14 is simply the nearest.  The bond breaking at 0.12 was *not*
+# spoiling the measurement -- the ratios there are 4.01 and 3.99, which is the
+# evidence that a barrierless flip is energy-continuous -- but a test that asserts
+# one thing should not depend on a second thing being harmless.
+GATE_START = 0.14
 GATE_TEMPERATURE = 1000.0  # K
 
 # **This is not the production timestep and is not meant to be.**  The sweep
@@ -606,4 +623,118 @@ class TestGateContinuity:
             f"change ({curvature.max():.3e} eV against a background of "
             f"{np.median(curvature):.3e}); a state is entering the basis with a "
             "coupling it did not ramp up to"
+        )
+
+
+class TestDissociationConservation:
+    """A bond that actually breaks, and one that actually forms.
+
+    Everything above tests a surface on which no bond could come apart: until
+    `qforce.BOND_ASYMPTOTE` lifted the Morse's dissociated limit off zero, the
+    bonded diabat was the lower one at every separation and H2 stayed H2 out to
+    any distance.  These two cases are the new event, and they are here rather
+    than in `test_dissociation.py` because that file asks whether the topology
+    flips and this one asks what the flip costs the integrator.
+
+    Driven as a bare H2 in a vacuum box rather than from a reaction path, for the
+    same reason `test_dissociation.py` drives `System` directly: the question is
+    about one bond crossing one threshold, and anything else in the box is noise
+    in a drift measurement.
+
+    **Both directions now converge, and they did not always.**  While these
+    channels carried `A = 0` the two diabats crossed with nothing between them,
+    so the energy was continuous and the force was not, and a kink crossed at
+    speed contributes error that falls off like `dt` rather than `dt**2`.  The
+    dissociation case was therefore exempted from `assert_converges_with_timestep`
+    -- at ratios 1.89 and 3.33 against a tolerance of 3.5 -- with the note that a
+    fitted coupling would smooth it.  `fit.coupling.fit_twobody` is that coupling,
+    and it did:
+
+        recombination, 0.003 eV inward     drift ratios 4.02, 4.01
+        dissociation, 4.9 eV outward       drift ratios 4.16, 3.94
+
+    So both carry the criterion now.  That is the point of asserting it here
+    rather than leaving the looser bound in place: the kink is what the amplitude
+    removed, and nothing else in the suite would notice it coming back.
+    """
+
+    CELL = 40.0
+
+    def _run(self, reaction_set, separation, velocity, dt, femtoseconds, bonded):
+        atoms = Atoms(
+            "H2",
+            positions=[[0.0, 0.0, 0.0], [0.0, 0.0, separation]],
+            cell=np.eye(3) * self.CELL,
+            pbc=False,
+        )
+        atoms.positions += self.CELL / 2 - atoms.positions.mean(0)
+        # Stated rather than perceived: at 3.2 A perception would call the pair
+        # two atoms and at 0.75 A it would call them a molecule, which is the
+        # answer these runs are supposed to reach on their own.
+        atoms.info["connectivity"] = [(0, 1, 1)] if bonded else []
+        atoms.set_velocities([[0.0, 0.0, -velocity], [0.0, 0.0, velocity]])
+        atoms.calc = DynamicTopology(atoms, reaction_set)
+
+        dynamics = VelocityVerlet(atoms, timestep=dt * units.fs)
+        total, bonds = [], set()
+        for _ in range(int(round(femtoseconds / dt)) + 1):
+            total.append(atoms.get_total_energy())
+            bonds.add(len(_topology_edges(atoms.calc)))
+            dynamics.run(1)
+        total = np.array(total)
+        return total.max() - total.min(), bonds
+
+    LADDER = (0.1, 0.05, 0.025)
+
+    def test_a_recombination_conserves_energy(self, reaction_set):
+        """Two H atoms pushed gently together, and the drift is integrator error.
+
+        The pair is sent in from 3.2 A with 0.003 eV, so it reaches the 2.39 A
+        crossing nearly at rest and the kink contributes almost nothing.  What is
+        left is ordinary Verlet error on a 4.7 eV well, and it converges: the
+        ratios are 3.98 and 4.01 over `LADDER`.
+
+        Note what the pair does after it bonds -- it falls to 0.43 A, because the
+        bond energy has nowhere to go without a third body.  That is a real
+        modelling limitation of relabelling a radical pair, not a defect in the
+        integration, and it is why this asserts a drift rather than a geometry.
+        """
+        drifts = []
+        for dt in self.LADDER:
+            # Negative is inward; the helper's sign is outward-positive.
+            drift, bonds = self._run(reaction_set, 3.2, -0.05, dt, 120.0, bonded=False)
+            assert bonds == {0, 1}, (
+                f"the pair did not recombine (edge counts seen: {sorted(bonds)}); "
+                "this asserts nothing unless a bond actually forms"
+            )
+            drifts.append(drift)
+        assert_converges_with_timestep(drifts)
+
+    def test_a_dissociation_conserves_energy(self, reaction_set):
+        """H2 blown apart at 4.9 eV, and the drift is integrator error.
+
+        The pair crosses at 2.39 A at speed, which is the hard case: a force
+        discontinuity there is integrated coarsely and contributes error that
+        falls off like `dt`, not `dt**2`.  That is what this used to measure --
+        ratios 1.89 and 3.33 against a 3.5 tolerance -- and it is now 4.16 and
+        3.94, because the crossing is an avoided one with a fitted amplitude
+        rather than two diabats meeting at a point.
+
+        Both the O(dt**2) criterion and the absolute bound are kept.  A genuine
+        energy step -- which is what admitting on near-degeneracy produced, and
+        what an `abs(gap)` criterion reintroduces -- does not shrink with dt at
+        all, and that is the failure this is placed to catch.
+        """
+        drifts = []
+        for dt in self.LADDER:
+            drift, bonds = self._run(reaction_set, 0.75, 2.2, dt, 40.0, bonded=True)
+            assert bonds == {0, 1}, (
+                f"the bond did not break (edge counts seen: {sorted(bonds)}); "
+                "this asserts nothing unless it does"
+            )
+            drifts.append(drift)
+        assert_converges_with_timestep(drifts)
+        assert max(drifts) < 0.05, (
+            f"drift reached {max(drifts):.3e} eV on a 4.9 eV dissociation; the "
+            "crossing is costing far more than a kink should"
         )

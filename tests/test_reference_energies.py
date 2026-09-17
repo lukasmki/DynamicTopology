@@ -532,6 +532,7 @@ class TestTemplateFrequencies:
         from ase.data import atomic_masses, atomic_numbers
 
         from DynamicTopology.fit.dissociation import bond_curvatures, total_wavenumber
+        from DynamicTopology.forcefield.exclusions import with_exclusions
 
         worst = (0.0, "")
         for stem in _entries("molecules"):
@@ -539,6 +540,14 @@ class TestTemplateFrequencies:
             terms = read_jsonl(stem.with_suffix(".jsonl"))
             if not any(term["type"] == "bond" for term in terms):
                 continue
+            # Through `with_exclusions`, for the reason the rest of this file
+            # goes through it: a raw `.jsonl` states the nonbonded parameters
+            # and none of the exclusions, so scoring one directly charges the
+            # bond an intramolecular `ZBL` the calculator does not apply.  It is
+            # not a small correction on a stretch -- H2 reads 5674 cm^-1 raw
+            # against 3762 excluded -- and the timestep asserted below is the
+            # one the *excluded* surface sets.
+            terms = with_exclusions(terms, frame.get_atomic_numbers())
             seen: set[tuple[float, float]] = set()
             pairs = []
             for term in terms:

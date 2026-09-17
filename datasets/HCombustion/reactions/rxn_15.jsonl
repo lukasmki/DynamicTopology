@@ -1,1 +1,1 @@
-{"type": "twobody", "atoms": {"p1": 0, "p2": 3}, "kwargs": {"A": -0.4502976769436905, "a": 22.57620190937116, "r0": 1.9572820482404483}, "provenance": "fitted", "limited_by": "reactant"}
+{"type": "twobody", "atoms": {"p1": 0, "p2": 3}, "kwargs": {"A": -0.4018289043371021, "a": 9.135817713721355, "r0": 2.251639095110007}, "provenance": "fitted", "limited_by": "reactant"}

@@ -99,16 +99,23 @@ class TestMadelung:
 
         `K_ii` -- an ion's interaction with its own images, which has no
         counterpart in the open-boundary kernel and which `ACKS2.build_system`
-        has to add to the hardness rather than overwrite -- carries 80% of the
-        rock-salt energy: without it the Madelung constant reads 0.350 against
+        has to add to the hardness rather than overwrite -- carries 81% of the
+        rock-salt energy: without it the Madelung constant reads 0.329 against
         1.7476.  Dropping it leaves a sum that converges perfectly to that.
+
+        **0.329 and not 0.350, because zeroing the diagonal makes the weight
+        non-neutral.**  `sum_ij q_i q_j` over the off-diagonal alone is
+        `-sum_i q_i**2`, so the `k = 0` background `Ewald` now carries no longer
+        cancels out of this particular contraction the way it does out of every
+        physical one.  The number moved when the background was added; the claim
+        it is here to make did not.
         """
         pos, q, cell = nacl()
         vecs, rij = geometry(pos, cell)
         K = Ewald(cell).bind(pos, vecs, rij).matrix()
         without = K.copy()
         without[np.diag_indices_from(without)] = 0.0
-        assert madelung(without, q) == pytest.approx(0.3502, abs=1e-3)
+        assert madelung(without, q) == pytest.approx(0.3289, abs=1e-3)
 
 
 class TestConvergence:
@@ -136,6 +143,56 @@ class TestConvergence:
         # below is not two runs of the same sum.
         assert Ewald(cell, accuracy=1e-6).kappa != Ewald(cell, accuracy=1e-12).kappa
         np.testing.assert_allclose(energies, energies[-1], atol=1e-7)
+
+    def test_independent_of_the_splitting_for_a_charged_weight(self):
+        """The same, with the neutrality that used to hide the background gone.
+
+        Every physical contraction of this kernel is neutral, and a neutral
+        weight cancels a constant added to every entry of `K` exactly -- which
+        is why the `k = 0` term could be dropped, and why nothing noticed for as
+        long as nothing asked for a single `K_ij`.
+
+        The intramolecular Coulomb exclusion asks for exactly that.  It
+        contracts the kernel against `S_ij q_i q_j` for a screen `S`, and the
+        excluded pairs of a molecule do not sum to zero, so without the
+        background the exclusion is worth whatever `kappa` the cell happened to
+        produce: an O-H pair moves by 0.0054 between `accuracy` 1e-4 and 1e-12,
+        8.7% of its own value, while the neutral sum below it holds to ten
+        digits.  This is that measurement, turned around.
+        """
+        rng = np.random.default_rng(0)
+        cell = np.eye(3) * 9.0
+        pos = rng.uniform(0, 9.0, size=(5, 3))
+        q = rng.normal(size=5)
+        q -= q.mean()
+
+        # A screen of the kind `ACKS2.screen_matrix` builds: symmetric, off the
+        # diagonal, and with no reason at all to be neutral.
+        screen = np.ones((5, 5))
+        screen[0, 1] = screen[1, 0] = 0.0
+        screen[2, 3] = screen[3, 2] = 0.4
+        vecs, rij = geometry(pos, cell)
+
+        weight = screen * np.outer(q, q)
+        energies, without_background = [], []
+        for accuracy in (1e-6, 1e-8, 1e-10, 1e-12):
+            setup = Ewald(cell, accuracy=accuracy)
+            K = setup.bind(pos, vecs, rij).matrix()
+            energies.append(0.5 * np.sum(weight * K))
+            without_background.append(0.5 * np.sum(weight * (K - setup.background)))
+
+        assert abs(np.sum((1.0 - screen) * np.outer(q, q))) > 1e-3, (
+            "the screened weight happens to be neutral; this proves nothing"
+        )
+        np.testing.assert_allclose(energies, energies[-1], atol=1e-7)
+        # Guard the guard: the background is what makes the line above hold,
+        # and taking it back out has to break it.  It moves this contraction by
+        # 9.1e-4 across the same four splittings, four orders of magnitude
+        # past the tolerance.
+        assert np.ptp(without_background) > 5e-4, (
+            "removing the background changed nothing; this test is no longer "
+            "measuring what it says it is"
+        )
 
     @pytest.mark.parametrize("size", [20.0, 40.0, 80.0])
     def test_approaches_the_open_boundary_kernel(self, size):

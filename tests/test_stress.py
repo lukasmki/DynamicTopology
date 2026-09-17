@@ -318,6 +318,35 @@ class TestACKS2Stress:
         assert_symmetric(w)
         np.testing.assert_allclose(w, w_fd, atol=1e-6, rtol=1e-4)
 
+    @pytest.mark.parametrize("positions", [POS_H2O2, POS_4], ids=["h2o2", "n4"])
+    def test_screened_call(self, positions):
+        """The same, under the fractional exclusion screen.
+
+        The screen breaks charge neutrality of the weight the kernel is
+        contracted against -- the excluded pairs of a molecule carry
+        `sum q_i q_j != 0` -- and that is what first exposed the missing `k = 0`
+        background in `forcefield/ewald.py`.  It surfaced here rather than in
+        the forces because the background reaches the strain through the cell
+        volume and does not depend on position at all, so this is the test that
+        would catch it coming back.
+        """
+        n = len(positions)
+        screen = np.ones((n, n))
+        for k, (i, j) in enumerate((i, j) for i in range(n) for j in range(i + 1, n)):
+            screen[i, j] = screen[j, i] = 1.0 - 0.2 - 0.13 * (k % 5)
+
+        def energy_fn(p, c):
+            acks2 = ACKS2()
+            acks2.prepare(p, PBC, c, self._TERM_DICT)
+            return acks2.compute(screen)[0]
+
+        acks2 = ACKS2()
+        acks2.prepare(positions, PBC, CELL, self._TERM_DICT)
+        _, _, w = acks2.compute(screen)
+        w_fd = finite_difference_virial(energy_fn, positions, CELL)
+        assert_symmetric(w)
+        np.testing.assert_allclose(w, w_fd, atol=1e-6, rtol=1e-4)
+
     def test_response_is_not_negligible(self):
         """Guard the guard: the frozen-charge virial must be visibly wrong.
 
@@ -407,6 +436,10 @@ class TestQForceStress:
 
     def test_exclusion(self):
         td = make_term("exclusion", [[0, 1]], sigma=[0.25], eps=[0.5])
+        self._check(POS_3, td)
+
+    def test_zblexclusion(self):
+        td = make_term("zblexclusion", [[0, 1]], z1=[8.0], z2=[1.0])
         self._check(POS_3, td)
 
     def test_angle(self):

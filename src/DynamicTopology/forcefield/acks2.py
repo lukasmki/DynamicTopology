@@ -29,6 +29,17 @@ class ACKS2:
     interact with itself.  A method here that needs the kernel takes it as an
     optional argument and falls back to `MinimumImage`, so calling any of them
     with a bare `rij` still means the open-boundary problem.
+
+    **The solve is topology-free and the energy is not.**  `build_system` never
+    sees an exclusion: the charges come from the full kernel over every pair,
+    which is what keeps them a function of the nuclear coordinates and the
+    elements alone, hence the same on every diabatic state, hence solvable once
+    per force call outside the EVB Hamiltonian.  The intramolecular exclusion
+    enters afterwards, as the `screen` multiplier on the *energy* functional --
+    `compute` and `compute_coulomb` -- and `System.calculate` assembles that
+    screen from the ground-state weights of the states it has just
+    diagonalized.  `forcefield/exclusions.py` has the argument for why it has to
+    be this way round; `prepare`/`compute` is the split that makes it possible.
     """
 
     CCOUL = 14.4  # eV
@@ -40,6 +51,15 @@ class ACKS2:
         self.state_hash = None
         self.ewald = None
         self.ewald_key = None
+        # Everything `compute` needs from the geometry `prepare` last saw.
+        self.indices = None
+        self.order = None
+        self.kernel = None
+        self.rij = None
+        self.vecs = None
+        self.params = None
+        self.natoms = 0
+        self.shape = None
 
     def build_system(self, rij, params, kernel=None):
         """Assemble the ACKS2 linear system `A x = b`, in term order.
@@ -59,6 +79,13 @@ class ACKS2:
         it.  With open boundaries there is nothing there to overwrite, but the
         periodic kernel carries an atom's interaction with its own images on
         that diagonal, and it belongs in the equilibration alongside `2 eta`.
+
+        **No exclusion reaches this matrix, deliberately.**  Masking the kernel
+        here would be the more obviously consistent thing to do -- a screened
+        kernel is simply another kernel, with energy, forces and virial all
+        derived from it -- and it is exactly what makes the charges depend on
+        the bond graph, which is what this term cannot afford.  See the class
+        docstring and `forcefield/exclusions.py`.
         """
         natoms = rij.shape[0]
         neqns = 2 * natoms + 2
@@ -114,12 +141,12 @@ class ACKS2:
         """Solve the ACKS2 linear system.  All arguments are in term order."""
         return self.solve_charges(rij, params, kernel)[0]
 
-    def compute_coulomb(self, Q, rij, vecs, kernel=None):
+    def compute_coulomb(self, Q, rij, vecs, kernel=None, screen=None):
         """Coulomb energy, forces and virial.  All arguments and results in term order.
 
         The charges are held fixed here, so this is only the explicit part of
         the gradient.  `compute_response_forces` supplies the dQ/dr part, and
-        `__call__` adds the two; this method on its own is not the gradient of
+        `compute` adds the two; this method on its own is not the gradient of
         its own energy.
 
         `W` is the weight the kernel is contracted against: the energy is
@@ -128,11 +155,30 @@ class ACKS2:
         returns `dS/dr` and `dS/de` for that same sum.  The diagonal is not
         masked off -- `K_ii` is zero under open boundaries and is a real
         self-image interaction under periodic ones.
+
+        `screen` is the intramolecular exclusion: an `(n, n)` symmetric
+        multiplier, 1 on a pair the kernel should act between and 0 on one a
+        template has claimed for its bonded terms.  It multiplies the weight,
+        which is the same thing as multiplying the kernel: the energy is
+        `sum_ij W_ij K_ij` and `contract` differentiates that same sum, so a
+        zero here removes the pair from the energy, the force and the virial
+        together with no separate correction to keep in step.
+
+        **Entries between 0 and 1 are meaningful and are the normal case.**  The
+        screen `System.calculate` builds is `1 - sum_s w_s M_s` over the states
+        of an EVB block, `w_s` their ground-state weights: a pair bonded in
+        every state of a block is screened out entirely, and one bonded in only
+        some of them is screened by however much ground state those states hold.
+        That is not an interpolation invented here -- it is what the
+        Hellmann-Feynman contraction of a per-state diagonal correction comes
+        to, term by term, and it is why one contraction serves a whole block.
         """
         if kernel is None:
             kernel = MinimumImage(rij, vecs)
 
         W = 0.5 * self.CCOUL * (Q[:, None] * Q[None, :])
+        if screen is not None:
+            W = W * screen
         e_tot = np.sum(W * kernel.matrix()) * units.eV
 
         dS_dr, dS_de = kernel.contract(W)
@@ -143,7 +189,9 @@ class ACKS2:
         w_tot = dS_de * units.eV
         return e_tot, f_tot, w_tot
 
-    def compute_response_forces(self, Q, u, A, rij, vecs, params, kernel=None):
+    def compute_response_forces(
+        self, Q, u, A, rij, vecs, params, kernel=None, screen=None
+    ):
         """The dQ/dr part of the force, and its virial.  All arguments and results in term order.
 
         The charges are not independent of the geometry: they solve `A(r) x = b`
@@ -167,6 +215,16 @@ class ACKS2:
         symmetric weight matrix that `-lam^T (dA/dr) x` puts on it.  The
         softness block needs care: `X_ii = -sum_j X_ij`, so each off-diagonal
         `bsoft_ij` appears in four entries of `X` and all four contribute.
+
+        **`screen` belongs to `dE/dx` and to nothing else here, and the
+        asymmetry is the whole point.**  The energy is the screened one, so its
+        derivative with respect to the charges carries the screen.  `A` is the
+        *unscreened* matrix -- `build_system` never saw an exclusion -- so
+        `dA/dr` is the unscreened kernel derivative and the weight it is
+        contracted against must not be masked.  Screening both would be the
+        gradient of a functional whose charges were also screened, which is not
+        the functional being evaluated; screening neither drops the exclusion
+        from the response entirely.  Either mistake shows up only as NVE drift.
         """
         natoms = len(Q)
         diag = np.diag_indices(natoms)
@@ -177,13 +235,17 @@ class ACKS2:
         # dE/dx, nonzero only on the charge block.  The multiplier rows are
         # geometry-free and the energy does not depend on u.
         gradient = np.zeros(A.shape[0])
-        gradient[:natoms] = self.CCOUL * (kernel.matrix() @ Q)
+        K = kernel.matrix()
+        if screen is not None:
+            K = K * screen
+        gradient[:natoms] = self.CCOUL * (K @ Q)
         lam = np.linalg.solve(A, gradient)
         lam_q, lam_u = lam[:natoms], lam[natoms : 2 * natoms]
 
         # -lam^T (dA/dr) x for the Coulomb block, as a weight on the kernel.
         # Entry (i, j) and entry (j, i) each hold the whole pair term, so the
         # weight is halved to match the convention `compute_coulomb` uses.
+        # Unscreened, for the reason in the docstring.
         W = -0.5 * (lam_q[:, None] * Q[None, :] + lam_q[None, :] * Q[:, None])
         coulomb_dr, coulomb_de = kernel.contract(W)
 
@@ -223,9 +285,105 @@ class ACKS2:
             self.ewald_key = key
         return self.ewald.bind(pos, vecs, rij)
 
-    def __call__(
-        self, pos, pbc, cell, term_dict: dict
-    ) -> tuple[float, np.ndarray, np.ndarray]:
+    # -- the intramolecular exclusion ---------------------------------------
+
+    def _local(self, pairs):
+        """`pairs`, global indices, mapped into term order.
+
+        Conflating the two orders is the silent failure the class docstring
+        warns about: they coincide whenever the atom terms were collected in
+        index order, which is the common case, so a mistake here shows up only
+        once a template is matched onto a live system in a different order.
+        """
+        pairs = np.asarray(pairs, dtype=int)
+        if pairs.size == 0:
+            return pairs.reshape(0, 2)
+        local = self.order[pairs[:, :2]]
+        if np.any(local < 0):
+            raise KeyError(
+                "A `coulombexclusion` term names an atom with no `atom` term; "
+                "the exclusion and the charge equilibration disagree about "
+                "which atoms exist."
+            )
+        return local
+
+    def exclusion_energy(self, pairs) -> float:
+        """What removing `pairs` from the Coulomb sum is worth, in eV.
+
+        `E = CCOUL sum_{i<j} Q_i Q_j K_ij` over the whole system, so dropping a
+        pair costs exactly `-CCOUL Q_i Q_j K_ij` -- one lookup per pair into the
+        kernel matrix `prepare` has already built and memoized.  That is the
+        whole cost of putting this correction on a diabatic state's diagonal,
+        which is what makes it affordable to evaluate per state where the
+        charges themselves are not.
+
+        Requires `prepare` to have run at the current geometry; the charges it
+        reads are the unscreened ones, identically so for every state.
+        """
+        local = self._local(pairs)
+        if len(local) == 0:
+            return 0.0
+        i, j = local[:, 0], local[:, 1]
+        K = self.kernel.matrix()
+        return -self.CCOUL * float(np.sum(self.Q[i] * self.Q[j] * K[i, j])) * units.eV
+
+    def screen_matrix(self, weighted_pairs):
+        """`1 - sum_s w_s M_s`, in term order, or None if nothing is excluded.
+
+        `weighted_pairs` is a list of `(pairs, weight)`: one entry per diabatic
+        state, `pairs` its excluded pairs in global indices and `weight` its
+        ground-state weight.  Blocks are atom-disjoint and a block's weights sum
+        to one, so a pair bonded in every state of its block comes out at
+        exactly 0 and the arithmetic never runs past it.
+
+        This is the object `compute_coulomb`'s docstring calls a fractional
+        screen, and it is not an approximation: it is the Hellmann-Feynman
+        contraction `sum_s w_s dE_s/dr` written as a single weight matrix, which
+        is legitimate because every state's correction is linear in its own mask
+        and the kernel contraction is linear in the weight.  One contraction and
+        one adjoint solve therefore serve the whole system, where a literal
+        per-state evaluation would cost one of each per diabatic state.
+        """
+        if not weighted_pairs:
+            return None
+        screen = np.ones((self.natoms, self.natoms))
+        for pairs, weight in weighted_pairs:
+            local = self._local(pairs)
+            if len(local) == 0:
+                continue
+            i, j = local[:, 0], local[:, 1]
+            np.subtract.at(screen, (i, j), weight)
+            np.subtract.at(screen, (j, i), weight)
+        return screen
+
+    def screen_from_terms(self, term_dict):
+        """The screen a single topology's `coulombexclusion` terms describe.
+
+        The one-state case of `screen_matrix`, for every caller that evaluates
+        one fixed bonding pattern rather than an EVB ground state: `evb.py`,
+        `fit/dissociation.py`, and `__call__` itself.  Returns None when a term
+        list carries no exclusions, so a dataset that predates them evaluates
+        exactly the unscreened kernel it always did.
+        """
+        params = term_dict.get("coulombexclusion")
+        if params is None:
+            return None
+        return self.screen_matrix([(params["atoms"], 1.0)])
+
+    # -- evaluation ----------------------------------------------------------
+
+    def prepare(self, pos, pbc, cell, term_dict: dict) -> np.ndarray:
+        """Solve the charges at this geometry and cache what `compute` needs.
+
+        Separated from `compute` because the charges are available before the
+        exclusion is: `System.calculate` cannot know which pairs to screen until
+        it has diagonalized the EVB blocks, and it cannot build those blocks'
+        diagonal corrections without the charges.  Nothing here depends on the
+        bond graph, which is exactly why the order works.
+
+        Returns the term-order-to-global index array, for a caller that needs to
+        talk about atoms in term order.
+        """
         pbc = np.asarray(pbc, dtype=bool)
         vecs = pos[:, None, :] - pos[None, :, :]
         if np.any(pbc):
@@ -243,19 +401,59 @@ class ACKS2:
         rij = np.sqrt(np.sum(vecs * vecs, -1))
         kernel = self.get_kernel(pos[indices], vecs, rij, pbc, cell)
 
+        order = np.full(int(indices.max()) + 1, -1, dtype=int)
+        order[indices] = np.arange(len(indices))
+
+        self.indices = indices
+        self.order = order
+        self.kernel = kernel
+        self.rij = rij
+        self.vecs = vecs
+        self.params = params
+        self.natoms = len(indices)
+        self.shape = pos.shape
+
         # Cache on the parameters and the cell as well as the geometry: the same
         # positions with a different set of atom terms is a different problem,
-        # and so is the same system in a cell a barostat has just rescaled.
+        # and so is the same system in a cell a barostat has just rescaled.  The
+        # bonding is deliberately absent from the key -- the solve does not
+        # depend on it, and a key that pretended otherwise would throw the
+        # charges away after every reaction for nothing.
         state_hash = hash(
-            (pos.tobytes(), indices.tobytes(), np.asarray(cell, dtype=float).tobytes())
+            (
+                pos.tobytes(),
+                indices.tobytes(),
+                np.asarray(cell, dtype=float).tobytes(),
+            )
         )
         if self.Q is None or state_hash != self.state_hash:
             self.Q, self.u, self.A = self.solve_charges(rij, params, kernel)
             self.state_hash = state_hash
+        return indices
 
-        e_tot, f_tot, w_tot = self.compute_coulomb(self.Q, rij, vecs, kernel)
+    def compute(self, screen=None) -> tuple[float, np.ndarray, np.ndarray]:
+        """Energy, forces and virial of the screened Coulomb functional.
+
+        All three are derived from the one functional
+        `E = CCOUL/2 sum_ij S_ij Q_i Q_j K_ij`, so they are consistent with each
+        other whatever `S` is -- including the fractional screen an EVB ground
+        state produces.  `S` is held fixed under the derivative, which is
+        correct and not an omission: the weights it is built from are
+        eigenvector components, and a Hellmann-Feynman gradient does not
+        differentiate those.
+        """
+        e_tot, f_tot, w_tot = self.compute_coulomb(
+            self.Q, self.rij, self.vecs, self.kernel, screen
+        )
         f_resp, w_resp = self.compute_response_forces(
-            self.Q, self.u, self.A, rij, vecs, params, kernel
+            self.Q,
+            self.u,
+            self.A,
+            self.rij,
+            self.vecs,
+            self.params,
+            self.kernel,
+            screen,
         )
         f_tot = f_tot + f_resp
         w_tot = w_tot + w_resp
@@ -263,6 +461,20 @@ class ACKS2:
         # scatter term-ordered forces back to global atom order.  The virial
         # needs no scatter: it is a single 3x3 sum over pairs, not a per-atom
         # quantity, so term order and global order give the same matrix.
-        forces = np.zeros_like(pos)
-        forces[indices] = f_tot
+        forces = np.zeros(self.shape)
+        forces[self.indices] = f_tot
         return e_tot, forces, w_tot
+
+    def __call__(
+        self, pos, pbc, cell, term_dict: dict
+    ) -> tuple[float, np.ndarray, np.ndarray]:
+        """One fixed bonding pattern, screened by its own exclusion terms.
+
+        The whole-system EVB path does not come through here -- `System` calls
+        `prepare` and `compute` around its diagonalization, because the screen
+        it wants is not any single topology's.  This is the honest statement of
+        what the term is for one topology, and what every caller outside the EVB
+        wants.
+        """
+        self.prepare(pos, pbc, cell, term_dict)
+        return self.compute(self.screen_from_terms(term_dict))

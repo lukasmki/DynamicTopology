@@ -226,17 +226,52 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # barely moved.  `TestTemplateFrequencies`, `tests/test_dissociation.py` and the
 # channel counts in `scripts/fit.py` are; the fastest stretch moved 4399 ->
 # 4639 cm^-1 and three channels that could not react now do.
+# And again for `forcefield/exclusions.py` and the refit that had to follow it.
+# **This is the first entry where both rows move, and they move for two
+# different reasons that have to be kept apart.**
+#
+#     energy_nonbonded   0.04125 -> -0.07713    (d30)     exclusions
+#                        0.84761 -> -2.13839    (d250)    exclusions
+#     energy_bonded    -1200.99732 -> -1201.00523 (d30)   refit
+#                      -1201.09232 -> -1201.09940 (d250)  refit
+#     blocks                 identical          identical
+#
+# The nonbonded row moves because the Coulomb exclusion is a screen on the
+# *whole-system* energy, weighted by the ground-state weights the EVB
+# diagonalization produces -- the one nonbonded sum in this force field that a
+# diabatic state can change.  It is nonetheless **bit-identical across the refit
+# itself**: measured on this branch with the old parameters it is already
+# -0.0771285657403261 and -2.1383859668755543, to the last bit.  So the entire
+# nonbonded move belongs to `exclusions.py` and none of it to the refit, which
+# is the same separation every entry above draws, drawn here in the one case
+# where the nonbonded row is not simply frozen.
+#
+# **Why the refit was not optional.**  Run with `exclusions.py` in place and the
+# pre-refit parameters still on disk, this box comes out at **-1201.34 eV**
+# against the -508.26 below -- overbound by 693 eV, because those depths were
+# fitted to cancel an intramolecular `ZBL` that is no longer charged.  The
+# parameters and the exclusions are a matched pair; neither half is a valid
+# force field with the other half's counterpart.
+#
+# The channel counts are where the surface change is legible, as always:
+# HCombustion goes to **19 of 19** for the first time (`rxn_08` had never been
+# fittable at any force constant), no fission channel's coupling is
+# cutoff-limited any more, and every stretch lands within 7% of q-force's own
+# frequency instead of at the `--max-k-scale` floor.  See
+# `fit.dissociation.nonbonded_curvatures`, which had been charging the
+# objective's wavenumber cap an intramolecular repulsion the calculator does not
+# apply.
 REFERENCE = {
     "tests/data/mix-n100-d30.xyz": (
-        -508.1359318992392,
-        -1200.9973178986195,
-        0.041254295990371045,
+        -508.26222229257536,
+        -1201.0052254302248,
+        -0.0771285657403261,
         87,
     ),
     "tests/data/mix-n100-d250.xyz": (
-        -503.2106293396529,
-        -1201.0923217406844,
-        0.8476084009425316,
+        -506.2036976150183,
+        -1201.0993956482316,
+        -2.1383859668755543,
         28,
     ),
 }

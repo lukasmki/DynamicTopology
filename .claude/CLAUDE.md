@@ -62,6 +62,12 @@ diagonalized state also decides the topology carried into the next step.
 6. Three nonbonded terms — electrostatics (`forcefield/acks2.py:ACKS2`), short-range repulsion
    (`forcefield/zbl.py:ZBL`) and the switched 12-6 (`forcefield/lj.py:LennardJones`) — are computed
    once on the whole system, topology-independent, and added on top. None sits on the EVB diagonal.
+   Their *intramolecular exclusions* do, because which pairs are 1-2/1-3/1-4 is exactly what a
+   diabatic state disagrees about: `forcefield/exclusions.py` derives them at load, `QForce`
+   evaluates the ZBL and 12-6 ones as ordinary additive terms, and the Coulomb one takes the route
+   that module's docstring lays out — charges solved once from the unmasked kernel, a per-state
+   scalar on the diagonal, and a single ground-state-weighted screen on the energy at the end.
+   `ACKS2.prepare` therefore runs *before* the diagonalization and `ACKS2.compute` after it.
 
 **Electrostatics is the one nonbonded term that is not short ranged**, so under full periodicity it
 is summed over images rather than truncated at the nearest one. `forcefield/ewald.py` holds both
@@ -78,9 +84,13 @@ Three things about the periodic kernel that the open-boundary one has no analogu
 - **`K_ii` is nonzero** — an atom interacts with its own images — so `build_system` *adds* the
   hardness to the Coulomb diagonal instead of overwriting it. It is 80% of the rock-salt energy in
   `test_ewald.py`, not a rounding term.
-- **The `k = 0` term is dropped**, which is only legal because `build_system` constrains
-  `sum_i q_i = 0`: a constant added to every entry of `K` scales as `(sum_i q_i)^2` in the energy
-  and `sum_i q_i` in each ACKS2 row. A charged system would need it back.
+- **The `k = 0` term is dropped and its background put back.** Dropping it is legal only because
+  `build_system` constrains `sum_i q_i = 0`: a constant added to every entry of `K` scales as
+  `(sum_i q_i)^2` in the energy and `sum_i q_i` in each ACKS2 row. That made every *neutral*
+  contraction right and every individual `K_ij` meaningless — it drifted with `kappa`. The Coulomb
+  exclusion contracts `K` against a non-neutral weight and needs the entries themselves, so
+  `Ewald.background` is now carried explicitly. It changes no energy, force or charge that predates
+  it, by the same `(sum_i q_i)^2` argument.
 - **Reciprocal vectors strain inversely to positions** (`k -> (I - e) k`), which is where the
   reciprocal virial comes from; the structure factor is invariant, so there is no `v_a v_b` term.
 

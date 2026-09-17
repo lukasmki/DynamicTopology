@@ -14,6 +14,7 @@ from .topology import Topology
 from .network import ReactionNetwork
 
 from .types import Term
+from ..forcefield.exclusions import with_exclusions
 
 # Atom pairs the bimolecular pair scan holds at once.  At 24 bytes a pair (a
 # 3-vector of displacements) this caps its scratch near 25 MB, so the scan stays
@@ -487,6 +488,13 @@ class ReactionSet:
                     terms: list[Term] = [json.loads(term) for term in fp.readlines()]
 
                 assert isinstance(atoms, Atoms)
+                # Intramolecular nonbonded exclusions, derived here rather than
+                # stored in the `.jsonl`.  They are a function of the bond graph
+                # and of `lj.EXCLUSION_DEPTH`, so deriving them keeps them
+                # correct when either changes, and keeps the term files to the
+                # parameters a fit actually produces.  A dataset shipping its
+                # own exclusions explicitly is left alone.
+                terms = with_exclusions(terms, atoms.get_atomic_numbers())
                 # A template that already states its shift keeps it.  Templates
                 # whose Morse depths have been fitted to carry the atomization
                 # energy state it as zero, and synthesizing another one here

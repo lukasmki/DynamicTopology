@@ -304,13 +304,22 @@ def test_a_violent_collision_stays_bounded(reaction_set):
 def test_the_collision_collapses_without_the_repulsion(reaction_set, monkeypatch):
     """Anti-vacuity: the test above must fail on the pre-LJ surface.
 
-    One `setattr` is the whole removal, which is itself the point.  Its
-    predecessor was a *pair* -- a whole-system Lennard-Jones sum and the
-    per-molecule `exclusion` terms that cancelled its intramolecular half -- and
-    stubbing only one of them left every molecule carrying a large residual of
-    the other.  `ZBL` has no second half to forget.
+    The removal is a *pair*, and it has to be.  This docstring used to say `ZBL`
+    had no second half to forget -- true until `forcefield/exclusions.py` gave it
+    one.  `zblexclusion` cancels the whole-system sum between near neighbours, so
+    stubbing `ZBL.__call__` alone leaves every molecule carrying the
+    cancellation of a term that is no longer there: a spurious intramolecular
+    *attraction*, which held the colliding pair at 3.47 A and so made this
+    anti-vacuity check pass for precisely the reason it exists to rule out.
+    That is the same trap its own predecessor fell into with the 12-6, one term
+    later.
+
+    `QForce` dispatches by looking up `compute_<type>` and silently skips a type
+    with no method, so deleting the method is the whole removal of the second
+    half -- and there is no zero-shaped return to get wrong.
     """
     from DynamicTopology.forcefield.zbl import ZBL
+    from DynamicTopology.forcefield.qforce import QForce
 
     monkeypatch.setattr(
         ZBL,
@@ -321,6 +330,7 @@ def test_the_collision_collapses_without_the_repulsion(reaction_set, monkeypatch
             np.zeros((3, 3)),
         ),
     )
+    monkeypatch.delattr(QForce, "compute_zblexclusion", raising=False)
 
     closest, _ = collide(reaction_set, SPEEDS[0])
     assert closest < COLLAPSED, (

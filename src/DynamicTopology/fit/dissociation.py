@@ -382,6 +382,12 @@ def _nonbonded_key(atoms: Atoms, term_dict: dict) -> tuple:
         # cache rather than read a stale number out of it.
         _params("atom"),
         _params("lennardjones"),
+        # And the exclusions, which `nonbonded_curvatures` now reads.  Without
+        # them a raw `.jsonl` and the same list `with_exclusions` has been
+        # applied to hash identically and the second caller reads the first
+        # one's answer -- which is the whole-system sum, uncorrected.
+        _params("exclusion"),
+        _params("zblexclusion"),
     )
 
 
@@ -661,7 +667,30 @@ def bond_curvatures(atoms: Atoms, terms: list[Term]) -> list[float]:
         forces = forces + _nonbonded(moved, term_dict)[1]
         return float(np.dot(forces[j], unit))
 
-    step = 1e-3
+    # 1e-4, not the 1e-3 a central difference would otherwise want.  The shape
+    # term is clamped at `dr = 0` (`s = a max(dr, 0)`), so a bond sitting
+    # exactly there has the correction on one side of the stencil and not the
+    # other, and the difference picks up an O(step) contribution that the true
+    # second derivative does not have -- `c * s**3` is cubic, so it contributes
+    # nothing to the curvature at the clamp.
+    #
+    # A bond sits exactly there whenever `fit_bond_lengths` can solve its
+    # geometry condition exactly, which after `forcefield/exclusions.py` is
+    # every homonuclear diatomic: the intramolecular nonbonded is removed
+    # entirely, so the Morse is the only force along the bond and `r0` lands on
+    # the bond length.  Measured on O2 against the analytic 217.856:
+    #
+    #     step 1e-2   224.748   +6.892
+    #     step 1e-3   218.594   +0.738
+    #     step 1e-4   217.930   +0.074
+    #     step 1e-5   217.863   +0.007
+    #
+    # Linear in the step, as an artifact of straddling the clamp has to be.
+    # 1e-4 puts it under a tenth of an eV/A**2 -- 0.03% on O2, a few cm^-1 on
+    # the wavenumber this feeds -- at no cost, since this function is called for
+    # the report and the tests and never from the objective's inner loop, which
+    # uses `stretch_curvatures`.
+    step = 1e-4
     types = bond_types(terms)
     totals = [0.0] * len(types)
     counts = [0] * len(types)
@@ -748,6 +777,37 @@ def nonbonded_curvatures(atoms: Atoms, terms: list[Term]) -> list[float]:
     topology.set_terms(terms)
     term_dict = topology.term_dict
 
+    # The exclusions belong to this half of the split, not to the Morse's.
+    # `_nonbonded` sums `ZBL`, the 12-6 and ACKS2 over every pair with no
+    # reference to the bond graph -- that is the property that puts those three
+    # outside the EVB at all -- and the intramolecular correction to them is
+    # carried as ordinary `QForce` terms, which is what `bond_curvatures` picks
+    # up by assembling the whole force field and this function did not.
+    #
+    # Leaving it out charged the objective an intramolecular `ZBL` the
+    # calculator does not apply: 33.4 eV/A**2 on H2's own bond, against a
+    # *total* excluded curvature of 26.2.  H2 scored 5674 cm^-1 where
+    # `bond_curvatures` -- and `report_force_constants`, which reads it --
+    # reported 3762, so the objective spent every force constant it was allowed
+    # to spend pulling a wavenumber under a cap it was never over.  Every bond
+    # type in both datasets ran to the `--max-k-scale` floor, and the report
+    # said the cap was satisfied while it happened.
+    #
+    # `coulombexclusion` is deliberately not here: it is not a `QForce` term at
+    # all (see `forcefield/exclusions.py` on why Coulomb cannot be subtracted
+    # additively), so `bond_curvatures` does not see it either and this stays
+    # the same quantity.
+    #
+    # Nothing the fit varies appears in any of them, so they are exactly as
+    # frozen as the rest of this measurement and stay on the cached path.
+    excluded = [term for term in terms if term["type"].endswith("exclusion")]
+    exclusion_dict: dict = {}
+    if excluded:
+        exclusion_topology = Topology.from_terms(terms, atoms)
+        exclusion_topology.set_terms(excluded)
+        exclusion_dict = exclusion_topology.term_dict
+    qforce = QForce(bond_form="morse")
+
     types = bond_types(terms)
     grouping: list[tuple[int, int]] = []
     for term in terms:
@@ -772,7 +832,13 @@ def nonbonded_curvatures(atoms: Atoms, terms: list[Term]) -> list[float]:
         unit = atoms.positions[j] - atoms.positions[i]
         unit = unit / np.linalg.norm(unit)
         moved.positions[j] = moved.positions[j] + delta * unit
-        return float(np.dot(_nonbonded(moved, term_dict)[1][j], unit))
+        forces = _nonbonded(moved, term_dict)[1]
+        if exclusion_dict:
+            forces = (
+                forces
+                + qforce(moved.positions, moved.pbc, moved.cell, exclusion_dict)[1]
+            )
+        return float(np.dot(forces[j], unit))
 
     step = 1e-3
     totals = [0.0] * len(types)

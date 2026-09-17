@@ -53,7 +53,7 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # Where each fission's diabats cross, from `fit.coupling.find_crossing` -- the
 # `r0` written into the channel's own term file.  A refit is allowed to move
 # these; they are quoted so a scan can be aimed, not as a bar.
-CROSSINGS = {"H2": 2.393, "OH": 2.943}
+CROSSINGS = {"H2": 2.210, "OH": 2.078}
 
 
 @pytest.fixture(scope="module")
@@ -230,7 +230,7 @@ class TestFission:
         assert steps[0]["bonds"] == 2
         assert steps[-1]["bonds"] == 1
         broke = next(s for s in steps if s["bonds"] == 1)
-        assert broke["x"] == pytest.approx(3.86, abs=0.4)
+        assert broke["x"] == pytest.approx(2.42, abs=0.4)
 
 
 class TestAdmission:
@@ -374,10 +374,14 @@ class TestRecombination:
         no stabilization to lose.  Fitted without the outer condition, `rxn_08`'s
         coupling was still worth 0.2 eV at 4.0 A and the energy stepped by
         exactly that when a dissociating OH...H drifted past the cutoff.  With it,
-        H2 leaves the basis at 3.44 A -- through the `eps` gate, well inside the
-        cutoff, which is the point -- for 8e-7 eV.
+        H2 leaves the basis at 3.16 A -- through the `eps` gate, well inside the
+        cutoff, which is the point -- for 1.5e-6 eV.
+
+        The distance is a force-field property and a refit moves it, so the scan
+        starts well inside it; what is asserted is that the exit is decided by
+        the `eps` gate rather than by the cutoff, and that it is free.
         """
-        steps = stretch(reaction_set, "H2", np.arange(3.20, 4.20, 0.002), False)
+        steps = stretch(reaction_set, "H2", np.arange(2.60, 4.20, 0.002), False)
         left = next(
             i
             for i in range(1, len(steps))

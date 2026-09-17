@@ -41,7 +41,7 @@ from DynamicTopology.core.topology import Topology
 # Defaults preserved from before this script grew options, so existing
 # invocations keep behaving the same way.
 DEFAULT_TEMPERATURE = 2000.0  # K
-DEFAULT_FRICTION = 0.01  # 1/fs
+DEFAULT_FRICTION = 0.005  # 1/fs
 DEFAULT_INTERVAL = 5  # steps between trajectory frames
 
 # The timestep follows from the fastest mode on the surface, and nothing else:

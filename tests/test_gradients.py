@@ -417,6 +417,96 @@ class TestACKS2Gradients:
         f_fd = finite_difference_forces(energy_fn, positions)
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
 
+    @pytest.mark.parametrize("positions", [POS_3, POS_H2O2], ids=["n3", "h2o2"])
+    @pytest.mark.parametrize("periodic", [False, True], ids=["open", "pbc"])
+    def test_screened_call_forces(self, positions, periodic):
+        """The intramolecular exclusion, as a *fractional* screen.
+
+        This is the geometry `System.calculate` actually evaluates: the screen
+        is `1 - sum_s w_s M_s` over an EVB block's states, so its entries are
+        arbitrary numbers in [0, 1] rather than 0 or 1.  The weights are held
+        fixed here, which is the same thing the Hellmann-Feynman contraction
+        does to them -- they are eigenvector components, and the ground-state
+        gradient does not differentiate those.
+
+        Two asymmetries have to be right at once for this to pass, and each one
+        fails silently on its own.  `dE/dQ` carries the screen because the
+        energy does; the `-lam^T (dA/dr) x` weight does *not*, because `A` is
+        built from the unscreened kernel.  Screening both, or neither, still
+        gives plausible forces and an NVE trajectory that drifts.
+        """
+        params = self._TERM_DICT["atom"]["kwargs"]
+        n = len(positions)
+        term_dict = {
+            "atom": {
+                "atoms": np.array([[i] for i in range(n)]),
+                "kwargs": {k: v[:n] for k, v in params.items()},
+            }
+        }
+        pbc = np.ones(3, dtype=bool) if periodic else PBC
+        cell = np.eye(3) * 9.0 if periodic else CELL
+
+        # Deliberately irrational, deliberately not 0 or 1, and symmetric.
+        screen = np.ones((n, n))
+        for k, (i, j) in enumerate((i, j) for i in range(n) for j in range(i + 1, n)):
+            screen[i, j] = screen[j, i] = 1.0 - 0.2 - 0.13 * (k % 5)
+
+        def energy_fn(p):
+            acks2 = ACKS2()
+            acks2.prepare(p, pbc, cell, term_dict)
+            return acks2.compute(screen)[0]
+
+        acks2 = ACKS2()
+        acks2.prepare(positions, pbc, cell, term_dict)
+        _, f_analytical, _ = acks2.compute(screen)
+        f_fd = finite_difference_forces(energy_fn, positions)
+        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
+
+    def test_the_screen_does_not_move_the_charges(self):
+        """Screening the energy must leave the equilibration alone.
+
+        The whole reason the exclusion is a screen on the *energy* and not a
+        mask on the matrix is that the charges have to stay a function of the
+        coordinates and the elements alone -- topology-free, hence the same on
+        every diabatic state, hence solvable once outside the EVB Hamiltonian.
+        A mask inside `build_system` is what
+        `test_evb_invariants.TestPivotInvariance` measured at 0.88 eV.
+        """
+        n = len(POS_H2O2)
+        screen = np.ones((n, n))
+        screen[0, 1] = screen[1, 0] = 0.0
+
+        plain = ACKS2()
+        plain.prepare(POS_H2O2, PBC, CELL, self._TERM_DICT)
+        plain.compute(None)
+
+        screened = ACKS2()
+        screened.prepare(POS_H2O2, PBC, CELL, self._TERM_DICT)
+        screened.compute(screen)
+
+        np.testing.assert_allclose(screened.Q, plain.Q, atol=0.0, rtol=0.0)
+
+    def test_the_screen_removes_exactly_the_pair(self):
+        """`exclusion_energy` is what a screened pair is worth, to the last bit.
+
+        The per-state diagonal correction and the screened energy are two
+        routes to the same number -- the first is what `System` puts on an EVB
+        diagonal, the second what it evaluates once at the end -- and the
+        identity between them is what stops the exclusion being counted twice
+        or not at all.
+        """
+        acks2 = ACKS2()
+        acks2.prepare(POS_H2O2, PBC, CELL, self._TERM_DICT)
+        unscreened = acks2.compute(None)[0]
+
+        pairs = np.array([[0, 1], [0, 2], [1, 3]])
+        screen = acks2.screen_matrix([(pairs, 1.0)])
+        screened = acks2.compute(screen)[0]
+
+        correction = acks2.exclusion_energy(pairs)
+        assert screened - unscreened == pytest.approx(correction, abs=1e-12)
+        assert abs(correction) > 1e-3, "a vacuous correction proves nothing"
+
     @pytest.mark.parametrize("seed", [0, 1, 2])
     def test_invariant_under_atom_relabeling(self, seed):
         """Relabeling atoms must not change the energy, only permute the forces.
@@ -498,6 +588,71 @@ class TestZBLGradients:
         _, f_analytical, _ = self.zbl(positions, numbers, PBC, CELL)
         f_numerical = finite_difference_forces(energy_fn, positions)
         np.testing.assert_allclose(f_analytical, f_numerical, atol=1e-5, rtol=1e-5)
+
+    @pytest.mark.parametrize(
+        "positions", [POS_2, POS_3, POS_4, POS_H2O2], ids=["n2", "n3", "n4", "h2o2"]
+    )
+    def test_exclusion(self, positions):
+        """`QForce.compute_zblexclusion`, the negative of the term above.
+
+        The counterpart of `TestLennardJonesGradients.test_exclusion`, and the
+        one of the two that carries the physics: tapered ZBL is 5.2-5.5 eV at an
+        O-H bond length where the switched 12-6 is 1e-3.  It is also the one
+        with a unit trap in it -- `zbl.pair_potential` works in eV and Angstrom
+        while `QForce` works in kJ/mol and nm -- so a wrong conversion here is a
+        force that is out by a constant factor and conservative anyway, which
+        finite differences against the same method would never catch.  These
+        run against `ZBL` itself in `test_the_two_forms_cancel`.
+        """
+        n = len(positions)
+        numbers = np.array([8.0 if i % 2 == 0 else 1.0 for i in range(n)])
+        rows = [[i, j] for i in range(n) for j in range(i + 1, n)]
+        td = make_term(
+            "zblexclusion",
+            rows,
+            z1=[numbers[i] for i, _ in rows],
+            z2=[numbers[j] for _, j in rows],
+        )
+        qf = QForce()
+
+        def energy_fn(p):
+            return qf(p, PBC, CELL, td)[0]
+
+        _, f_analytical, _ = qf(positions, PBC, CELL, td)
+        f_fd = finite_difference_forces(energy_fn, positions)
+        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize(
+        "positions", [POS_2, POS_3, POS_4, POS_H2O2], ids=["n2", "n3", "n4", "h2o2"]
+    )
+    def test_the_two_forms_cancel(self, positions):
+        """One small molecule: every pair is excluded, so the sum is zero.
+
+        Asserted to machine precision, not to a tolerance -- `ZBL` and
+        `compute_zblexclusion` call the same `pair_potential`, so this is an
+        identity and not an approximation.  It is the identity that makes a
+        template's gas-phase minimum the q-force potential's own minimum, which
+        is what `forcefield/exclusions.py` exists to arrange; the unit
+        conversion has to be exactly inverted for it to hold.
+        """
+        n = len(positions)
+        numbers = np.array([8 if i % 2 == 0 else 1 for i in range(n)])
+        rows = [[i, j] for i in range(n) for j in range(i + 1, n)]
+        td = make_term(
+            "zblexclusion",
+            rows,
+            z1=[float(numbers[i]) for i, _ in rows],
+            z2=[float(numbers[j]) for _, j in rows],
+        )
+
+        total, total_forces, total_virial = self.zbl(positions, numbers, PBC, CELL)
+        cancel, cancel_forces, cancel_virial = QForce()(positions, PBC, CELL, td)
+        assert abs(total) > 1.0, "a vacuous cancellation proves nothing"
+        assert abs(total + cancel) < 1e-9 * max(1.0, abs(total)), (
+            f"{total} does not cancel {cancel}"
+        )
+        np.testing.assert_allclose(total_forces, -cancel_forces, atol=1e-9, rtol=1e-9)
+        np.testing.assert_allclose(total_virial, -cancel_virial, atol=1e-9, rtol=1e-9)
 
     def test_forces_under_periodic_boundaries(self):
         """The minimum-image path has its own branch and its own gradient."""

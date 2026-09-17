@@ -211,6 +211,28 @@ class Ewald:
         # reciprocal sum includes and which is not a real interaction.
         self.self_term = -2 * self.kappa / np.sqrt(np.pi)
 
+        # The neutralizing background, which is what the dropped `k = 0` term
+        # leaves behind.  A constant on *every* entry of `K`, diagonal included.
+        #
+        # **It contracts to zero against any neutral weight, and that is why it
+        # was absent.**  `sum_ij q_i q_j c = c (sum_i q_i)**2`, so with the
+        # sum-zero constraint `ACKS2.build_system` imposes it changes no energy,
+        # no force and no charge this code has ever computed.  What it does
+        # change is an individual `K_ij`, which without it is not a well-defined
+        # number at all: it drifts with the splitting parameter, by 0.0054 on an
+        # O-H pair between `accuracy` 1e-4 and 1e-12 while the neutral
+        # contraction holds to ten digits.
+        #
+        # That became reachable when the intramolecular exclusion arrived.  The
+        # screened Coulomb energy contracts the kernel against `S_ij q_i q_j`,
+        # and a screen is not neutral -- the excluded pairs of a water carry
+        # `sum_{excl} q_i q_j != 0` -- so the exclusion picked up whatever
+        # `kappa` the cell happened to produce.  It showed up first in the
+        # *virial*, at 0.5% of a 7-atom box, because `kappa` is a function of
+        # the cell and a strain moves it; the energy was quietly wrong by the
+        # same mechanism without moving.
+        self.background = -np.pi / (self.kappa**2 * self.volume)
+
     def bind(self, pos, vecs, rij):
         return EwaldKernel(self, pos, vecs, rij)
 
@@ -252,6 +274,7 @@ class EwaldKernel:
             weighted_sin = self.sin * setup.weight
             K = short + weighted_cos @ self.cos.T + weighted_sin @ self.sin.T
             K[np.diag_indices_from(K)] += setup.self_term
+            K += setup.background
             self._matrix = K
         return self._matrix
 
@@ -295,4 +318,13 @@ class EwaldKernel:
             + np.einsum("k,ka,kb->ab", coeff, setup.kvecs, setup.kvecs)
             - np.eye(3) * Sk.sum()
         )
+
+        # The background reaches the strain through the volume alone -- it has
+        # no position dependence, hence no `dS_dr` term.  `V -> V (1 + tr e)`,
+        # so `d(-pi / (kappa**2 V))/de_ab = +pi / (kappa**2 V) delta_ab`, which
+        # is `-background` on the diagonal.  `kappa` is a function of the cell
+        # too and is deliberately not differentiated: the completed kernel is
+        # independent of it to the reciprocal sum's own accuracy, which is the
+        # property the background was added to restore.
+        dS_de = dS_de - np.eye(3) * (setup.background * W.sum())
         return dS_dr, dS_de

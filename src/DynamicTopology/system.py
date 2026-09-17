@@ -26,6 +26,24 @@ logger: logging.Logger = logging.getLogger(__name__)
 PIVOT_HYSTERESIS: float = 0.1
 
 
+# An empty `(0, 2)` pair list, so a state with no exclusions costs no allocation.
+_NO_PAIRS: np.ndarray = np.zeros((0, 2), dtype=int)
+
+
+def _exclusion_pairs(state: Topology) -> np.ndarray:
+    """The pairs this diabatic state's templates take out of the charge kernel.
+
+    Global atom indices, straight off the state's own term dict -- `EVBBasis`
+    has already given every state in a block its terms in order to evaluate its
+    bonded energy, so this is a dictionary lookup rather than another pass over
+    the reaction set.  A dataset that ships no `coulombexclusion` terms yields
+    nothing here and the electrostatics are unscreened, exactly as before they
+    existed.
+    """
+    params = state.term_dict.get("coulombexclusion")
+    return _NO_PAIRS if params is None else params["atoms"][:, :2]
+
+
 class System:
     def __init__(
         self,
@@ -94,6 +112,16 @@ class System:
         )
         log_debug(logger, f"Closed {len(evb_blocks)} EVB blocks")
 
+        # The charges, before anything is diagonalized.  `ACKS2.prepare` solves
+        # the *unscreened* equilibration, which depends on the coordinates and
+        # the elements alone, so it is the same problem for every diabatic state
+        # of every block and is solved once here.  What is not the same for
+        # every state is which pairs are intramolecular, and that correction
+        # needs the charges -- hence this order.  See `forcefield/exclusions.py`.
+        terms = self.reaction_set.get_terms(self.topology)
+        self.topology.set_terms(terms)
+        self.nonbonded_ff.prepare(pos, pbc, cell, self.topology.term_dict)
+
         energy = 0.0
         forces = np.zeros_like(pos)
         # dE/d(strain), a single 3x3 for the whole system.  `ase.py` divides by
@@ -102,9 +130,21 @@ class System:
         virial = np.zeros((3, 3))
         final_states: list[Topology] = []
         blocks: list[dict[str, Any]] = []
+        # One `(pairs, weight)` entry per diabatic state, accumulated across
+        # every block and handed to `ACKS2.screen_matrix` below.
+        weighted_pairs: list[tuple[np.ndarray, float]] = []
 
         for i, block in enumerate(evb_blocks):
             log_debug(logger, f"block {i}, nstates = {block.nstates}")
+
+            # What each state of this block would have the charge kernel stop
+            # counting, and what that is worth at the charges already solved.
+            # A lookup per excluded pair, which is the whole reason this can sit
+            # on a diagonal the charge solve itself could never afford to.
+            pairs = [_exclusion_pairs(state) for state in block.states]
+            corrections = np.array(
+                [self.nonbonded_ff.exclusion_energy(p) for p in pairs]
+            )
 
             if block.nstates == 1:
                 energy += block.energies[0]
@@ -114,9 +154,18 @@ class System:
                 weights = np.ones(1)
                 pivot = 0
                 gap = np.inf
-                block_energy = float(block.energies[0])
+                block_energy = float(block.energies[0] + corrections[0])
             else:
                 ham, fham, vham = block.hamiltonian()
+                # The exclusion correction goes on the diagonal and nowhere
+                # else, so it does what it is here to do -- decide which bonding
+                # pattern is lower -- while its *gradient* stays out of `fham`.
+                # Putting it there would cost one kernel contraction and one
+                # adjoint solve per state; leaving it out costs nothing, because
+                # the Hellmann-Feynman sum `sum_s w_s d(correction_s)/dr` is
+                # linear in the masks and collapses into the single screened
+                # `ACKS2.compute` call below.
+                ham[np.diag_indices(block.nstates)] += corrections
                 eigval, eigvec = np.linalg.eigh(ham)
                 statevec = eigvec[:, 0]
 
@@ -127,15 +176,23 @@ class System:
                 # is stationary, so its own derivative contributes nothing at
                 # first order and only the matrix's explicit dependence survives.
                 virial_gs = np.einsum("i,ijab,j->ab", statevec, vham, statevec)
-                energy += energy_gs
+
+                weights = statevec * statevec
+                # `energy_gs` carries the corrections; the electrostatic term
+                # below carries them too, in the screen.  Taking them off here
+                # is what keeps `energy_bonded` the bonded energy and stops the
+                # exclusion being counted twice.  The forces need no such
+                # subtraction: `fham` never had the corrections in it.
+                energy += energy_gs - float(weights @ corrections)
                 forces += forces_gs
                 virial += virial_gs
 
-                weights = statevec * statevec
                 pivot = self._pivot(weights, block.seed_index)
                 final_states.append(block.states[pivot])
                 gap = float(eigval[1] - eigval[0])
                 block_energy = float(energy_gs)
+
+            weighted_pairs.extend(zip(pairs, (float(w) for w in weights)))
 
             blocks.append(
                 {
@@ -154,10 +211,21 @@ class System:
 
         energy_bonded = energy
 
-        # compute topology-independent nonbonded interactions
-        terms = self.reaction_set.get_terms(self.topology)
-        self.topology.set_terms(terms)
-        en_nb, fr_nb, w_nb = self.nonbonded_ff(pos, pbc, cell, self.topology.term_dict)
+        # Electrostatics, at the charges solved before the loop and screened by
+        # what the ground state just decided is bonded.  The screen is
+        # `1 - sum_s w_s M_s`: a pair intramolecular in every state of its block
+        # drops out entirely, one intramolecular in only some of them drops out
+        # by however much ground state those states hold.  That is not an
+        # interpolation -- it is `sum_s w_s d(correction_s)/dr` written as one
+        # weight matrix, which the linearity of the kernel contraction permits,
+        # so the exclusion costs no extra contraction and no extra solve.
+        #
+        # The charges themselves are never screened.  Screening them is what
+        # makes them topology-dependent, and a topology-dependent charge solve
+        # outside the EVB Hamiltonian is exactly the pivot dependence
+        # `tests/test_evb_invariants.py` measures.
+        screen = self.nonbonded_ff.screen_matrix(weighted_pairs)
+        en_nb, fr_nb, w_nb = self.nonbonded_ff.compute(screen)
         energy += en_nb
         forces += fr_nb
         virial += w_nb

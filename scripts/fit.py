@@ -80,6 +80,7 @@ from DynamicTopology.fit.coupling import (
     fit_twobody,
 )
 from DynamicTopology.forcefield.qforce import QForce, SHAPE_DECAY
+from DynamicTopology.forcefield.exclusions import with_exclusions
 from DynamicTopology.io.json import read_jsonl, write_jsonl
 
 # Masses used for the frequency report only, so a q-force force constant can be
@@ -198,14 +199,31 @@ def load_templates(
     templates = []
     for entry in manifest["molecules"]:
         stem = manifest_path.parent / entry["path"]
+        atoms = io.read(stem.with_suffix(".xyz"))
+        # The same exclusions `ReactionSet.load` derives, and for the reason
+        # `fit/dissociation.py` gives for routing the 12-6 through them: this
+        # has to be the *same* sum the calculator will evaluate, or a template
+        # stops reproducing the energy it was fitted to.  Fitting against an
+        # unexcluded intramolecular ZBL while the calculator excludes it is not
+        # a small disagreement -- it is 5.2 eV per O-H bond, and it is what
+        # pins `r0` a quarter of an Angstrom inside the real bond length.
+        # Stripped again by `strip_exclusions` before anything is written, since
+        # the term files carry parameters and the exclusions are derived.
         templates.append(
             (
                 stem.name,
-                io.read(stem.with_suffix(".xyz")),
-                read_jsonl(stem.with_suffix(".jsonl")),
+                atoms,
+                with_exclusions(
+                    read_jsonl(stem.with_suffix(".jsonl")), atoms.get_atomic_numbers()
+                ),
             )
         )
     return templates
+
+
+def strip_exclusions(terms: list) -> list:
+    """`terms` without the derived exclusions, for writing back to a `.jsonl`."""
+    return [term for term in terms if not term["type"].endswith("exclusion")]
 
 
 def load_reactions(
@@ -512,7 +530,11 @@ def main() -> int:
         report_force_constants(fit, args.max_wavenumber)
         if not args.dry_run:
             for (name, _, _), stem in zip(templates, molecule_stems):
-                write_jsonl(stem.with_suffix(".jsonl"), fit.terms[name], exist_ok=True)
+                write_jsonl(
+                    stem.with_suffix(".jsonl"),
+                    strip_exclusions(fit.terms[name]),
+                    exist_ok=True,
+                )
         print()
 
     elif args.bonds:
@@ -533,7 +555,9 @@ def main() -> int:
             )
             fitted_terms.append(fitted)
             if not args.dry_run:
-                write_jsonl(stem.with_suffix(".jsonl"), fitted, exist_ok=True)
+                write_jsonl(
+                    stem.with_suffix(".jsonl"), strip_exclusions(fitted), exist_ok=True
+                )
         install_templates(reaction_set, templates, fitted_terms)
         print()
 
@@ -660,7 +684,9 @@ def main() -> int:
             f"{stem.name:<16}{kwargs['A']:>12.4f}{kwargs['a']:>12.2f}{centre}  {source}"
         )
         if not args.dry_run:
-            write_jsonl(stem.with_suffix(".jsonl"), terms, exist_ok=True)
+            write_jsonl(
+                stem.with_suffix(".jsonl"), strip_exclusions(terms), exist_ok=True
+            )
         fitted += 1
 
     if cutoff_limited:

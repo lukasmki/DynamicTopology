@@ -379,6 +379,51 @@ class QForce:
         np.add.at(f, atoms[:, 1], -dv)
         return e_tot, f, self._virial((v, dv))
 
+    def compute_zblexclusion(self, vecs, atoms, z1, z2):
+        """Cancels the global ZBL repulsion between near neighbours.
+
+        The counterpart of `compute_exclusion` for `forcefield/zbl.py`, and it
+        exists for the same reason: that term is summed over every pair in the
+        system so that it is the same number on every diabatic state, and what
+        is topology-dependent is which pairs should not have been counted.
+
+        This is the exclusion that matters most.  Tapered ZBL is 5.2-5.5 eV at
+        an O-H bond length and falls to zero by 1.6 A, so leaving it inside a
+        template makes the Morse depth cancel a 5 eV step rather than describe a
+        bond.  H3O+ is where that cancellation failed -- fitted depth 5.76 eV
+        against a 5.21 eV step, leaving the isolated cation's true minimum at
+        1.60 A.  See `forcefield/exclusions.py`.
+
+        **Unit trap, and it is the opposite of `compute_exclusion`'s.**
+        `lj.pair_potential` is unit-agnostic, so that method can hand it q-force's
+        nm directly.  `zbl.pair_potential` is *not*: `SCREENING_LENGTH` is in
+        Angstrom and `CCOUL` in eV*Angstrom, so `r` has to be converted going in
+        and the result converted coming back, into the kJ/mol and kJ/mol/nm that
+        `__call__` expects to scale at the end.  Getting this wrong by the factor
+        of ten would leave the energy right and the forces wrong.
+        """
+        from DynamicTopology.forcefield.zbl import pair_potential
+
+        kjmol = units.kJ / units.mol  # eV per kJ/mol
+
+        v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3) in nm, atom0 -> atom1
+        r = np.sqrt(np.sum(v * v, -1))  # (n,) in nm
+        u, du_dr = pair_potential(r * 10.0, z1, z2)  # eV, eV/Angstrom
+
+        # e = -u, converted from eV to kJ/mol.
+        e_tot = -float(np.sum(u)) / kjmol
+        # de/dr in kJ/mol/nm: minus the eV/Angstrom derivative, times 10
+        # Angstrom per nm, divided by the energy conversion.
+        de_dr = -du_dr * 10.0 / kjmol
+        dv = (de_dr / r)[:, None] * v  # (n, 3)
+
+        n_atoms = vecs.shape[0]
+        f = np.zeros((n_atoms, 3))
+        # F = -dE/d(pos)
+        np.add.at(f, atoms[:, 0], dv)
+        np.add.at(f, atoms[:, 1], -dv)
+        return e_tot, f, self._virial((v, dv))
+
     def compute_angle(self, vecs, atoms, theta0, k):
         va = vecs[atoms[:, 0], atoms[:, 1]]  # (n, 3)
         vb = vecs[atoms[:, 2], atoms[:, 1]]  # (n, 3)

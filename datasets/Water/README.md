@@ -13,9 +13,9 @@ at wB97X-V/aug-cc-pVTZ.
 
 | id | channel | atoms | A (eV) | a (1/A^2) |
 |----|---------|-------|--------|-----------|
-| 1 | `reactions/h3o-h2o-transfer`  | H3O+ + H2O <-> H2O + H3O+ (Zundel) | 7 | -3.882 | 19.9 |
-| 2 | `reactions/h2o-oh-transfer`   | OH- + H2O <-> H2O + OH- (H3O2-)    | 5 | -3.987 | 23.5 |
-| 3 | `reactions/h2o-autoionization`| H2O + H2O <-> H3O+ + OH-           | 6 | -4.140 | 46.8 |
+| 1 | `reactions/h3o-h2o-transfer`  | H3O+ + H2O <-> H2O + H3O+ (Zundel) | 7 | -3.909 | 19.9 |
+| 2 | `reactions/h2o-oh-transfer`   | OH- + H2O <-> H2O + OH- (H3O2-)    | 5 | -3.896 | 23.4 |
+| 3 | `reactions/h2o-autoionization`| H2O + H2O <-> H3O+ + OH-           | 6 | -4.113 | 46.8 |
 
 All three are **atom transfers**, so all three carry a `threebody` coupling: a
 Gaussian in the transferring proton's own triangle,

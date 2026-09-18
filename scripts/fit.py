@@ -79,7 +79,8 @@ from DynamicTopology.fit.coupling import (
     fit_threebody,
     fit_twobody,
 )
-from DynamicTopology.forcefield.qforce import QForce, SHAPE_DECAY
+from DynamicTopology.forcefield.params import ForceFieldParams, active
+from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.exclusions import with_exclusions
 from DynamicTopology.io.json import read_jsonl, write_jsonl
 
@@ -193,9 +194,15 @@ def _transfer(frames):
 
 
 def load_templates(
-    manifest_path: Path, manifest: dict
+    manifest_path: Path, manifest: dict, params: ForceFieldParams
 ) -> list[tuple[str, Atoms, list]]:
-    """`(name, atoms, terms)` per molecule entry."""
+    """`(name, atoms, terms)` per molecule entry.
+
+    `params` is the dataset's own global parameters, taken from the loaded
+    `ReactionSet` and passed explicitly rather than read from the active set:
+    the exclusions derived here have to be the ones the manifest asks for, and
+    saying so at the call site is cheaper to verify than an ordering argument.
+    """
     templates = []
     for entry in manifest["molecules"]:
         stem = manifest_path.parent / entry["path"]
@@ -214,7 +221,9 @@ def load_templates(
                 stem.name,
                 atoms,
                 with_exclusions(
-                    read_jsonl(stem.with_suffix(".jsonl")), atoms.get_atomic_numbers()
+                    read_jsonl(stem.with_suffix(".jsonl")),
+                    atoms.get_atomic_numbers(),
+                    params=params,
                 ),
             )
         )
@@ -256,7 +265,7 @@ def report_force_constants(fit, max_wavenumber: float = 0.0) -> None:
         )
         k_scales = fit.k_scales or [1.0] * len(fit.variables)
         curvatures = fit.curvatures or [None] * len(fit.variables)
-        decays = fit.decays or [SHAPE_DECAY] * len(fit.variables)
+        decays = fit.decays or [active().shape_decay] * len(fit.variables)
         for variable, shape, decay, k_scale, curvature in zip(
             fit.variables, fit.scales, decays, k_scales, curvatures
         ):
@@ -452,7 +461,7 @@ def main() -> int:
         default=DEFAULT_MAX_DECAY,
         help="upper bound on the fitted shape decay `b`. Setting both bounds to "
         "the same value pins it, which is how the b sweep in "
-        "`qforce.SHAPE_DECAY` was measured.",
+        "`params.ForceFieldParams.shape_decay` was measured.",
     )
     parser.add_argument(
         "--max-k-scale",
@@ -512,7 +521,7 @@ def main() -> int:
     reaction_set = ReactionSet(manifest_path)
 
     if args.force_constants:
-        templates = load_templates(manifest_path, manifest)
+        templates = load_templates(manifest_path, manifest, reaction_set.params)
         fit = fit_force_constants(
             reaction_set,
             templates,
@@ -539,7 +548,7 @@ def main() -> int:
 
     elif args.bonds:
         print(f"{'molecule':<16}{'scale':>10}{'E_bonded':>12}{'E_reference':>13}")
-        templates = load_templates(manifest_path, manifest)
+        templates = load_templates(manifest_path, manifest, reaction_set.params)
         fitted_terms = []
         for (name, atoms, terms), stem in zip(templates, molecule_stems):
             try:

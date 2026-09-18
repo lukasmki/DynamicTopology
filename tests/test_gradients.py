@@ -9,7 +9,8 @@ import numpy as np
 import pytest
 from ase import units
 
-from DynamicTopology.forcefield.qforce import BOND_ASYMPTOTE, QForce
+from DynamicTopology.forcefield.params import active
+from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.acks2 import ACKS2
 from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.lj import LennardJones
@@ -203,11 +204,11 @@ class TestQForceGradients:
             f"Morse ({e_morse:.3f} eV) should saturate well below harmonic "
             f"({e_harm:.3f} eV) at a badly stretched bond"
         )
-        # Morse is bounded above by its asymptote, which sits at `BOND_ASYMPTOTE`
+        # Morse is bounded above by its asymptote, which sits at `bond_asymptote`
         # over the free-fragment limit rather than on it -- that offset is what
         # makes a bonded diabat cross its own fragments' instead of converging to
         # them.  Harmonic has no asymptote at all, which is the point here.
-        assert e_morse <= BOND_ASYMPTOTE * units.kJ / units.mol
+        assert e_morse <= active().bond_asymptote_kjmol * units.kJ / units.mol
 
     def test_reference(self):
         """Constant per-molecule reference shift contributes energy but no force."""

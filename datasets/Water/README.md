@@ -17,6 +17,14 @@ at wB97X-V/aug-cc-pVTZ.
 | 2 | `reactions/h2o-oh-transfer`   | OH- + H2O <-> H2O + OH- (H3O2-)    | 5 | -3.896 | 23.4 |
 | 3 | `reactions/h2o-autoionization`| H2O + H2O <-> H3O+ + OH-           | 6 | -4.113 | 46.8 |
 
+The manifest's `global_params` block pins the force field constants these terms
+were fitted at -- the two taper radii and widths, `core_fraction`,
+`exclusion_depth`, `exclude_coulomb`, `bond_asymptote` and `gamma`.  They are the
+repository defaults, written out rather than left implicit so that a later change
+to a default cannot invalidate these `.jsonl` files without a diff saying so.
+Changing one means re-running `scripts/fit.py --force-constants` here; see
+`forcefield/README.md` for the table and the units.
+
 All three are **atom transfers**, so all three carry a `threebody` coupling: a
 Gaussian in the transferring proton's own triangle,
 
@@ -177,7 +185,7 @@ and the electrostatic part of a hydrogen bond goes as `mu^2`, so that is not a
 32% error, it is a factor of 2.2 in the binding.  For scale, every fixed-charge
 water model sits *above* the gas-phase value, not below it: SPC/E `q_H = +0.4238`
 (2.35 D), TIP3P `+0.417`, TIP4P/2005 `+0.5564`.  `eta` is the lever that moves
-this -- `soft_amp`, `soft_decay` and `ewald.GAMMA` are not, and scaling any of
+this -- `soft_amp`, `soft_decay` and the kernel's `gamma` are not, and scaling any of
 them by 2 moves the dipole by under 6% -- so `eta` is scaled by 0.75, giving
 `q_H = +0.3040` and 1.711 D.
 

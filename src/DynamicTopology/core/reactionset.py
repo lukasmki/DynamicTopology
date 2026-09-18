@@ -15,6 +15,7 @@ from .network import ReactionNetwork
 
 from .types import Term
 from ..forcefield.exclusions import with_exclusions
+from ..forcefield.params import ForceFieldParams, activate
 
 # Atom pairs the bimolecular pair scan holds at once.  At 24 bytes a pair (a
 # 3-vector of displacements) this caps its scratch near 25 MB, so the scan stays
@@ -35,6 +36,11 @@ class ReactionSet:
 
     def __init__(self, path: str | Path | None = None):
         self.data = deepcopy(self.default_data)
+        # The global force field parameters this set was fitted at.  Defaults
+        # until a manifest says otherwise; `load` replaces it and activates it
+        # before a single template is read, since deriving the exclusions and
+        # solving the reference shifts both depend on them.
+        self.params: ForceFieldParams = ForceFieldParams()
         self._term_cache: dict[tuple[tuple, tuple], list] = {}
         self._bimol_hash_cache: dict[frozenset, str] = {}
         # Keyed by molecule signature rather than held on the Topology, because
@@ -476,6 +482,19 @@ class ReactionSet:
             # NOTE: should use the metadata to handle
             # merge conflicts with multiple reaction sets
 
+            # **Before anything else.**  `global_params` states the constants
+            # this dataset's `.jsonl` files were fitted at -- the two taper
+            # radii, the exclusion depth, the Morse asymptote -- and the loop
+            # below derives exclusions and solves reference shifts against
+            # exactly those.  Activating them afterwards would fit the templates
+            # on one surface and evaluate them on another, which is the silent
+            # invalidation `forcefield/params.py` exists to close.  A manifest
+            # that omits the key gets the defaults, unchanged.
+            self.params = ForceFieldParams.from_dict(
+                data.get("global_params"), source=str(path)
+            )
+            activate(self.params, source=str(path))
+
             for mol in data["molecules"]:
                 # load molecule and associated force field
                 data_path: Path = path.parent / mol["path"]
@@ -490,11 +509,13 @@ class ReactionSet:
                 assert isinstance(atoms, Atoms)
                 # Intramolecular nonbonded exclusions, derived here rather than
                 # stored in the `.jsonl`.  They are a function of the bond graph
-                # and of `lj.EXCLUSION_DEPTH`, so deriving them keeps them
-                # correct when either changes, and keeps the term files to the
-                # parameters a fit actually produces.  A dataset shipping its
+                # and of this dataset's `exclusion_depth`, so deriving them keeps
+                # them correct when either changes, and keeps the term files to
+                # the parameters a fit actually produces.  A dataset shipping its
                 # own exclusions explicitly is left alone.
-                terms = with_exclusions(terms, atoms.get_atomic_numbers())
+                terms = with_exclusions(
+                    terms, atoms.get_atomic_numbers(), params=self.params
+                )
                 # A template that already states its shift keeps it.  Templates
                 # whose Morse depths have been fitted to carry the atomization
                 # energy state it as zero, and synthesizing another one here

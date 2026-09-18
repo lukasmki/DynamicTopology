@@ -92,8 +92,8 @@ ZBL off with a Fermi function before it reaches bonding distances and hands over
 to something else.  This module does the same, with the difference that there is
 nothing to hand over to: `ACKS2` and the bonded terms are the whole of the rest.
 So the taper is placed as far out as the wall can afford rather than at the ~1 A
-those potentials use.  `TAPER_RADIUS` and `TAPER_WIDTH` are the two constants,
-and what they buy at a 64-water box and at the dimer:
+those potentials use.  `params.taper_radius` and `params.taper_width` are the
+two constants, and what they buy at a 64-water box and at the dimer:
 
     quantity                              untapered   tapered
     intermolecular ZBL, 64 waters          172 eV     0.16 eV
@@ -155,9 +155,9 @@ order.
 `forcefield/lj.py` is what replaced it, and this is the term it hands over to.
 The 12-6 is switched *on* at 2.2 A, so above that radius the repulsion and the
 dispersion are its and below it they are this module's.  The two switches are
-the same Fermi function with the same `TAPER_WIDTH`; they are deliberately
-**not** placed at the same radius, and `lj.SWITCH_RADIUS` carries the
-measurement that says why.  See `production/density-300K/README.md` for what the
+the same Fermi function with the same width; they are deliberately **not**
+placed at the same radius, and `params.switch_radius` carries the measurement
+that says why.  See `production/density-300K/README.md` for what the
 pair did to the density.
 
 Angstrom and eV throughout, unlike `QForce` and `LennardJones`, because the ZBL
@@ -167,53 +167,34 @@ between this module and its own literature.
 
 import numpy as np
 
+from DynamicTopology.forcefield.params import ForceFieldParams, resolve
+
 
 # Screening length prefactor, `0.8854 * a_0`, in Angstrom.
 SCREENING_LENGTH: float = 0.46850
-
-# Coulomb constant in eV*Angstrom, matching `ACKS2.CCOUL` to the digits ASE uses.
-CCOUL: float = 14.399645
 
 # The universal screening function `phi(x) = sum_k C[k] * exp(-B[k] * x)`.
 PHI_C: tuple[float, ...] = (0.18175, 0.50986, 0.28022, 0.02817)
 PHI_B: tuple[float, ...] = (3.19980, 0.94229, 0.40290, 0.20162)
 
 
-# Where the screened-nuclear form stops being evaluated, in Angstrom, and how
-# sharply it is switched off there.  See the module docstring for the numbers
-# these produce; this comment is for why they are these numbers.
-#
-# `TAPER_RADIUS` is bounded from both sides and the window is narrow:
-#
-#   from below  the wall has to stay ahead of the ACKS2 contact funnel at every
-#               separation, or two molecules drift through each other.  At 1.2 A
-#               the H2 + O2 approach of `tests/test_collapse.py` already reads
-#               +0.52 eV against +3.14 eV untapered, and by 1.0 A that approach
-#               is downhill -- the collapse this module exists to prevent.
-#   from above  every 0.1 A of extra reach puts roughly another 0.2 eV onto the
-#               hydrogen bond.  Measured on the water dimer, the minimum moves
-#               -0.148 eV at 2.70 A (1.4) -> -0.116 eV at 2.85 A (1.5) ->
-#               -0.090 eV at 3.00 A (1.6), against a reference of -0.218 eV at
-#               2.91 A.  1.5 puts the minimum at the right *separation* and
-#               takes the depth deficit as a known residual, which is the right
-#               way round: the position is structure and the depth is not.
-#
-# `TAPER_WIDTH` is the smallest that keeps the term smooth enough to integrate.
-# The switch contributes `-f(1-f)/w` to `du/dr`, which peaks at `1/(4w)` times
-# the potential there; at 0.12 A that peak sits at 1.5 A where O-H ZBL is
-# 1.15 eV, so it adds 2.4 eV/A of force -- large, but far under the 17.8 eV/A
-# the unmodified term already carries at the O-H bond length, and continuous in
-# every derivative because a Fermi function is analytic.
-TAPER_RADIUS: float = 1.5
-TAPER_WIDTH: float = 0.12
+# `TAPER_RADIUS`, `TAPER_WIDTH` and the Coulomb constant this module used to
+# declare are now fields of `params.ForceFieldParams` -- `taper_radius`,
+# `taper_width` and `zbl_ccoul` -- read through `params.resolve()` at call
+# time; see that module for why.
 
 
-def taper(r: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def taper(
+    r: np.ndarray, params: ForceFieldParams | None = None
+) -> tuple[np.ndarray, np.ndarray]:
     """The Fermi switch `f = 1/(1 + exp((r - rc)/w))` and its derivative.
 
-    Returns `(f, df/dr)`.  `f` runs from 1 well inside `TAPER_RADIUS` to 0 well
+    Returns `(f, df/dr)`.  `f` runs from 1 well inside `taper_radius` to 0 well
     outside it, and `df/dr = -f (1 - f) / w` is expressed through `f` itself so
     that it costs one extra multiply rather than a second `exp`.
+
+    `params` defaults to the active set -- the dataset's, once a manifest has
+    been loaded.
 
     The exponent is clipped before `np.exp` sees it.  Without that, an r far
     outside the window overflows to `inf` and the `f (1 - f)` product becomes
@@ -222,13 +203,17 @@ def taper(r: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     apart.  Clipping at 500 is far outside anything the switch resolves and
     keeps `f` exactly 0 or 1 there, which is what the analytic limit is anyway.
     """
-    z = np.clip((r - TAPER_RADIUS) / TAPER_WIDTH, -500.0, 500.0)
+    ff = resolve(params)
+    z = np.clip((r - ff.taper_radius) / ff.taper_width, -500.0, 500.0)
     f = 1.0 / (1.0 + np.exp(z))
-    return f, -f * (1.0 - f) / TAPER_WIDTH
+    return f, -f * (1.0 - f) / ff.taper_width
 
 
 def pair_potential(
-    r: np.ndarray, z1: np.ndarray, z2: np.ndarray
+    r: np.ndarray,
+    z1: np.ndarray,
+    z2: np.ndarray,
+    params: ForceFieldParams | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """The repulsion and its radial derivative, `(u, du/dr)`, in eV and eV/A.
 
@@ -242,10 +227,11 @@ def pair_potential(
     `ZBL.__call__` does.
 
     Not unit-agnostic, unlike `lj.pair_potential`: `SCREENING_LENGTH` is in
-    Angstrom and `CCOUL` in eV*Angstrom, so `r` has to be in Angstrom and the
-    result comes back in eV.  `TAPER_RADIUS` and `TAPER_WIDTH` are in Angstrom
-    for the same reason.
+    Angstrom and `params.zbl_ccoul` in eV*Angstrom, so `r` has to be in Angstrom
+    and the result comes back in eV.  `taper_radius` and `taper_width` are in
+    Angstrom for the same reason.
     """
+    ff = resolve(params)
     a = SCREENING_LENGTH / (z1**0.23 + z2**0.23)
     x = r / a
 
@@ -256,7 +242,7 @@ def pair_potential(
         phi = phi + term
         dphi_dx = dphi_dx - b * term
 
-    k = CCOUL * z1 * z2
+    k = ff.zbl_ccoul * z1 * z2
     u = k * phi / r
     # d/dr [ k phi(r/a) / r ] = k ( phi'(x)/a / r  -  phi(x) / r^2 )
     du_dr = k * (dphi_dx / (a * r) - phi / r**2)
@@ -266,7 +252,7 @@ def pair_potential(
     # curvatures -- differentiates whatever this function returns, so the
     # switch and its derivative have to travel together or the analytic
     # gradients silently stop matching the energy.
-    f, df_dr = taper(r)
+    f, df_dr = taper(r, ff)
     return f * u, f * du_dr + df_dr * u
 
 

@@ -14,5 +14,15 @@
         {"id": 1, "path" : "reactions/h3o-h2o-transfer"},
         {"id": 2, "path" : "reactions/h2o-oh-transfer"},
         {"id": 3, "path" : "reactions/h2o-autoionization"}
-    ]
+    ],
+    "global_params": {
+        "bond_asymptote": 1.0,
+        "taper_radius": 1.5,
+        "taper_width": 0.12,
+        "switch_radius": 0.22,
+        "core_fraction": 0.4,
+        "exclusion_depth": 3,
+        "exclude_coulomb": true,
+        "gamma": 2.0
+    }
 }

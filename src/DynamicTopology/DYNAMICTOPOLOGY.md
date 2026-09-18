@@ -57,6 +57,35 @@ same on every state is which pairs are intramolecular, and that correction does 
 on the diagonal — §2.3.2, which is also where the one term that cannot be written
 additively is dealt with.
 
+### Global parameters belong to the dataset
+
+Thirteen constants appear in the equations below with no symbol of their own — two
+taper radii and their widths, the Morse asymptote, the exclusion depth, the charge
+smearing width, the Coulomb constant. They are **not module constants**. Each is a
+field of `params.ForceFieldParams` ([forcefield/params.py](forcefield/params.py)),
+stated per dataset under `global_params` in the manifest, defaulted when the
+manifest omits it, and read through `params.active()` at call time:
+
+```json
+"global_params": { "taper_radius": 1.5, "exclusion_depth": 3 }
+```
+
+All but `accuracy` and `shape_decay` sit inside $E_{\text{bonded}} +
+E_{\text{nonbonded}}$, which `fit/dissociation.py` solves each template's depth
+scale against (§5.2), so each one is part of the definition of the surface a
+dataset's `.jsonl` files were fitted to. As module constants they were a property of
+the installed source tree instead, and a checkout whose taper radius had moved
+scored every dataset on a surface it was not fitted to and said nothing about it.
+`forcefield/README.md` tabulates the full set with units and defaults.
+
+`ReactionSet.load` reads the block before it touches a template — the exclusion
+derivation (§2.3.2) and the reference shift (§5.1) both depend on it — and activates
+it process-wide. Two datasets whose blocks disagree therefore cannot be loaded into
+one process: `params.activate` refuses the second, naming the fields, because
+whichever loaded second would score the first's templates on the wrong surface.
+`params.use(...)` is the explicit override for a caller that wants a different
+surface on purpose.
+
 ---
 
 ## 1. Topology, reactions, and state generation
@@ -278,8 +307,8 @@ E = D\Big[\big(1 - e^{-\alpha \Delta r}\big)^2 - 1 + c\,s^3 e^{-b s}\Big],
 s = \alpha\,\max(\Delta r, 0),
 $$
 
-with $b$ fitted per bond type alongside $c$; `SHAPE_DECAY` $= 4.0$
-([qforce.py:40](forcefield/qforce.py#L40)) is only the fallback a term file
+with $b$ fitted per bond type alongside $c$; `shape_decay` $= 4.0$
+([params.py](forcefield/params.py)) is only the fallback a term file
 written before $b$ was a parameter reads as. The $-D$ offset
 puts the dissociated limit at zero, so a topology's energy carries the depth of
 the bonds it contains and breaking a bond costs $+D$; boundedness above is what
@@ -429,10 +458,11 @@ $$
 \varphi(x) = 0.18175\,e^{-3.1998x} + 0.50986\,e^{-0.94229x} + 0.28022\,e^{-0.4029x} + 0.02817\,e^{-0.20162x}.
 $$
 
-The constants are `SCREENING_LENGTH` $= 0.46850$ Å ($= 0.8854\,a_0$), `CCOUL`
-$= 14.399645$ eV·Å, and the amplitude/decay tuples `PHI_C` / `PHI_B`
-([zbl.py:172](forcefield/zbl.py#L172)). Note `ZBL.CCOUL` and `ACKS2.CCOUL`
-$= 14.4$ are the same physical constant written to different precision.
+The constants are `SCREENING_LENGTH` $= 0.46850$ Å ($= 0.8854\,a_0$) and the
+amplitude/decay tuples `PHI_C` / `PHI_B` ([zbl.py](forcefield/zbl.py)), plus
+`zbl_ccoul` $= 14.399645$ eV·Å from the global parameters. Note `zbl_ccoul` and
+`ccoul` $= 14.4$ are the same physical constant written to different precision,
+which is why they are two fields of `ForceFieldParams` and not one.
 
 **The taper.** ZBL is a screened *nuclear* potential, fitted where two nuclei are
 close enough that the electrons between them barely intervene. It carries no
@@ -449,7 +479,7 @@ f(r) = \frac{1}{1 + e^{(r - r_c)/w}},
 r_c = 1.5\ \text{Å},\quad w = 0.12\ \text{Å}.
 $$
 
-(`TAPER_RADIUS` and `TAPER_WIDTH`, [zbl.py:207](forcefield/zbl.py#L207).) The
+(`taper_radius` and `taper_width`, [params.py](forcefield/params.py).) The
 taper is folded in **inside** `pair_potential` rather than applied by the caller
 ([zbl.py:269](forcefield/zbl.py#L269)), so $f$ and $f'$ can never travel
 separately — `fit/dissociation.py` differentiates this function for its bond
@@ -572,9 +602,9 @@ g(r) \;=\; 1 - \frac{1}{1 + e^{(r - r_s)/w}},
 $$
 
 with $\sigma$ and $\varepsilon$ combined **geometrically** in both parameters (q-force's
-`A=sqrt(A1*A2); B=sqrt(B1*B2)`, *not* Lorentz–Berthelot), $r_s =$ `SWITCH_RADIUS`
-$= 0.22$ nm and $w =$ `SWITCH_WIDTH` $=$ `zbl.TAPER_WIDTH / 10` $= 0.012$ nm — the
-same physical width, in this module's units ([lj.py:154](forcefield/lj.py#L154)).
+`A=sqrt(A1*A2); B=sqrt(B1*B2)`, *not* Lorentz–Berthelot), $r_s =$ `switch_radius`
+$= 0.22$ nm and $w =$ `switch_width` $=$ `taper_width / 10` $= 0.012$ nm — the
+same physical width, in this module's units ([params.py](forcefield/params.py)).
 
 $g$ is the same Fermi form as ZBL's $f$ run in the opposite direction, but it is
 **not $1 - f$**: the two are centred at different radii, so
@@ -582,8 +612,8 @@ $g(r) + f(10r) \ne 1$. Calling them complementary is the mistake the next paragr
 is about. Like ZBL's, the exponent is clipped at $\pm 500$
 ([lj.py:178](forcefield/lj.py#L178)).
 
-**A linear core below $0.4\sigma$** ([lj.py:104](forcefield/lj.py#L104),
-[lj.py:222](forcefield/lj.py#L222)). Below `CORE_FRACTION` $\times\ \sigma$ the
+**A linear core below $0.4\sigma$** ([params.py](forcefield/params.py),
+[lj.py:222](forcefield/lj.py#L222)). Below `core_fraction` $\times\ \sigma$ the
 potential is continued by its own tangent,
 
 $$
@@ -643,8 +673,8 @@ in this gap. `tests/test_collapse.py` is what checks nothing squeezes through it
 
 **It is a refit, for the same reason the taper was.** `fit/dissociation.py` solves
 against $E_{\text{QForce}} + E_{\text{nonbonded}}$ and this term is inside
-$E_{\text{nonbonded}}$, so changing $r_s$, $w$ or `CORE_FRACTION` invalidates every
-`.jsonl` in every dataset. What that cost is recorded in
+$E_{\text{nonbonded}}$, so changing $r_s$, $w$ or `core_fraction` invalidates every
+`.jsonl` in the dataset that states them. What that cost is recorded in
 [production/density-300K/README.md](../../production/density-300K/README.md).
 
 **The decomposition, and it is live.** LJ depends on the topology only through
@@ -654,7 +684,7 @@ $$
 E_{\text{LJ}}(\text{state}) \;=\; \underbrace{\sum_{i<j} u_{ij}}_{\text{topology-free}} \;-\; \underbrace{\sum_{\substack{i<j \\ d_G(i,j)\,\le\,3}} u_{ij}}_{\text{per-molecule exclusion terms}}
 $$
 
-with $d_G$ the bond-graph distance and depth 3 (`EXCLUSION_DEPTH`, GROMACS
+with $d_G$ the bond-graph distance and depth 3 (`exclusion_depth`, GROMACS
 `nrexcl = 3`). The calculator evaluates the first sum once on the whole system and
 the second per diabatic state, through `QForce.compute_exclusion`
 ([qforce.py:334](forcefield/qforce.py#L334)); `forcefield/exclusions.py` derives the
@@ -675,7 +705,7 @@ the excluded and the counted branch use identical numbers.
 `compute_zblexclusion` ([qforce.py:382](forcefield/qforce.py#L382)) is the same
 construction for `ZBL`, and it carries the **opposite** unit trap:
 `lj.pair_potential` is unit-agnostic and can be handed q-force's nm directly, while
-`zbl.pair_potential` is not — `SCREENING_LENGTH` is in Å and `CCOUL` in eV·Å, so $r$
+`zbl.pair_potential` is not — `SCREENING_LENGTH` is in Å and `zbl_ccoul` in eV·Å, so $r$
 converts going in and the result converts coming back. Getting that wrong leaves the
 energy right and the forces wrong by a factor of ten.
 `tests/test_gradients.py::TestZBLGradients` and `tests/test_stress.py` now assert
@@ -728,7 +758,7 @@ exploits.
 
 **Parameter names.** The term kwargs are `mu` ($\mu$), `eta` ($\eta$), `soft_amp`
 ($\chi$) and `soft_decay` ($\tau$); there are no `chi` or `tau` keys. The kernel
-width $\gamma$ is `ewald.GAMMA` $= 2.0$ Å⁻¹, named once and shared by both kernel
+width $\gamma$ is `params.gamma` $= 2.0$ Å⁻¹, named once and shared by both kernel
 implementations — it was an unnamed literal `2` repeated at five sites in this file
 before `ewald.py` existed.
 
@@ -863,7 +893,7 @@ virial comes from. The structure factor is invariant under the same strain, sinc
 $\mathbf{k}\cdot\mathbf{r}$ is, so there is no $v_av_b$ term to match the real-space
 one.
 
-**`ACCURACY` $= 10^{-8}$** sets $\kappa$ and the reciprocal cutoff together, so both
+**`accuracy` $= 10^{-8}$** sets $\kappa$ and the reciprocal cutoff together, so both
 halves converge to the same level. Loosening it is cheap in the reciprocal vector
 count — which scales as $(-\log a)^3$ — and expensive in the **stress**, for the
 reason its comment gives: $\kappa$ is derived from the cell, so a strained cell is
@@ -900,7 +930,7 @@ The scale, on one water with the dataset's own parameters: the entire unscreened
 ACKS2 energy of an isolated H₂O is **−4.64419 eV**, every bit of it intramolecular,
 and the screen takes it to exactly 0.
 
-`exclusions.exclusion_terms` derives one term per pair within `EXCLUSION_DEPTH = 3`
+`exclusions.exclusion_terms` derives one term per pair within `exclusion_depth = 3`
 bonds (GROMACS `nrexcl = 3`), at load time
 ([core/reactionset.py:497](core/reactionset.py#L497)), for all three sums:
 
@@ -1049,7 +1079,7 @@ the intermolecular term scales as $q^2$ and softening the hardness buys depth ba
 without reintroducing the coupling. **That retune is outstanding**, and until it is
 done `tests/test_water_structure.py`'s dimer assertions fail by construction.
 
-**`EXCLUDE_COULOMB`** ([exclusions.py:111](forcefield/exclusions.py#L111)) turns the
+**`exclude_coulomb`** ([params.py](forcefield/params.py)) turns the
 Coulomb exclusion off and keeps the other two. The result is a dataset the whole
 pipeline still evaluates consistently and **cannot fit**: the solve is hard-constrained
 to zero total charge, so ACKS2 scores H₃O⁺ as a neutral H₃O, and the −4.8 eV of
@@ -1397,7 +1427,7 @@ $$
 by `brentq` over `SCALE_BRACKET` $= (0.05, 20.0)$. Note $E_{\text{FF}}$ here is
 **bonded plus nonbonded** — `bonded_energy` includes ACKS2, ZBL and the switched
 12-6 (memoized in `_NONBONDED_CACHE`), which is why every change to
-`TAPER_RADIUS`, `TAPER_WIDTH`, `SWITCH_RADIUS` or `CORE_FRACTION` forces a refit.
+`taper_radius`, `taper_width`, `switch_radius` or `core_fraction` forces a refit.
 
 **The exclusions are inside that target too, and adding them was a refit of both
 datasets.** The fit path reaches ACKS2 through `ACKS2.__call__`, which screens by
@@ -1405,7 +1435,7 @@ datasets.** The fit path reaches ACKS2 through `ACKS2.__call__`, which screens b
 scored with its own intramolecular electrostatics removed, and the ZBL and 12-6
 exclusions arrive as ordinary terms in the same term list. That is the point: it is
 what makes a small template's fitted minimum its own rather than a cancellation
-against three whole-system sums. `EXCLUDE_COULOMB` and `EXCLUSION_DEPTH` therefore
+against three whole-system sums. `exclude_coulomb` and `exclusion_depth` therefore
 join the list above.
 
 **(2) Bond lengths — `fit_bond_lengths` ([fit/dissociation.py:837](fit/dissociation.py#L837)).**
@@ -1443,7 +1473,7 @@ $$
 
 Three of the four are hinges: they cost nothing until a constraint is violated.
 The last pulls toward "the unchanged force field" — $u = 0$, zero log $k$-scale,
-$b = $ `SHAPE_DECAY`.
+$b = $ `shape_decay`.
 
 | symbol | option | constant | default |
 | --- | --- | --- | --- |
@@ -1561,6 +1591,7 @@ assembly.
 | Calculator entry, topology feedback, stress | [ase.py:13](ase.py#L13) |
 | Assembly, pivot, charge solve, screen, nonbonded addition | [system.py:103](system.py#L103) |
 | Basis closure, switching, block Hamiltonian | [basis.py](basis.py) |
+| Global parameters, defaults, manifest activation | [forcefield/params.py](forcefield/params.py) |
 | Bonded terms, `_virial` | [forcefield/qforce.py](forcefield/qforce.py) |
 | Screened-nuclear repulsion (tapered) | [forcefield/zbl.py](forcefield/zbl.py) |
 | Switched 12-6, linear core, wall and dispersion | [forcefield/lj.py](forcefield/lj.py) |
@@ -1582,3 +1613,4 @@ assembly.
 | Fit solves and bounds | `tests/test_fit.py` |
 | Network fingerprint regression | `tests/test_get_network.py` |
 | Cache correctness | `tests/test_optimizations.py` |
+| Global parameters reach the force field; collisions refuse | `tests/test_params.py` |

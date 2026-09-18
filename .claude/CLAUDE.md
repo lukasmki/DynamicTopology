@@ -94,7 +94,7 @@ Three things about the periodic kernel that the open-boundary one has no analogu
 - **Reciprocal vectors strain inversely to positions** (`k -> (I - e) k`), which is where the
   reciprocal virial comes from; the structure factor is invariant, so there is no `v_a v_b` term.
 
-`ewald.ACCURACY` sets `kappa` and the reciprocal cutoff together. Loosening it is cheap in the
+`params.accuracy` sets `kappa` and the reciprocal cutoff together. Loosening it is cheap in the
 reciprocal vector count (`(-log accuracy)^3`) and expensive in the *stress*, for the reason its
 comment gives. Reciprocal vectors are selected on an integer ellipsoid rather than by `|k|`, so the
 set is piecewise constant in the cell and a strain does not move a whole degenerate shell across the
@@ -109,8 +109,8 @@ understand before touching either:
 
 | | form | Fermi switch | carries |
 | --- | --- | --- | --- |
-| `zbl.py:ZBL` | screened nuclear, no free parameters | off above `TAPER_RADIUS = 1.5` Å, `TAPER_WIDTH = 0.12` Å | bond lengths and closer |
-| `lj.py:LennardJones` | 12-6, q-force's σ and ε | on above `SWITCH_RADIUS = 0.22` nm, same width | intermolecular contact and dispersion |
+| `zbl.py:ZBL` | screened nuclear, no free parameters | off above `taper_radius = 1.5` Å, `taper_width = 0.12` Å | bond lengths and closer |
+| `lj.py:LennardJones` | 12-6, q-force's σ and ε | on above `switch_radius = 0.22` nm, same width | intermolecular contact and dispersion |
 
 Bare ZBL is fitted for keV nuclear stopping, and reaching it into the 1.5–3 Å range put +0.72 eV on
 a water dimer's hydrogen bond and +251 kbar in a water box; the taper keeps >90% of it at every bond
@@ -123,16 +123,27 @@ all descend from exclusions it no longer has.
 The two radii are deliberately *not* equal, so there is a gap from ~1.6 to ~2.0 Å where both are
 small and `ACKS2` carries the hydrogen bond alone. Making them complementary is the obvious-looking
 change and it is wrong: at 1.5 Å the switch is still 1.1e-2 where 12-6 is 953 eV, which puts +20.6 eV
-on a single water molecule. `lj.SWITCH_RADIUS`'s comment has the measurements.
+on a single water molecule. `params.ForceFieldParams.switch_radius` has the measurements.
 
-**Changing `TAPER_RADIUS`, `TAPER_WIDTH` or `SWITCH_RADIUS` invalidates every `.jsonl` in every
-dataset** — `fit/dissociation.py` solves against `E_QForce + E_nonbonded` and all three nonbonded
-terms are inside it, so `scripts/fit.py --force-constants` has to be re-run for both datasets. Note
-`fit.py` is **not idempotent**: re-running it over already-fitted output moves the channel count on
-its own, so refit once from the previous state rather than iterating, and quote a regression only
-against a baseline produced by the *same* pipeline over the *same* input files. The cheapest way to
-get one is to disable the new physics (`SWITCH_RADIUS = 1e6` makes the 12-6 identically zero) and
-re-run.
+**The taper radii, the exclusion depth, the Morse asymptote and the charge smearing width are
+`global_params` in the dataset manifest, not module constants.** `forcefield/params.py` holds
+`ForceFieldParams` — the fields, the defaults, and the measurement behind each one.
+`ReactionSet.load` reads the manifest's `global_params` block before it touches a template and
+activates it process-wide; every force field reads it through `params.active()` at call time, never
+bound into a default argument, since the fitter imports long before any manifest is read. Two
+datasets whose blocks disagree cannot share a process: `params.activate` refuses the second and
+names the fields that differ. `params.use(...)` is the explicit override. `forcefield/README.md`
+tabulates the full set with units and defaults.
+
+**Changing a pinned value still invalidates that dataset's `.jsonl` files** —
+`fit/dissociation.py` solves against `E_QForce + E_nonbonded` and all three nonbonded terms are
+inside it, so `scripts/fit.py --force-constants` has to be re-run for that dataset. Both datasets
+here pin their values explicitly, so a change to a *default* no longer invalidates anything
+silently. Note `fit.py` is **not idempotent**: re-running it over already-fitted output moves the
+channel count on its own, so refit once from the previous state rather than iterating, and quote a
+regression only against a baseline produced by the *same* pipeline over the *same* input files. The
+cheapest way to get one is to disable the new physics (`switch_radius` at 1e6 makes the 12-6
+identically zero) and re-run.
 
 `evb.py:EVBSystem` (exposed as `ase.py:EVB`) is the simpler alternative: a fixed list of states
 with an empirical geometric-mean coupling `H_ij = sqrt((1+h)*H_ii*H_jj)`, no network rebuild and
@@ -187,7 +198,9 @@ reads/writes the canonical JSONL term format (one term per line). `io/h5.py` is 
 
 A dataset is a manifest JSON (`datasets/HCombustion/HCombustion.json`) listing molecule and
 reaction entries by *extensionless* path; loading pairs each `<path>.xyz` (geometry; reactions
-read `index=":"` as reactant/TS.../product) with `<path>.jsonl` (parameters).
+read `index=":"` as reactant/TS.../product) with `<path>.jsonl` (parameters). The manifest also
+carries `global_params`, the force field constants the dataset was fitted at — see the Architecture
+note above and `forcefield/README.md`.
 
 ### Tests
 
@@ -205,6 +218,9 @@ read `index=":"` as reactant/TS.../product) with `<path>.jsonl` (parameters).
   reaction hashes, atom mappings) on a 250-molecule H2/O2 box.
 - `test_optimizations.py` — locks in the caching behavior of `Topology.hash`/`molecules` and
   `ReactionSet.get_terms_topology`, so caches must stay correct-by-key, not just fast.
+- `test_params.py` — each global parameter is overridden to a value the defaults do not contain and
+  the reported number has to move, which is the only way to catch a call site that still reads a
+  stale default; plus the manifest plumbing and the two-dataset collision.
 - `test_energy_conservation.py` — NVE drift through the ASE calculators, plus a dt-halving check
   that the residual is O(dt²) integrator error rather than inconsistent forces. Two xfails pin the
   ACKS2 frozen-charge approximation (see below).

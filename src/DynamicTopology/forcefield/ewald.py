@@ -2,7 +2,7 @@
 
 ACKS2 needs the smeared-charge kernel
 
-    g(r) = erf(GAMMA * r) / r
+    g(r) = erf(gamma * r) / r
 
 in three places: as the Coulomb block of its linear system, as the energy
 `E = CCOUL/2 * Q.K.Q`, and as the `dE/dQ` that drives the charge-response
@@ -26,7 +26,7 @@ which is why the kernel had to become an object rather than a matrix.
 sum of `g` into a standard Ewald sum of `1/r` minus a short-ranged remainder,
 and the two real-space pieces merge:
 
-    K_ij = sum_n' [erf(GAMMA |r_ij + n|) - erf(kappa |r_ij + n|)] / |r_ij + n|
+    K_ij = sum_n' [erf(gamma |r_ij + n|) - erf(kappa |r_ij + n|)] / |r_ij + n|
          + (4 pi / V) sum_{k != 0} exp(-k^2 / 4 kappa^2) / k^2 * cos(k . r_ij)
          - delta_ij * 2 kappa / sqrt(pi)
 
@@ -54,25 +54,12 @@ stays a nearest-image pair term and no periodic treatment is needed.
 import numpy as np
 from scipy.special import erf
 
+from DynamicTopology.forcefield.params import ForceFieldParams, resolve
 
-# Charge-smearing width of the ACKS2 kernel `erf(GAMMA r) / r`, in 1/Angstrom.
-GAMMA = 2.0
 
-# Target relative error of the truncated lattice sum.  It sets `kappa` (through
-# the real-space sum, which is truncated at the nearest image) and the
-# reciprocal cutoff together, so both halves are converged to the same level.
-#
-# Do not loosen this casually.  The cost is a cube root -- the reciprocal
-# vector count scales as `(-log(accuracy))^3` -- but the *stress* pays for it
-# linearly: `kappa` is derived from the cell, so a strained cell is summed with
-# a slightly different splitting, and the residual `d(truncation error)/d(cell)`
-# is a spurious contribution to the finite-difference virial that the analytic
-# expression (taken at fixed `kappa`, correctly, since the exact sum does not
-# depend on it) has no counterpart for.  That error is amplified by
-# `2 log(1/accuracy)` relative to the truncation error itself.  At 1e-8 it lands
-# around 1e-6 eV, comfortably under what `tests/test_stress.py` asserts; at 1e-6
-# it would be at the tolerance.
-ACCURACY = 1e-8
+# `GAMMA` and `ACCURACY` are now fields of `params.ForceFieldParams` --
+# `gamma` and `accuracy` -- resolved in `MinimumImage`/`Ewald.__init__`
+# (per force call and per cell respectively); see that module for why.
 
 
 def _screened(rij, r, alpha):
@@ -109,7 +96,7 @@ def contract_pairs(coeff, vecs, r):
 
 
 class MinimumImage:
-    """`erf(GAMMA r) / r` over the nearest image of each pair and nothing else.
+    """`erf(gamma r) / r` over the nearest image of each pair and nothing else.
 
     The open-boundary kernel, and the fallback for a partially periodic cell:
     Ewald in fewer than three dimensions is a different summation altogether,
@@ -119,14 +106,17 @@ class MinimumImage:
     with but the other atoms.
     """
 
-    def __init__(self, rij, vecs=None):
+    def __init__(self, rij, vecs=None, params: ForceFieldParams | None = None):
         self.rij = rij
         self.vecs = vecs
         self.r = rij + np.finfo(np.float64).eps
         self._derivative = None
+        # Captured per kernel, which is per force call: the geometry this object
+        # wraps and the smearing width it sums with are the same generation.
+        self.gamma = resolve(params).gamma
 
     def matrix(self):
-        return _screened(self.rij, self.r, GAMMA)[0]
+        return _screened(self.rij, self.r, self.gamma)[0]
 
     def derivative(self):
         """`dK_ij/dr_ij`, memoized for the same reason `matrix` is.
@@ -137,7 +127,7 @@ class MinimumImage:
         derivative is the same array both times.
         """
         if self._derivative is None:
-            self._derivative = _screened(self.rij, self.r, GAMMA)[1]
+            self._derivative = _screened(self.rij, self.r, self.gamma)[1]
         return self._derivative
 
     def contract(self, W):
@@ -161,7 +151,13 @@ class Ewald:
     so this only ever sums more than asked for.
     """
 
-    def __init__(self, cell, accuracy=ACCURACY):
+    def __init__(self, cell, accuracy=None, params: ForceFieldParams | None = None):
+        ff = resolve(params)
+        # `accuracy` stays an explicit argument because `tests/test_ewald.py`
+        # sweeps it to show the sum is independent of the splitting; `None`
+        # takes the dataset's.
+        accuracy = ff.accuracy if accuracy is None else accuracy
+        self.gamma = ff.gamma
         self.cell = np.asarray(cell, dtype=float)
         self.volume = abs(np.linalg.det(self.cell))
         if self.volume <= 0.0:
@@ -181,10 +177,10 @@ class Ewald:
         # kappa is the smallest splitting that leaves the nearest image enough:
         # smallest, because every reciprocal vector is paid for on every atom
         # pair, so the reciprocal sum is the expensive half here.  Capping it at
-        # GAMMA covers the cell so small that no splitting converges in one
+        # `gamma` covers the cell so small that no splitting converges in one
         # image; there the real-space term vanishes identically and the whole
         # kernel is summed in reciprocal space, more slowly but correctly.
-        self.kappa = min(span / cutoff, GAMMA)
+        self.kappa = min(span / cutoff, self.gamma)
 
         kmax = 2 * self.kappa * span
         nmax = np.maximum(np.ceil(kmax / blen).astype(int), 1)
@@ -267,7 +263,7 @@ class EwaldKernel:
         if self._matrix is None:
             setup = self.setup
             short = (
-                _screened(self.rij, self.r, GAMMA)[0]
+                _screened(self.rij, self.r, setup.gamma)[0]
                 - _screened(self.rij, self.r, setup.kappa)[0]
             )
             weighted_cos = self.cos * setup.weight
@@ -296,7 +292,7 @@ class EwaldKernel:
             # charge response -- against the same positions, so the real-space
             # derivative is memoized alongside `matrix`.
             self._derivative = (
-                _screened(self.rij, self.r, GAMMA)[1]
+                _screened(self.rij, self.r, setup.gamma)[1]
                 - _screened(self.rij, self.r, setup.kappa)[1]
             )
         dS_dr, dS_de = contract_pairs(W * self._derivative, self.vecs, self.r)

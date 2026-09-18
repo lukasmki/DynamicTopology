@@ -161,6 +161,16 @@ Each of these was measured in this repo, not inferred.
 - **Unknown term types are silently skipped.** Force fields dispatch to
   `compute_<type>`; a typo'd type costs you the term with no error.
 - **Manifest paths are extensionless** and relative to the manifest's directory.
+- **`global_params` in the manifest states the force field constants the dataset is
+  fitted at** — the two taper radii and widths, `core_fraction`, `exclusion_depth`,
+  `exclude_coulomb`, `bond_asymptote`, `gamma`. Omitted keys take the defaults in
+  `forcefield/params.py`; an *unknown* key is an error rather than a no-op, so a typo
+  cannot leave the default quietly in force. Pin the block explicitly once the set is
+  fitted, as both shipped datasets do: a later change to a default then cannot
+  invalidate your `.jsonl` files without saying so. Changing a pinned value means
+  re-running `scripts/fit.py --force-constants`, since `fit/dissociation.py` solves
+  against `E_bonded + E_nonbonded` and every one of them is inside it. Two datasets
+  whose blocks disagree cannot be loaded into one process.
 - **Every connected component of every reactant and product needs its own template**,
   or `get_terms_topology` raises at runtime. `probe` checks closure up front.
 - **Degenerate reactions are stored twice.** `add_reaction` files a reaction under its

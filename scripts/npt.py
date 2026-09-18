@@ -211,6 +211,11 @@ def main() -> int:
                     "density_kg_m3": density_kg_m3(atoms),
                     "bimol_cutoff": args.bimol_cutoff,
                     "evb": evb,
+                    # The surface this trajectory ran on, as the manifest
+                    # states it plus whatever it left to the defaults.  A
+                    # log that records the reaction set but not its global
+                    # parameters does not identify the potential.
+                    "global_params": reaction_set.params.to_dict(),
                     "restart": args.restart,
                 }
             )

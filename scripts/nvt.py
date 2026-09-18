@@ -228,6 +228,11 @@ def main() -> int:
                     "steps": args.steps,
                     "bimol_cutoff": args.bimol_cutoff,
                     "evb": evb,
+                    # The surface this trajectory ran on, as the manifest
+                    # states it plus whatever it left to the defaults.  A
+                    # log that records the reaction set but not its global
+                    # parameters does not identify the potential.
+                    "global_params": reaction_set.params.to_dict(),
                     "natoms": len(atoms),
                     "cell": atoms.cell.lengths().tolist(),
                     "restart": args.restart,

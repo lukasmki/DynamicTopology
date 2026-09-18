@@ -33,5 +33,15 @@
         {"id": 17, "path" : "reactions/rxn_17"},
         {"id": 18, "path" : "reactions/rxn_18"},
         {"id": 19, "path" : "reactions/rxn_19"}
-    ]
+    ],
+    "global_params": {
+        "bond_asymptote": 1.0,
+        "taper_radius": 1.5,
+        "taper_width": 0.12,
+        "switch_radius": 0.22,
+        "core_fraction": 0.4,
+        "exclusion_depth": 3,
+        "exclude_coulomb": true,
+        "gamma": 2.0
+    }
 }

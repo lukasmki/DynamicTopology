@@ -8,7 +8,7 @@ three terms are where they are, and nothing here changes it: the whole-system
 sums stay exactly as they were.
 
 What this module adds is the *correction* -- which pairs should not have been
-counted.  That is the pairs within `lj.EXCLUSION_DEPTH` bonds of each other, and
+counted.  That is the pairs within `params.exclusion_depth` bonds of each other, and
 it is a per-molecule quantity, which is what makes it expressible as a term and
 therefore evaluable per diabatic state alongside the bonded ones.  This is the
 decomposition `QForce.compute_exclusion` was already written for; it had been
@@ -99,16 +99,12 @@ from __future__ import annotations
 import networkx as nx
 import numpy as np
 
-from DynamicTopology.forcefield.lj import EXCLUSION_DEPTH, _near_pairs
+from DynamicTopology.forcefield.lj import _near_pairs
+from DynamicTopology.forcefield.params import ForceFieldParams, resolve
 
-# Whether to emit `coulombexclusion` terms.  On: see the module docstring for
-# how they are applied, which is not by masking the charge solve.  Turning this
-# off drops the Coulomb exclusion and keeps the other two, which is a dataset
-# the whole pipeline still evaluates consistently -- but not one that can be
-# fitted: the H3O+ template is unfittable without it, because ACKS2 scores the
-# cation as a neutral H3O and the -4.8 eV of spurious binding that produces has
-# nothing left to cancel it once ZBL's intramolecular +15.45 eV is excluded.
-EXCLUDE_COULOMB: bool = True
+# `EXCLUDE_COULOMB` is now `params.ForceFieldParams.exclude_coulomb`, and the
+# depth these terms are derived to is `exclusion_depth`; see that module for
+# why both belong to the dataset rather than to the installed source tree.
 
 
 def bond_graph(terms: list[dict], natoms: int | None = None) -> nx.Graph:
@@ -134,9 +130,14 @@ def bond_graph(terms: list[dict], natoms: int | None = None) -> nx.Graph:
 def exclusion_terms(
     terms: list[dict],
     numbers: np.ndarray | None = None,
-    depth: int = EXCLUSION_DEPTH,
+    depth: int | None = None,
+    params: ForceFieldParams | None = None,
 ) -> list[dict]:
     """Exclusion terms for every pair within `depth` bonds, for all three sums.
+
+    `depth` defaults to the active `exclusion_depth` and `params` to the active
+    set, both resolved in the body: this module is imported long before any
+    manifest is read, so a default argument would pin the wrong dataset's depth.
 
     `numbers` supplies the atomic numbers the `zblexclusion` terms need; ZBL
     reads them from the `Atoms` rather than from a template, so they have to be
@@ -150,6 +151,8 @@ def exclusion_terms(
     no free parameters and the charge kernel is element-independent -- so every
     pair gets one of each.
     """
+    ff = resolve(params)
+    depth = ff.exclusion_depth if depth is None else depth
     lj_params = {
         next(iter(term["atoms"].values())): term["kwargs"]
         for term in terms
@@ -184,7 +187,7 @@ def exclusion_terms(
                 }
             )
 
-        if EXCLUDE_COULOMB:
+        if ff.exclude_coulomb:
             out.append({"type": "coulombexclusion", "atoms": atoms, "kwargs": {}})
     return out
 
@@ -192,7 +195,8 @@ def exclusion_terms(
 def with_exclusions(
     terms: list[dict],
     numbers: np.ndarray | None = None,
-    depth: int = EXCLUSION_DEPTH,
+    depth: int | None = None,
+    params: ForceFieldParams | None = None,
 ) -> list[dict]:
     """`terms` plus its exclusions, unless it already states them.
 
@@ -203,4 +207,4 @@ def with_exclusions(
     """
     if any(term["type"].endswith("exclusion") for term in terms):
         return list(terms)
-    return list(terms) + exclusion_terms(terms, numbers, depth)
+    return list(terms) + exclusion_terms(terms, numbers, depth, params)

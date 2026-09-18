@@ -2,11 +2,11 @@
 
 `QForce` writes a bond as
 
-    E = Dw * (1 - exp(-a * dr))**2 - D,    Dw = D + BOND_ASYMPTOTE,
+    E = Dw * (1 - exp(-a * dr))**2 - D,    Dw = D + bond_asymptote,
                                           a  = sqrt(k / 2Dw)
 
 which is -D at the minimum, so the well depths a molecule's bonds carry *are*
-its atomization energy -- if they add up to it.  It is `BOND_ASYMPTOTE` rather
+its atomization energy -- if they add up to it.  It is `bond_asymptote` rather
 than zero at dissociation, which is what makes a bonded diabat and its own
 fragments' diabat cross instead of converging; see that constant.
 As fitted by q-force they do not: each bond is parameterized locally, and for
@@ -70,7 +70,7 @@ predating the parameter reads as.
 `c` is bounded, and not arbitrarily: past `c = shape_bound(b)` the correction
 beats the exponential and the dissociation curve turns over, putting a barrier on
 a channel that has none and a bound state beyond it.  The decay `b` is fitted per
-bond type alongside `c` -- see `qforce.SHAPE_DECAY` for the measurement that made
+bond type alongside `c` -- see `params.ForceFieldParams.shape_decay` for the measurement that made
 it a parameter -- and because the bound moves with it (1.31 at b = 2, 19.33 at
 b = 4, 52.20 at b = 6) the search variable is the fraction `c / shape_bound(b)`
 rather than `c` itself.
@@ -126,7 +126,8 @@ from scipy.optimize import brentq, minimize
 
 from DynamicTopology.core.types import Term
 from DynamicTopology.forcefield.acks2 import ACKS2
-from DynamicTopology.forcefield.qforce import BOND_ASYMPTOTE, SHAPE_DECAY, QForce
+from DynamicTopology.forcefield.params import active
+from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.zbl import ZBL
 from DynamicTopology.forcefield.lj import LennardJones
 
@@ -377,6 +378,11 @@ def _nonbonded_key(atoms: Atoms, term_dict: dict) -> tuple:
         atoms.numbers.tobytes(),
         atoms.cell.array.tobytes(),
         tuple(atoms.pbc),
+        # The global parameters, because all three nonbonded terms read them:
+        # two taper radii, the core fraction and the smearing width.  A fit run
+        # under `params.use(...)` must miss the cache rather than read the
+        # previous surface's answer out of it.
+        active(),
         # Both parameter sets the memoized terms read, for the reason above:
         # neither is fitted here, but a caller that fitted one should miss the
         # cache rather than read a stale number out of it.
@@ -559,8 +565,8 @@ def _morse_stretch_force(r, D: float, r0, k: float, c: float, b: float):
     """
     dr = np.asarray(r, dtype=float) - np.asarray(r0, dtype=float)
     # `Dw`, not `D`: the well the exponential climbs is the depth plus the
-    # asymptote, on the stretched branch only.  See `qforce.BOND_ASYMPTOTE`.
-    Dw = np.where(dr > 0.0, D + BOND_ASYMPTOTE, D)
+    # asymptote, on the stretched branch only.  See `params.bond_asymptote`.
+    Dw = np.where(dr > 0.0, D + active().bond_asymptote_kjmol, D)
     al = np.sqrt(k / (2 * Dw))
     exp_term = np.exp(-al * dr)
     de_dr = 2 * Dw * (1 - exp_term) * al * exp_term
@@ -733,14 +739,14 @@ def _bonded_curvature(kwargs: dict, r: float) -> float:
     D = kwargs["D"]
     k = kwargs["k"]
     c = kwargs.get("c", 0.0)
-    b = kwargs.get("b", SHAPE_DECAY)
+    b = kwargs.get("b", active().shape_decay)
     dr = r / 10.0 - kwargs["r0"]  # nm
     # `Dw`, not `D`, and on the stretched branch only.  The curvature *at the
     # minimum* is `k` either way, which is what makes the asymptote free of the
     # fitted frequencies -- but `fit_bond_lengths` displaces `r0` *inside* the
     # reference bond length, so the bond sits at `dr > 0` and this is exactly
-    # where the two differ.  See `qforce.BOND_ASYMPTOTE`.
-    Dw = D + BOND_ASYMPTOTE if dr > 0.0 else D
+    # where the two differ.  See `params.bond_asymptote`.
+    Dw = D + active().bond_asymptote_kjmol if dr > 0.0 else D
     al = np.sqrt(k / (2 * Dw))
 
     exp_term = np.exp(-al * dr)
@@ -967,7 +973,7 @@ def fit_bond_lengths(
             t["kwargs"]["D"],
             t["kwargs"]["k"],
             t["kwargs"].get("c", 0.0),
-            t["kwargs"].get("b", SHAPE_DECAY),
+            t["kwargs"].get("b", active().shape_decay),
         )
         for t in working
         if t["type"] == "bond"
@@ -1468,7 +1474,7 @@ def bond_decays(terms: list[Term]) -> list[float]:
         if key in seen:
             continue
         seen.append(key)
-        decays.append(float(term["kwargs"].get("b", SHAPE_DECAY)))
+        decays.append(float(term["kwargs"].get("b", active().shape_decay)))
     return decays
 
 
@@ -1619,9 +1625,9 @@ def fit_force_constants(
     #
     # `u` needs none -- it is already a fraction, which is the second reason the
     # search is parameterized that way.  The decay block is normalized on its own
-    # half-width and measured from `SHAPE_DECAY`, so that every block's origin is
+    # half-width and measured from `shape_decay`, so that every block's origin is
     # the *unchanged* force field: `u = 0` is plain Morse, a zero log k-scale is
-    # q-force's own constant, and `b = SHAPE_DECAY` is what a term file without a
+    # q-force's own constant, and `b = shape_decay` is what a term file without a
     # decay reads as.  Measuring the decay from zero instead would make the
     # regularizer a preference for short-ranged corrections, and measuring it
     # from the middle of the box would make it a preference for whatever the
@@ -1640,7 +1646,7 @@ def fit_force_constants(
     scale_of = np.concatenate(blocks)
     origin = np.zeros(scale_of.size)
     if shaped:
-        origin[decay_at : decay_at + width] = SHAPE_DECAY
+        origin[decay_at : decay_at + width] = active().shape_decay
 
     def score(x: np.ndarray) -> float:
         try:
@@ -1688,7 +1694,7 @@ def fit_force_constants(
         # The regularizer is on the *fraction of the available box* each
         # variable uses, not on its raw value.  `c` and `log(k-scale)` live on
         # scales that differ by an order of magnitude, and `c`'s own bound moves
-        # with `SHAPE_DECAY`, so penalizing raw magnitudes silently reweights
+        # with `shape_decay`, so penalizing raw magnitudes silently reweights
         # the objective whenever any of those change -- which it did: raising
         # the decay from 2 to 4 lifted the bound on `c` from 1.3 to 19.3 and
         # multiplied this penalty by ~200, crushing the fit for reasons that had
@@ -1714,12 +1720,12 @@ def fit_force_constants(
     # `x = start` is the *unchanged* force field: `u = 0` is plain Morse and a
     # zero log k-scale is q-force's own constant.  Zero is not the identity for
     # the decay block -- `b = 0` is not a shape term with no effect, it is a
-    # correction that never decays -- so that block starts at `SHAPE_DECAY`,
+    # correction that never decays -- so that block starts at `shape_decay`,
     # which is what a term file without a `b` reads as.  Getting this wrong
     # makes the "before" column a report on a force field nobody ever had.
     start = np.zeros(n_x)
     if shaped:
-        start[decay_at : decay_at + width] = SHAPE_DECAY
+        start[decay_at : decay_at + width] = active().shape_decay
     install_templates(reaction_set, templates, refit(start))
     before = reaction_margins(reaction_set, reactions)
 
@@ -1798,7 +1804,7 @@ def fit_force_constants(
     #
     # It was unreachable while the starting point was poor, because there was
     # always more to gain by fixing an infeasible channel than to save by
-    # dropping a feasible one.  `qforce.BOND_ASYMPTOTE` made the starting point
+    # dropping a feasible one.  `params.bond_asymptote` made the starting point
     # good -- 16 of 19 before any force-constant fit at all -- and `mode="k"`
     # then traded `rxn_16` from +0.191 to -0.095 for the frequency term, giving
     # up the one channel the asymptote had just bought.
@@ -1846,7 +1852,7 @@ def fit_force_constants(
         decays=(
             [float(value) for value in solution[decay_at : decay_at + width]]
             if shaped
-            else [SHAPE_DECAY] * width
+            else [active().shape_decay] * width
         ),
         k_scales=(
             [float(value) for value in np.exp(solution[width:])]

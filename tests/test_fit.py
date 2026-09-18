@@ -71,7 +71,8 @@ from DynamicTopology.fit.dissociation import (
     wavenumber,
 )
 from DynamicTopology.forcefield.coupling import EVBCoupling
-from DynamicTopology.forcefield.qforce import BOND_ASYMPTOTE, SHAPE_DECAY, QForce
+from DynamicTopology.forcefield.params import active
+from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.io.json import read_jsonl
 
 
@@ -349,9 +350,17 @@ class TestMorseShape:
 
     D, R0, K = 436.0, 0.07772, 251200.0
 
-    def _curve(self, r, c, b=SHAPE_DECAY):
+    def _curve(self, r, c, b=None):
+        """The Morse at one separation, in q-force units.
+
+        `b=None` omits the argument entirely rather than passing `None` through,
+        because that is what a term file predating `b` actually produces: the
+        key is absent from the `term_dict` and `_bond_morse` is called without
+        it, so the fallback it resolves is the one under test.
+        """
         positions = np.array([[0.0, 0.0, 0.0], [r, 0.0, 0.0]])
         vectors = positions[None, :, :] - positions[:, None, :]
+        decay = () if b is None else (np.array([b]),)
         return QForce(bond_form="morse")._bond_morse(
             vectors,
             np.array([[0, 1]]),
@@ -359,22 +368,24 @@ class TestMorseShape:
             np.array([self.R0]),
             np.array([self.K]),
             np.array([c]),
-            np.array([b]),
+            *decay,
         )[0]
 
     @pytest.mark.parametrize("c", [0.0, 0.5, 1.3, -0.8])
-    @pytest.mark.parametrize("b", [2.0, SHAPE_DECAY, 8.0])
+    @pytest.mark.parametrize("b", [2.0, 4.0, 8.0])
     def test_the_shape_term_moves_neither_the_well_nor_the_limit(self, c, b):
-        """Both ends, in q-force units: `-D` at the minimum, `BOND_ASYMPTOTE` far out.
+        """Both ends, in q-force units: `-D` at the minimum, `bond_asymptote` far out.
 
-        The limit is not zero.  `qforce.BOND_ASYMPTOTE` lifts the dissociated end
+        The limit is not zero.  `params.bond_asymptote` lifts the dissociated end
         of every Morse off the free-fragment energy so that a bonded diabat and
         its own fragments' diabat cross rather than converge -- which is what the
         claim here has to be stated against, since `c` leaving the limit alone is
         a statement about the shape term and not about where the limit is.
         """
         assert self._curve(self.R0, c, b) == pytest.approx(-self.D, abs=1e-9)
-        assert self._curve(2.0, c, b) == pytest.approx(BOND_ASYMPTOTE, abs=1e-9)
+        assert self._curve(2.0, c, b) == pytest.approx(
+            active().bond_asymptote_kjmol, abs=1e-9
+        )
 
     @pytest.mark.parametrize("c", [0.0, 0.5, 1.3, -0.8])
     def test_the_shape_term_moves_no_frequency(self, c):
@@ -479,7 +490,7 @@ class TestMorseShape:
         """Term files predating `b` must be unchanged by its introduction."""
         for r in (self.R0 + 0.02, self.R0 + 0.05, self.R0 + 0.12):
             assert self._curve(r, 1.3) == pytest.approx(
-                self._curve(r, 1.3, SHAPE_DECAY), abs=1e-12
+                self._curve(r, 1.3, active().shape_decay), abs=1e-12
             )
 
     def test_setting_the_shape_leaves_every_other_parameter_alone(self, templates):

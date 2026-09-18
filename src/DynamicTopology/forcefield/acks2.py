@@ -2,6 +2,7 @@ from ase import units
 import numpy as np
 
 from DynamicTopology.forcefield.ewald import Ewald, MinimumImage, contract_pairs
+from DynamicTopology.forcefield.params import active
 
 
 class ACKS2:
@@ -42,7 +43,17 @@ class ACKS2:
     be this way round; `prepare`/`compute` is the split that makes it possible.
     """
 
-    CCOUL = 14.4  # eV
+    @property
+    def CCOUL(self) -> float:
+        """The Coulomb constant in eV*Angstrom, from the active parameters.
+
+        A property rather than a class attribute so that it tracks the dataset
+        rather than the import: `fit/dissociation.py` builds one of these at
+        module scope, before any manifest has been read.  `zbl` carries the same
+        physical constant to more digits under its own field; see
+        `params.ForceFieldParams.zbl_ccoul` for why the two are separate.
+        """
+        return active().ccoul
 
     def __init__(self):
         self.Q = None

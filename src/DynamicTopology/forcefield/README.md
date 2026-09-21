@@ -449,7 +449,3 @@ because whichever loaded second would score the first's templates on a surface
 they were not fitted to. A caller that genuinely wants a different surface says
 so with `params.use(...)`, which never refuses and restores on exit.
 
----
-
-*Note: `atom` terms carry a `soft_scale` parameter in the shipped `.jsonl`
-files that no code currently reads.*

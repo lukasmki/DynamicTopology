@@ -1,9 +1,9 @@
-from copy import deepcopy
+from dataclasses import dataclass, field
 import json
 import sys
 import numpy as np
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 import networkx as nx
 from ase import Atoms, io, units
@@ -24,23 +24,205 @@ from ..forcefield.params import ForceFieldParams, activate
 PAIR_SCRATCH: int = 1 << 20
 
 
-class ReactionSet:
-    default_data = {
-        "meta": {
-            "molecules": {},
-            "reactions": {},
-        },
-        "molecules": {},
-        "reactions": {},
-    }
+def _reference_term(atoms: Atoms, terms: list[Term]) -> Term | None:
+    """Constant shift putting this template on the reference energy scale.
 
+    Diabatic states are compared by their absolute energies, so every bonding
+    topology has to be measured from the same zero.  The dataset supplies that
+    zero: `scripts/compute.py` writes an atomization energy per template (eV,
+    referenced to free atoms, hence exactly 0 for a free atom).  Morse bonds
+    already account for -sum(D) of it at the minimum, so the part the force
+    field cannot reproduce is the residual
+
+        E0 = E_atomization + sum(D)
+
+    which is what gets stored.  Morse therefore carries the physics and the
+    shift only corrects for q-force having fitted each bond locally rather than
+    to the molecule's total atomization energy -- a residual of a few tenths of
+    an eV for most templates here, but +2.59 eV for H2O2, which is worth knowing
+    about rather than silently absorbing.
+
+    Returns None for a template with no reference energy, so datasets whose
+    energies have not been computed yet keep loading unchanged (they simply keep
+    the old, uncalibrated behaviour).
+    """
+    if atoms.calc is None:
+        return None
+    try:
+        e_atomization = atoms.get_potential_energy()  # eV
+    except (RuntimeError, AttributeError):
+        return None
+
+    sum_d = sum(  # kJ/mol
+        term["kwargs"]["D"] for term in terms if term["type"] == "bond"
+    )
+    e0 = e_atomization / (units.kJ / units.mol) + sum_d  # kJ/mol
+
+    # Anchored on atom 0 purely so the term has an index to be remapped through
+    # when the template is matched onto the live system; the energy belongs to
+    # the molecule as a whole and contributes no force.
+    return {"type": "reference", "atoms": {"a1": 0}, "kwargs": {"E0": e0}}
+
+
+@dataclass
+class ReactionSetData:
+    """Everything a dataset manifest states, parsed and keyed by WL hash.
+
+    The database proper: what was loaded, not how it is queried.  Every lookup
+    here is a plain dict probe on a Weisfeiler-Lehman hash and returns the
+    stored object by reference
+    """
+
+    molecules: dict[str, Topology] = field(default_factory=dict)
+    # Both directions of every reaction: forward under the reactant hash and
+    # reversed under the product's, which is what lets `channels` be a single
+    # probe rather than a scan.
+    reactions: dict[str, list[Reaction]] = field(default_factory=dict)
+    # Manifest `id` and chemical formula -> molecule hash.  Two maps rather than
+    # the one mixed dict this replaced: an integer key colliding with a formula
+    # was indistinguishable there, and neither could be typed.
+    ids: dict[int, str] = field(default_factory=dict)
+    formulas: dict[str, str] = field(default_factory=dict)
+    # The global force field parameters this set was fitted at.  Defaults until
+    # a manifest says otherwise; `from_manifest` replaces it and activates it
+    # before a single template is read, since deriving the exclusions and
+    # solving the reference shifts both depend on them.
+    params: ForceFieldParams = field(default_factory=ForceFieldParams)
+    source: Path | None = None
+
+    def add_molecule(self, molid: int, molecule: Topology) -> None:
+        molecule_hash = molecule.hash()
+        if molecule_hash in self.molecules:
+            print(
+                f"WARN: Overwriting molecule {molecule} - {molecule_hash}",
+                file=sys.stderr,
+            )
+        self.molecules[molecule_hash] = molecule
+        self.ids[molid] = molecule_hash
+        # Case-folded on the way in as well as on the way out.  Storing the
+        # formula verbatim and looking it up upper-cased agreed for H/O species
+        # and raised `KeyError` for any two-letter element ("ClH" -> "CLH").
+        self.formulas[molecule.atoms.get_chemical_formula().upper()] = molecule_hash
+
+    def add_reaction(self, reaction: Reaction) -> None:
+        reactant_hash, product_hash = reaction.hash()
+        self.reactions.setdefault(reactant_hash, []).append(reaction)
+        self.reactions.setdefault(product_hash, []).append(reaction.reverse())
+
+    def channels(self, molecule_hash: str) -> list[Reaction]:
+        """Every stored reaction this molecule hash is the reactant side of."""
+        return self.reactions.get(molecule_hash, [])
+
+    def by_id(self, molid: int) -> Topology:
+        """The template the manifest gave this `id`."""
+        return self.molecules[self.ids[molid]]
+
+    def by_formula(self, formula: str) -> Topology:
+        """The template with this chemical formula, case-insensitively."""
+        return self.molecules[self.formulas[formula.upper()]]
+
+    @property
+    def n_reactions(self) -> int:
+        """Stored reactions, counting each one twice -- once per direction."""
+        return sum(len(rxns) for rxns in self.reactions.values())
+
+    @classmethod
+    def from_manifest(cls, path: str | Path) -> "ReactionSetData":
+        """Parse a dataset manifest and everything it points at.
+
+        `path` names a JSON manifest listing molecule and reaction entries by
+        extensionless path; each is paired with a `.xyz` (geometry) and a
+        `.jsonl` (parameters, one term per line).  An entry's `smiles` is
+        annotation for a reader -- identity here is the WL hash of the `.xyz`'s
+        bond graph, so nothing below reads it.
+        """
+        path = Path(path).resolve()
+        if path.suffix != ".json":
+            raise ValueError(
+                f"Reaction set path should point to a .json manifest, got '{path.suffix}'"
+            )
+
+        with open(path, "r") as fp:
+            manifest = json.load(fp)
+
+        # NOTE: should use the metadata to handle
+        # merge conflicts with multiple reaction sets
+
+        # **Before anything else.**  `global_params` states the constants this
+        # dataset's `.jsonl` files were fitted at -- the two taper radii, the
+        # exclusion depth, the Morse asymptote -- and the loops below derive
+        # exclusions and solve reference shifts against exactly those.
+        # Activating them afterwards would fit the templates on one surface and
+        # evaluate them on another, which is the silent invalidation
+        # `forcefield/params.py` exists to close.  A manifest that omits the key
+        # gets the defaults, unchanged.
+        params = ForceFieldParams.from_dict(
+            manifest.get("global_params"), source=str(path)
+        )
+        activate(params, source=str(path))
+        data = cls(params=params, source=path)
+
+        for mol in manifest["molecules"]:
+            # load molecule and associated force field
+            data_path: Path = path.parent / mol["path"]
+
+            if data_path.suffix in ioformats:
+                atoms: Atoms | list[Atoms] = io.read(data_path)
+            else:  # try to read as xyz
+                atoms: Atoms | list[Atoms] = io.read(data_path.with_suffix(".xyz"))
+            with open(data_path.with_suffix(".jsonl"), "r") as fp:
+                terms: list[Term] = [json.loads(term) for term in fp.readlines()]
+
+            assert isinstance(atoms, Atoms)
+            # Intramolecular nonbonded exclusions, derived here rather than
+            # stored in the `.jsonl`.  They are a function of the bond graph and
+            # of this dataset's `exclusion_depth`, so deriving them keeps them
+            # correct when either changes, and keeps the term files to the
+            # parameters a fit actually produces.  A dataset shipping its own
+            # exclusions explicitly is left alone.
+            terms = with_exclusions(terms, atoms.get_atomic_numbers(), params=params)
+            # A template that already states its shift keeps it.  Templates
+            # whose Morse depths have been fitted to carry the atomization
+            # energy state it as zero, and synthesizing another one here would
+            # count the same energy twice.
+            if not any(term["type"] == "reference" for term in terms):
+                reference = _reference_term(atoms, terms)
+                if reference is not None:
+                    terms = terms + [reference]
+            data.add_molecule(mol["id"], Topology.from_terms(terms, atoms))
+
+        for rxn in manifest["reactions"]:
+            # load reactions and associated diabatic coupling force field
+            data_path: Path = path.parent / rxn["path"]
+
+            if data_path.suffix in ioformats:
+                atoms: Atoms | list[Atoms] = io.read(data_path, index=":")
+            else:  # try to read as xyz
+                atoms: Atoms | list[Atoms] = io.read(
+                    data_path.with_suffix(".xyz"), index=":"
+                )
+
+            with open(data_path.with_suffix(".jsonl"), "r") as fp:
+                terms: list[Term] = [json.loads(term) for term in fp.readlines()]
+
+            data.add_reaction(Reaction.from_atoms(atoms, terms))
+
+        return data
+
+
+class ReactionSet:
     def __init__(self, path: str | Path | None = None):
-        self.data = deepcopy(self.default_data)
-        # The global force field parameters this set was fitted at.  Defaults
-        # until a manifest says otherwise; `load` replaces it and activates it
-        # before a single template is read, since deriving the exclusions and
-        # solving the reference shifts both depend on them.
-        self.params: ForceFieldParams = ForceFieldParams()
+        self.data = ReactionSetData()
+        self._reset_caches()
+        if path:
+            self.load(path)
+
+    def _reset_caches(self) -> None:
+        """Drop everything derived from `self.data`.
+
+        Called on every `load`, since a set that is reloaded onto a different
+        dataset would otherwise answer from the previous one's templates.
+        """
         self._term_cache: dict[tuple[tuple, tuple], list] = {}
         self._bimol_hash_cache: dict[frozenset, str] = {}
         # Keyed by molecule signature rather than held on the Topology, because
@@ -48,8 +230,11 @@ class ReactionSet:
         # are rebuilt from scratch on every force call.
         self._hash_cache: dict[tuple[tuple, tuple], str] = {}
         self._channel_cache: dict[tuple[tuple, tuple], list] = {}
-        if path:
-            self.load(path)
+
+    @property
+    def params(self) -> ForceFieldParams:
+        """The global force field parameters this set was fitted at."""
+        return self.data.params
 
     def _unknown_molecule_message(self, mol: Topology) -> str:
         """Say which species was perceived, and what it is nearest to.
@@ -73,7 +258,7 @@ class ReactionSet:
         # Nearest by edge-set difference among the templates with the same
         # multiset of elements; anything else is not a rearrangement of this.
         neighbours: list[tuple[int, str]] = []
-        for template in self.data["molecules"].values():
+        for template in self.data.molecules.values():
             template_elements = [
                 template.graph.nodes[node]["atomic_number"]
                 for node in template.graph.nodes()
@@ -162,7 +347,7 @@ class ReactionSet:
             combined_hash = self.hash_molecule(topology)
         channels = [
             (reaction, mapping)
-            for reaction in self.data["reactions"].get(combined_hash, [])
+            for reaction in self.data.channels(combined_hash)
             for mapping in reaction.get_mappings(topology)
         ]
         self._channel_cache[signature] = channels
@@ -170,7 +355,7 @@ class ReactionSet:
 
     def get_molecule(self, molecule: Topology) -> Topology:
         """Returns a copy of the molecule in the database"""
-        return self.data["molecules"][molecule.hash()].copy()
+        return self.data.molecules[molecule.hash()].copy()
 
     def get_molecules(
         self, ids: list[int] | None = None, formulas: list[str] | None = None
@@ -178,14 +363,12 @@ class ReactionSet:
         """Returns a copy of the molecules in the database"""
         if ids:
             for molid in ids:
-                mol_hash = self.data["meta"]["molecules"][molid]
-                yield self.data["molecules"][mol_hash].copy()
+                yield self.data.by_id(molid).copy()
         elif formulas:
             for formula in formulas:
-                mol_hash = self.data["meta"]["molecules"][formula.upper()]
-                yield self.data["molecules"][mol_hash].copy()
+                yield self.data.by_formula(formula).copy()
         else:
-            for mol in self.data["molecules"].values():
+            for mol in self.data.molecules.values():
                 yield mol.copy()
 
     def get_reactions(
@@ -195,118 +378,44 @@ class ReactionSet:
         reaction: Reaction | None = None,
     ):
         """Returns a copy of the reaction in the database"""
+        if reaction is None and (reactants is not None) and (products is not None):
+            reaction = Reaction(reactants, products)
+
         if reaction is not None:
-            for rxn in self.data["reactions"].get(reaction.reactants.hash(), []):
-                if rxn.products.hash() == reaction.products.hash():
-                    yield rxn.copy()
-        elif (reactants is not None) and (products is not None):
-            reaction: Reaction = Reaction(reactants, products)
-            for rxn in self.data["reactions"].get(reaction.reactants.hash(), []):
+            for rxn in self.data.channels(reaction.reactants.hash()):
                 if rxn.products.hash() == reaction.products.hash():
                     yield rxn.copy()
         elif reactants:
-            for rxn in self.data["reactions"].get(reactants.hash(), []):
+            for rxn in self.data.channels(reactants.hash()):
                 yield rxn.copy()
         elif products:
-            for rxn in self.data["reactions"].get(products.hash(), []):
+            for rxn in self.data.channels(products.hash()):
                 yield rxn.reverse().copy()
         else:
-            for rxn_list in self.data["reactions"].values():
+            for rxn_list in self.data.reactions.values():
                 for rxn in rxn_list:
                     yield rxn.copy()
 
-    @staticmethod
-    def _reference_term(atoms: Atoms, terms: list[Term]) -> Term | None:
-        """Constant shift putting this template on the reference energy scale.
-
-        Diabatic states are compared by their absolute energies, so every
-        bonding topology has to be measured from the same zero.  The dataset
-        supplies that zero: `scripts/compute.py` writes an atomization energy
-        per template (eV, referenced to free atoms, hence exactly 0 for a free
-        atom).  Morse bonds already account for -sum(D) of it at the minimum,
-        so the part the force field cannot reproduce is the residual
-
-            E0 = E_atomization + sum(D)
-
-        which is what gets stored.  Morse therefore carries the physics and the
-        shift only corrects for q-force having fitted each bond locally rather
-        than to the molecule's total atomization energy -- a residual of a few
-        tenths of an eV for most templates here, but +2.59 eV for H2O2, which
-        is worth knowing about rather than silently absorbing.
-
-        Returns None for a template with no reference energy, so datasets whose
-        energies have not been computed yet keep loading unchanged (they simply
-        keep the old, uncalibrated behaviour).
-        """
-        if atoms.calc is None:
-            return None
-        try:
-            e_atomization = atoms.get_potential_energy()  # eV
-        except (RuntimeError, AttributeError):
-            return None
-
-        sum_d = sum(  # kJ/mol
-            term["kwargs"]["D"] for term in terms if term["type"] == "bond"
-        )
-        e0 = e_atomization / (units.kJ / units.mol) + sum_d  # kJ/mol
-
-        # Anchored on atom 0 purely so the term has an index to be remapped
-        # through when the template is matched onto the live system; the energy
-        # belongs to the molecule as a whole and contributes no force.
-        return {"type": "reference", "atoms": {"a1": 0}, "kwargs": {"E0": e0}}
-
     def add_molecule(self, molid: int, molecule: Topology) -> None:
-        molecule_hash = molecule.hash()
-        if molecule_hash in self.data["molecules"]:
-            print(
-                f"WARN: Overwriting molecule {molecule} - {molecule_hash}",
-                file=sys.stderr,
-            )
-        self.data["molecules"][molecule_hash] = molecule
-        self.data["meta"]["molecules"].update(
-            {
-                molid: molecule_hash,
-                molecule.atoms.get_chemical_formula(): molecule_hash,
-            }
-        )
+        self.data.add_molecule(molid, molecule)
 
-    def add_reaction(self, rxnid: int, reaction: Reaction) -> None:
-        reactant_hash, product_hash = reaction.hash()
-        if reactant_hash in self.data["reactions"]:
-            self.data["reactions"][reactant_hash].append(reaction)
-        else:
-            self.data["reactions"][reactant_hash] = [reaction]
+    def add_reaction(self, reaction: Reaction) -> None:
+        self.data.add_reaction(reaction)
 
-        if product_hash in self.data["reactions"]:
-            self.data["reactions"][product_hash].append(reaction.reverse())
-        else:
-            self.data["reactions"][product_hash] = [reaction.reverse()]
+    def set_template_terms(self, molecule_hash: str, terms: list[Term]) -> None:
+        """Install a freshly fitted parameter set onto a stored template.
 
-        self.data["meta"]["reactions"].update(
-            {
-                rxnid: (reactant_hash, product_hash),
-                reaction.equation(): (reactant_hash, product_hash),
-            }
-        )
+        The fitter refits `kwargs` in place rather than rewriting the `.jsonl`
+        files and reloading, so the stored graphs and their hashes stay valid
+        and only the remapped-term cache goes stale.  Clearing it is the half
+        that is easy to forget, which is why this is one call.
+        """
+        self.data.molecules[molecule_hash].terms = terms
+        self._term_cache.clear()
 
-    def get_terms(
-        self, parametrizable: Topology | ReactionNetwork
-    ) -> list[dict[str, Any]]:
-        if isinstance(parametrizable, Topology):
-            return self.get_terms_topology(parametrizable)
-        elif isinstance(parametrizable, ReactionNetwork):
-            return self.get_terms_network(parametrizable)
-        else:
-            raise ValueError(f"Unknown parametrizable object {type(parametrizable)}")
-
-    def get_terms_network(self, network: ReactionNetwork) -> list[Term]:
-        all_terms: list[Term] = []
-        for subnet in network.subnetworks():
-            if subnet.terms:
-                all_terms.extend(subnet.terms)
-                continue
-            subnet.reactions()
-        raise NotImplementedError()
+    def get_terms(self, topology: Topology) -> list[Term]:
+        """Force field terms for `topology`, remapped onto its global indices."""
+        return self.get_terms_topology(topology)
 
     def get_terms_topology(self, topology: Topology) -> list[Term]:
         """Get force field terms to load into topology"""
@@ -334,7 +443,7 @@ class ReactionSet:
                 continue
 
             mol_hash = self.hash_molecule(mol)
-            mol_data: Topology = self.data["molecules"].get(mol_hash)
+            mol_data: Topology | None = self.data.molecules.get(mol_hash)
             if mol_data is None:
                 raise ValueError(self._unknown_molecule_message(mol))
 
@@ -471,85 +580,6 @@ class ReactionSet:
         return ReactionNetwork(graph)
 
     def load(self, path: str | Path) -> None:
-        """Load ReactionSet data from .json or .h5 archive"""
-        if isinstance(path, str):
-            path = Path(path).resolve()
-        if path.suffix == ".json":
-            # load from json manifest
-            with open(path, "r") as fp:
-                data = json.load(fp)
-
-            # NOTE: should use the metadata to handle
-            # merge conflicts with multiple reaction sets
-
-            # **Before anything else.**  `global_params` states the constants
-            # this dataset's `.jsonl` files were fitted at -- the two taper
-            # radii, the exclusion depth, the Morse asymptote -- and the loop
-            # below derives exclusions and solves reference shifts against
-            # exactly those.  Activating them afterwards would fit the templates
-            # on one surface and evaluate them on another, which is the silent
-            # invalidation `forcefield/params.py` exists to close.  A manifest
-            # that omits the key gets the defaults, unchanged.
-            self.params = ForceFieldParams.from_dict(
-                data.get("global_params"), source=str(path)
-            )
-            activate(self.params, source=str(path))
-
-            for mol in data["molecules"]:
-                # load molecule and associated force field
-                data_path: Path = path.parent / mol["path"]
-
-                if data_path.suffix in ioformats:
-                    atoms: Atoms | list[Atoms] = io.read(data_path)
-                else:  # try to read as xyz
-                    atoms: Atoms | list[Atoms] = io.read(data_path.with_suffix(".xyz"))
-                with open(data_path.with_suffix(".jsonl"), "r") as fp:
-                    terms: list[Term] = [json.loads(term) for term in fp.readlines()]
-
-                assert isinstance(atoms, Atoms)
-                # Intramolecular nonbonded exclusions, derived here rather than
-                # stored in the `.jsonl`.  They are a function of the bond graph
-                # and of this dataset's `exclusion_depth`, so deriving them keeps
-                # them correct when either changes, and keeps the term files to
-                # the parameters a fit actually produces.  A dataset shipping its
-                # own exclusions explicitly is left alone.
-                terms = with_exclusions(
-                    terms, atoms.get_atomic_numbers(), params=self.params
-                )
-                # A template that already states its shift keeps it.  Templates
-                # whose Morse depths have been fitted to carry the atomization
-                # energy state it as zero, and synthesizing another one here
-                # would count the same energy twice.
-                if not any(term["type"] == "reference" for term in terms):
-                    reference = self._reference_term(atoms, terms)
-                    if reference is not None:
-                        terms = terms + [reference]
-                molecule = Topology.from_terms(terms, atoms)
-                self.add_molecule(mol["id"], molecule)
-
-            for rxn in data["reactions"]:
-                # load reactions and associated diabatic coupling force field
-                data_path: Path = path.parent / rxn["path"]
-
-                if data_path.suffix in ioformats:
-                    atoms: Atoms | list[Atoms] = io.read(data_path, index=":")
-                else:  # try to read as xyz
-                    atoms: Atoms | list[Atoms] = io.read(
-                        data_path.with_suffix(".xyz"), index=":"
-                    )
-
-                with open(data_path.with_suffix(".jsonl"), "r") as fp:
-                    terms: list[Term] = [json.loads(term) for term in fp.readlines()]
-
-                reaction = Reaction.from_atoms(atoms, terms)
-                self.add_reaction(rxn["id"], reaction)
-
-        elif path.suffix == ".h5":
-            # load from h5
-            raise NotImplementedError(".h5 io not implemented")
-        else:
-            raise ValueError("Reaction set path should point to one of: .json, .h5")
-
-    def save(self, path: str | Path) -> None:
-        """Save as .h5 archive"""
-        pass
+        """Load ReactionSet data from a .json manifest"""
+        self.data = ReactionSetData.from_manifest(path)
+        self._reset_caches()

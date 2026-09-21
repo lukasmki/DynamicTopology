@@ -70,11 +70,17 @@ def scaffold(args: argparse.Namespace) -> int:
         "description": args.description or f"{name} reaction set",
         "version": "1.0.0",
         "author": args.author or "",
+        # `smiles` is annotation, not input: nothing in the loader reads it, but
+        # a manifest entry is otherwise just an id and a path, and the species a
+        # template stands for is only recoverable by opening its `.xyz`.  Write
+        # it as a placeholder so a scaffolded dataset has the slot to fill.
         "molecules": [
-            {"id": i, "path": f"molecules/{m}"} for i, m in enumerate(args.molecules, 1)
+            {"id": i, "smiles": "", "path": f"molecules/{m}"}
+            for i, m in enumerate(args.molecules, 1)
         ],
         "reactions": [
-            {"id": i, "path": f"reactions/{r}"} for i, r in enumerate(args.reactions, 1)
+            {"id": i, "smiles": "", "path": f"reactions/{r}"}
+            for i, r in enumerate(args.reactions, 1)
         ],
     }
     path = root / f"{name}.json"
@@ -311,7 +317,7 @@ def probe(args: argparse.Namespace) -> int:
         print(f"  {stem.name:<14} {formula:<8} E_atomization = {e:>12.6f} eV")
 
     print("\n== reaction table (database key -> stored templates)")
-    for h, lst in rs.data["reactions"].items():
+    for h, lst in rs.data.reactions.items():
         flag = "  <-- degenerate: stored twice, see SKILL.md" if len(lst) > 1 and lst[0].equation() == lst[1].reverse().equation() else ""
         print(f"  {h[:10]}  n={len(lst)}  {[x.equation() for x in lst]}{flag}")
 
@@ -355,7 +361,7 @@ def probe(args: argparse.Namespace) -> int:
         frames = io.read(stem.with_suffix(".xyz"), index=":")
         for frame in (frames[0], frames[-1]):
             for mol in Topology.from_atoms(frame).molecules():
-                if rs.hash_molecule(mol) not in rs.data["molecules"]:
+                if rs.hash_molecule(mol) not in rs.data.molecules:
                     missing.add(frame[sorted(mol.graph.nodes)].get_chemical_formula())
     if missing:
         print(f"  [FAIL] no template for {sorted(missing)} -- add them to the manifest")
@@ -384,8 +390,8 @@ def run(args: argparse.Namespace) -> int:
     mpath = Path(args.manifest).resolve()
     manifest = json.loads(mpath.read_text())
     rs = ReactionSet(mpath)
-    print(f"loaded {mpath.name}: {len(rs.data['molecules'])} templates, "
-          f"{sum(len(v) for v in rs.data['reactions'].values())} stored reactions")
+    print(f"loaded {mpath.name}: {len(rs.data.molecules)} templates, "
+          f"{rs.data.n_reactions} stored reactions")
 
     stems = {(mpath.parent / e["path"]).name: mpath.parent / e["path"] for e in manifest["molecules"]}
     if args.template not in stems:

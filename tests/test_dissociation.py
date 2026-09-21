@@ -1,8 +1,8 @@
 """Barrierless bond fission and recombination.
 
-Seven of HCombustion's nineteen channels change exactly one bond in one
+Six of HCombustion's nineteen channels change exactly one bond in one
 direction -- `rxn_05` (H2), `rxn_06` (O2), `rxn_07` (HO), `rxn_08` (H2O),
-`rxn_09` (HO2), `rxn_15` (H2O2) and `rxn_03` (H + HO recombination).  None of
+`rxn_09` (HO2) and `rxn_15` (H2O2).  None of
 them has a saddle, and that used to mean none of them could be coupled: the
 `fit.coupling.fit_amplitude` route inverts a reference barrier, and for a
 barrierless channel its discriminant `(Hbar - E)**2 - dH**2` vanishes
@@ -284,15 +284,20 @@ class TestAdmission:
     def test_every_fission_channel_carries_a_fitted_coupling(self):
         """No channel is left decoupled, and none is a placeholder.
 
-        The seven channels that change one bond in one direction all used to read
+        The six channels that change one bond in one direction all used to read
         `A = 0.0, provenance: decoupled`.  They now carry a `twobody` term fitted
         from their own diabatic crossing, which is what makes them visible to
         `EVBBasis` at all -- and `provenance` is what `Block.placeholder_channels`
         reports on, so a channel that regressed to a stand-in amplitude would show
         up in a trajectory rather than only here.
+
+        `rxn_03` used to be listed here and is not a fission.  Its reactant frame
+        was missing the H-H bond, so it parsed as `H + H + OH -> H + H2O` -- one
+        bond, no saddle -- and `_fission` routed it accordingly.  With the bond
+        stated it is `H2 + OH -> H2O + H`: two bonds, a real barrier (TS 0.112 eV
+        above the reactant), and a `threebody` transfer coupling.
         """
         fissions = [
-            "rxn_03",
             "rxn_05",
             "rxn_06",
             "rxn_07",

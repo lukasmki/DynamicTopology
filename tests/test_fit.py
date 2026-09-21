@@ -47,6 +47,7 @@ from ase import io
 
 from DynamicTopology.basis import EVBBasis
 from DynamicTopology.core import ReactionSet
+from DynamicTopology.core.reactionset import _reference_term
 from DynamicTopology.fit.coupling import (
     CouplingFitError,
     fit_amplitude,
@@ -163,7 +164,7 @@ class TestDissociationFit:
             assert len(shifts) == 1, f"{name} states no reference shift"
             assert shifts[0]["kwargs"]["E0"] == 0.0
 
-            synthesized = ReactionSet._reference_term(atoms, fitted)
+            synthesized = _reference_term(atoms, fitted)
             assert synthesized is not None
             assert abs(synthesized["kwargs"]["E0"]) > 1e-6, (
                 f"{name}'s synthesized shift is zero anyway, so this test is not "

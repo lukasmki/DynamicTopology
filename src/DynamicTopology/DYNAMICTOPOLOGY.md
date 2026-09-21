@@ -137,7 +137,7 @@ $$
 
 and applying it is the edge rewrite $E(T') = \big(E(T)\setminus\mathcal{B}\big)\cup\mathcal{F}$.
 
-**Network construction** (`ReactionSet.get_network`, [core/reactionset.py:351](core/reactionset.py#L351)).
+**Network construction** (`ReactionSet.get_network`, [core/reactionset.py:517](core/reactionset.py#L517)).
 Nodes are molecules. Unimolecular channels are self-loops. A bimolecular channel
 between molecules $\mu,\nu$ is offered only when their minimum-image separation
 is under the cutoff:
@@ -932,7 +932,7 @@ and the screen takes it to exactly 0.
 
 `exclusions.exclusion_terms` derives one term per pair within `exclusion_depth = 3`
 bonds (GROMACS `nrexcl = 3`), at load time
-([core/reactionset.py:497](core/reactionset.py#L497)), for all three sums:
+([core/reactionset.py:183](core/reactionset.py#L183)), for all three sums:
 
 | term | evaluated by | note |
 | --- | --- | --- |
@@ -1396,7 +1396,7 @@ how bonds break and form across MD steps.
 
 ## 5. Parameterization
 
-### 5.1 Reference shift (`ReactionSet._reference_term`, [core/reactionset.py:205](core/reactionset.py#L205))
+### 5.1 Reference shift (`reactionset._reference_term`, [core/reactionset.py:27](core/reactionset.py#L27))
 
 The dataset supplies an atomization energy per template (eV, referenced to free
 atoms, hence exactly 0 for a free atom). Morse bonds already account for

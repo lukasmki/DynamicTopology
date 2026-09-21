@@ -1420,7 +1420,7 @@ def install_templates(
     the files and reloading is both slow and a side effect on the dataset the
     fit has not yet decided to keep.  Only `kwargs` change, so the stored
     `Topology` graphs and hashes stay valid; the remapped-term cache does not,
-    and is cleared.
+    which is why this routes through `ReactionSet.set_template_terms`.
 
     Only `kwargs` change, so no term list is rebuilt on the way in.  This used
     to route through `lj.with_exclusions`, and installing without it silently
@@ -1433,8 +1433,7 @@ def install_templates(
 
     for (_, atoms, original), terms in zip(templates, fitted):
         key = Topology.from_terms(original, atoms).hash()
-        reaction_set.data["molecules"][key].terms = terms
-    reaction_set._term_cache.clear()
+        reaction_set.set_template_terms(key, terms)
 
 
 def reaction_margins(

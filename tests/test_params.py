@@ -462,7 +462,7 @@ class TestTheTemplateFollowsItsManifest:
 
         rset = ReactionSet(manifest)
         assert rset.params.exclusion_depth == 0
-        molecule = next(iter(rset.data["molecules"].values()))
+        molecule = next(iter(rset.data.molecules.values()))
         assert not any(term["type"].endswith("exclusion") for term in molecule.terms), (
             "a depth of 0 still derived exclusions; the manifest was read too late"
         )
@@ -479,5 +479,5 @@ class TestTheTemplateFollowsItsManifest:
             '{"molecules": [{"id": 1, "path": "molecules/h2o"}], "reactions": []}'
         )
 
-        molecule = next(iter(ReactionSet(manifest).data["molecules"].values()))
+        molecule = next(iter(ReactionSet(manifest).data.molecules.values()))
         assert any(term["type"].endswith("exclusion") for term in molecule.terms)

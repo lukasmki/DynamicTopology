@@ -72,7 +72,7 @@ def reaction_set():
 def templates(reaction_set):
     return {
         t.atoms.get_chemical_formula(): t
-        for t in reaction_set.data["molecules"].values()
+        for t in reaction_set.data.molecules.values()
     }
 
 

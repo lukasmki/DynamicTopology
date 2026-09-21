@@ -160,10 +160,18 @@ no topology update.
   ensemble). `get_mapping()` uses `nx.isomorphism.GraphMatcher` to map template indices onto
   live global indices; `apply()` diffs reactant/product edges and returns a new `Topology`.
 - `ReactionNetwork` — `nx.MultiGraph` over molecules; `states()` produces the diabatic state list.
-- `ReactionSet` — the database. Keyed by WL hash: `data["molecules"][hash] -> Topology`,
-  `data["reactions"][hash] -> list[Reaction]` (both directions stored, forward under the reactant
-  hash and reversed under the product hash). `get_terms()` looks up a molecule's parameter
-  template and remaps indices into the live system, caching on `(mol_hash, frozenset(nodes))`.
+- `ReactionSetData` — the database, a dataclass: `molecules: {wl_hash -> Topology}`,
+  `reactions: {wl_hash -> list[Reaction]}` (both directions stored, forward under the reactant
+  hash and reversed under the product hash), the manifest's `ids`/`formulas` indexes onto
+  molecule hashes, the dataset's `params`, and the manifest `source`. `from_manifest()` is the
+  whole of the parse, which is what keeps the "activate `global_params` before reading a single
+  template" ordering inside one function. Lookups are `channels()`, `by_id()`, `by_formula()`.
+- `ReactionSet` — the cached query engine over one `ReactionSetData` (held as `.data`), mapping
+  it onto a live system's atom indices. `get_terms()` looks up a molecule's parameter template
+  and remaps indices into the live system, caching on the molecule signature; four caches hang
+  off it and `load()` resets them all. `set_template_terms()` is how the fitter installs a
+  refit without writing files — it clears the term cache, which is the half that is easy to
+  forget.
 
 ### The "term" format
 
@@ -193,12 +201,15 @@ and `ase.py` divides by the cell volume to publish `stress`, which is what the A
 ### I/O and datasets
 
 `io/xml.py` parses OpenMM-style `<Forces>` XML (as emitted by q-force) into terms; `io/json.py`
-reads/writes the canonical JSONL term format (one term per line). `io/h5.py` is empty and
-`ReactionSet.load()` raises `NotImplementedError` for `.h5`; `ReactionSet.save()` is a stub.
+reads/writes the canonical JSONL term format (one term per line). `io/h5.py` is empty; there is
+no `.h5` route and no `ReactionSet.save()` — a manifest is the only thing a set loads from.
 
 A dataset is a manifest JSON (`datasets/HCombustion/HCombustion.json`) listing molecule and
 reaction entries by *extensionless* path; loading pairs each `<path>.xyz` (geometry; reactions
-read `index=":"` as reactant/TS.../product) with `<path>.jsonl` (parameters). The manifest also
+read `index=":"` as reactant/TS.../product) with `<path>.jsonl` (parameters). Each entry also
+carries a `smiles` — a molecule SMILES, or a `reactants>>products` reaction SMILES whose two
+sides match the first and last frames of the `.xyz`. It is documentation only: identity is the
+WL hash of the bond graph, and `from_manifest` never reads the field. The manifest also
 carries `global_params`, the force field constants the dataset was fitted at — see the Architecture
 note above and `forcefield/README.md`.
 

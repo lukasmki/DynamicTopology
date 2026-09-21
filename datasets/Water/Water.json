@@ -4,16 +4,16 @@
     "version" : "1.0.0",
     "author": "Lukas Kim",
     "molecules": [
-        {"id" : 1, "path": "molecules/h"},
-        {"id" : 2, "path": "molecules/o"},
-        {"id" : 3, "path": "molecules/h1o"},
-        {"id" : 4, "path": "molecules/h2o"},
-        {"id" : 5, "path": "molecules/h3o"}
+        {"id" : 1, "smiles": "[H]",    "path": "molecules/h"},
+        {"id" : 2, "smiles": "[O]",    "path": "molecules/o"},
+        {"id" : 3, "smiles": "[OH-]",  "path": "molecules/h1o"},
+        {"id" : 4, "smiles": "O",      "path": "molecules/h2o"},
+        {"id" : 5, "smiles": "[OH3+]", "path": "molecules/h3o"}
     ],
     "reactions": [
-        {"id": 1, "path" : "reactions/h3o-h2o-transfer"},
-        {"id": 2, "path" : "reactions/h2o-oh-transfer"},
-        {"id": 3, "path" : "reactions/h2o-autoionization"}
+        {"id": 1, "smiles": "[OH3+].O>>O.[OH3+]",    "path" : "reactions/h3o-h2o-transfer"},
+        {"id": 2, "smiles": "O.[OH-]>>[OH-].O",      "path" : "reactions/h2o-oh-transfer"},
+        {"id": 3, "smiles": "O.O>>[OH-].[OH3+]",     "path" : "reactions/h2o-autoionization"}
     ],
     "global_params": {
         "bond_asymptote": 1.0,

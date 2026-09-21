@@ -1,16 +1,28 @@
 # Equation Reference
 
-The potential energy of **one fixed bonding pattern**.  Every equation below is
-a function of atomic positions and a parameter set; nothing here knows about
-reaction networks or state mixing.
+Every equation this directory evaluates, and nothing about how they are
+assembled.  There are two kinds.  The **diagonal** is the potential energy of
+one fixed bonding pattern; the **off-diagonal** is the coupling between two of
+them.  Both are functions of atomic positions and a parameter set alone —
+which states exist, which channels connect them and how the Hamiltonian is
+diagonalized is `basis.py` and `system.py`.
 
 ```
-E  =  E_bonded  +  E_ZBL  +  E_12-6  +  E_Coulomb  -  E_excl
-      \________/  \______________________________/  \______/
-       qforce.py   summed over every pair in the     removes the
-       per term    system, no bond graph consulted   near-neighbour
-                   (zbl.py, lj.py, acks2.py)         double count
+H_ss  =  E_bonded  +  E_ZBL  +  E_12-6  +  E_Coulomb  -  E_excl
+         \________/  \______________________________/  \______/
+          qforce.py   summed over every pair in the     removes the
+          per term    system, no bond graph consulted   near-neighbour
+                      (zbl.py, lj.py, acks2.py)         double count
+
+H_st  =  V(x)        coupling.py -- one Gaussian per reaction channel,
+                     nonzero only near the geometry it is centred on
 ```
+
+Only two of those five depend on the bonding pattern: `E_bonded` and `E_excl`.
+The three whole-system sums are deliberately blind to the bond graph, so they
+are the same number on every state and are evaluated once, outside the
+Hamiltonian — which is what makes the exclusions the interesting term rather
+than a bookkeeping detail.
 
 ## Units
 
@@ -18,11 +30,47 @@ E  =  E_bonded  +  E_ZBL  +  E_12-6  +  E_Coulomb  -  E_excl
 | --- | --- | --- | --- |
 | `qforce.py` internals, `lj.pair_potential` | nm | kJ/mol | converted to eV / Å at the end of `QForce.__call__` |
 | `zbl.py`, `acks2.py` | Å | eV | ZBL constants and `ccoul` are stated in these units |
+| `coupling.py` | Å | eV | ASE units throughout; nothing to convert |
 | everything returned to ASE | Å | eV | forces eV/Å, stress eV/Å³ |
 
 Angles are radians.  `shape_decay`, `PHI_B` and the like are dimensionless;
-`SCREENING_LENGTH` is Å, `ccoul` is eV·Å, `gamma` is 1/Å.  The global
+`SCREENING_LENGTH` is Å, `ccoul` is eV·Å, `gamma` is 1/Å.  A coupling's `A` is
+eV and its `a` is 1/Å²; `r0`, `ra0`, `rb0` are Å and `t0` radians.  The global
 parameters and their units are tabulated at the bottom of this file.
+
+---
+
+## Term types at a glance
+
+`core/types.py` defines a term as `{"type", "atoms", "kwargs"}`; each force field
+dispatches on the type to its own `compute_<type>` and silently skips a type it
+has no method for.  Every type in play, and where it comes from:
+
+| type | evaluated by | kwargs | comes from |
+| --- | --- | --- | --- |
+| `bond` | `QForce` | `D, r0, k, c, b` | template `.jsonl` |
+| `angle` | `QForce` | `theta0, k` | template `.jsonl` |
+| `bondbond`, `bondangle`, `angleangle` | `QForce` | see cross terms | template `.jsonl` |
+| `periodicdihedral`, `dihedralbond`, `dihedralangle`, `dihedralangleangle` | `QForce` | see dihedrals | template `.jsonl` |
+| `reference` | `QForce` | `E0` | set by `ReactionSet.load` |
+| `atom` | `ACKS2` | `mu, eta, soft_amp, soft_decay` | template `.jsonl` |
+| `lennardjones` | `LennardJones` | `sigma, eps` | template `.jsonl` |
+| `exclusion` | `QForce` | `sigma, eps`, already combined | derived at load |
+| `zblexclusion` | `QForce` | `z1, z2` | derived at load |
+| `coulombexclusion` | `ACKS2` | none — the pair is the whole term | derived at load |
+| `twobody`, `threebody`, `rmsd` | `EVBCoupling` | see coupling | reaction `.jsonl` |
+
+`atom` and `lennardjones` carry no energy of their own; they are how a template
+hands its per-atom nonbonded parameters to a whole-system sum.  `ZBL` takes no
+terms at all — it reads atomic numbers straight off the `Atoms`, so the only
+thing it can be a function of is the geometry and the elements.
+
+The three exclusion types are **not** in any `.jsonl`.  `ReactionSet.load`
+derives them per template from the bond graph at the dataset's
+`exclusion_depth`, which is why a raw term list scored outside the loader reads
+hundreds of eV high — H2 came out at +842 eV against a reference of −4.67.
+Anything evaluating a term list against a reference energy goes through
+`exclusions.with_exclusions`.
 
 ---
 
@@ -247,21 +295,199 @@ removed, so that a molecule's geometry is set by its bonded terms:
 
 | term | how it is removed | where |
 | --- | --- | --- |
-| 12-6 | `exclusion` term, `E = -u_LJ(r, σ_ij, ε_ij)` | `QForce.compute_exclusion` |
+| 12-6 | `exclusion` term, `E = -u_126(r, σ_ij, ε_ij)` | `QForce.compute_exclusion` |
 | ZBL | `zblexclusion` term, `E = -u_ZBL(r, Z1, Z2)` | `QForce.compute_zblexclusion` |
-| Coulomb | screen `S_ij = 0` on the energy functional | `ACKS2.compute` |
+| Coulomb | `coulombexclusion` term, in two places (below) | `ACKS2`, `System.calculate` |
 
-The first two are ordinary additive pair corrections and go through the *same*
-`pair_potential` as the whole-system sum, switch included, so the cancellation
-is exact.  Coulomb cannot be subtracted that way — the charges come from a
-solve whose matrix contains the kernel — so it is screened in the energy
-functional while the solve stays unmasked.
+The first two are ordinary additive pair corrections, evaluated per diabatic
+state alongside the bonded terms, and they go through the *same* `pair_potential`
+as the whole-system sum, switch included, so the cancellation is exact.  A pair
+gets an `exclusion` only if both atoms carry a nonzero σ and ε: `sigma_H = 0` in
+the Water set makes the whole-system 12-6 identically zero on every H–H pair, so
+there is nothing to cancel and a term would be an expensive no-op.  ZBL and
+Coulomb have no such escape — ZBL has no free parameters and the charge kernel is
+element-independent — so every near pair gets one of each.
+
+### Why Coulomb takes two
+
+`ACKS2`'s charges come from a solve whose matrix *contains* the kernel, so the
+exclusion cannot simply be subtracted from the energy.  Masking the kernel inside
+the solve would be the more obviously consistent thing to do and is still wrong:
+it makes the charges a function of the bond graph, and a term evaluated once
+outside the Hamiltonian must not be (measured at **0.88 eV** of pivot dependence,
+`tests/test_evb_invariants.py`).  So the charges are solved once from the
+**unmasked** kernel and the exclusion is applied afterwards, as the same quantity
+seen from two directions:
+
+```
+per state   H_ss += -ccoul * sum_{(i,j) in excl(s)} Q_i Q_j K_ij
+            one lookup per excluded pair into a kernel already built
+            (ACKS2.exclusion_energy).  This is the half that lets the
+            exclusion decide which bonding pattern is lower.
+
+once        S_ij = 1 - sum_s w_s M_ij^s
+            E    = (ccoul / 2) sum_ij S_ij Q_i Q_j K_ij
+            M^s the mask of state s, w_s its ground-state weight
+            (ACKS2.screen_matrix).  One contraction, one adjoint solve,
+            for the whole system.
+```
+
+Fractional entries of `S` are the normal case and not an interpolation: every
+state's correction is linear in its own mask and the kernel contraction is linear
+in its weight, so the Hellmann-Feynman sum `sum_s w_s dE_s/dr` collapses into a
+single weight matrix.  A pair bonded in every state of a block comes out at
+exactly 0; one bonded in some of them is removed in proportion.  `S` is held
+fixed under the derivative, which is what Hellmann-Feynman says to do with
+eigenvector components.
+
+That is why `ACKS2` is split in two.  `prepare` solves the charges *before* the
+diagonalization, because the per-state diagonal corrections need them; `compute`
+applies the screen *after* it, because the screen needs the weights the
+diagonalization produced.  One asymmetry has to be got right in
+`compute_response_forces`: `dE/dQ` is screened because the energy is, while the
+`-lam^T (dA/dr) x` weight is not, because `A` never was.  Either mistake shows up
+only as NVE drift.
+
+**What the exclusion costs is the intramolecular half of the polarization
+response, and that is a real 0.07 eV of the hydrogen bond.**  The water dimer
+well goes from 0.1677 eV at 2.85 Å to 0.1024 eV at 2.91 Å — datasets held fixed,
+so this is the mechanism and not a refit.  The molecules polarize each other, the
+charges grow (`q_H` +0.30399 → +0.31264 at 2.85 Å), and the intramolecular
+Coulomb energy falls along with the intermolecular one; booking that gain inside
+the molecule is exactly what the exclusion exists to stop.  `eta` is the lever
+that pays it back, since the intermolecular term scales as `q²` — see
+`datasets/Water/README.md`.
+
+The charges themselves are untouched by all of this: an isolated water still
+comes out at `q_H = +0.30399`, so nothing about a molecule's dipole moves.  The
+exclusion is, however, the first thing here to contract the periodic kernel
+against a **non-neutral** weight, which is what exposed the missing `k = 0`
+background above — an individual `K_ij` was not a well-defined number until that
+was carried explicitly.
+
+---
+
+## Coupling — the off-diagonal (`coupling.py`)
+
+Everything above is a diagonal entry.  This module is `H_st`: one Gaussian per
+reaction channel, dispatched by term type exactly as `QForce` is, in ASE units
+(Å, eV) throughout.
+
+**There are three forms, and a channel's own connectivity change picks which.**
+`scripts/fit.py` routes on the bond-graph difference between the first and last
+frame of the channel's `.xyz` — `_fission` first, then `_transfer`, then the RMSD
+fallback:
+
+| type | the channel | V | parameters |
+| --- | --- | --- | --- |
+| `twobody` | one bond broken or formed, separating two fragments | `A exp(-a (r - r0)²)` | `A, a, r0` |
+| `threebody` | one bond broken and one formed, sharing an atom | `A exp(-a g)` | `A, a, ra0, rb0, t0` |
+| `rmsd` | anything else | `(A/M) Σ_m exp(-a ρ_m²)` | `A, a` + a TS ensemble |
+
+`twobody`'s `r` is the length of the bond that changes.  `threebody`'s `g` is the
+transferring atom's own triangle, on `atoms = (donor, transferring atom,
+acceptor)` with the mover central, as `compute_angle` orders a vertex:
+
+```
+ra = |H - D|,   rb = |H - A|,   d = |A - D|
+d0 = sqrt( ra0² + rb0² - 2 ra0 rb0 cos t0 )        law of cosines
+g  = (ra - ra0)² + (rb - rb0)² + (d - d0)²         Å²
+```
+
+`t0` is stored as an angle because that is the readable parameter and used as a
+length so that one width `a` is dimensionally consistent across all three sides.
+The three sides are a **complete** description of the triangle and a
+non-redundant one, so this is the transfer's full geometry, not a projection of
+it.  `rmsd`'s `ρ_m` is the optimally superposed RMSD to the m-th frame of the
+channel's stored transition-state ensemble — Diamond's quaternion form of the
+rotational superposition (`_kabsch`), with unit weights and no rescaling, batched
+over the channels of one template.  `twobody` and `threebody` need no ensemble at
+all: they are *centred* on a geometry rather than measured against one, and they
+accept the argument only for the uniform `compute_*` signature.
+
+**Two independent things distinguish the forms: where the amplitude comes from,
+and what the width is measured in.**
+
+| form | amplitude from | width measured in |
+| --- | --- | --- |
+| `twobody` | the diabatic crossing | the breaking bond's length |
+| `threebody` | the reference barrier | the transferring atom's triangle |
+| `rmsd` | the reference barrier | the RMSD to the whole geometry |
+
+Only `twobody` changes the amplitude, and only because it has to.  A transfer's
+amplitude is the reference barrier `E*` inverted through the 2x2 secular
+equation at the transition state, where `V = A` exactly:
+
+```
+A = -sqrt( (Hm - E*)^2 - dH^2 ),     Hm = (H_R + H_P) / 2
+                                     dH = (H_R - H_P) / 2
+```
+
+A fission has no saddle, so there is no barrier to invert.  The bound diabat
+*is* the ground state up to the crossing, so a perfect reactant diabat puts the
+reference barrier exactly on it, the discriminant above vanishes identically,
+every imperfection makes it imaginary, and the best attainable `A` is zero —
+which `basis.EVBBasis` drops at every geometry.  That is why H2, OH and H2O could
+not come apart at all, and no refit of the force field moves it.  Centring on
+the crossing asks a question that has an answer instead.  It also makes the
+ordinary admission gate sufficient: at a crossing the diabats are degenerate, so
+the stabilization `hypot(dH, V) - |dH|` is `|A|` exactly, and a Gaussian centred
+there is at its maximum exactly there — so a fission channel is admitted at the
+one geometry where the topology decision is taken, by construction rather than
+by luck.
+
+A transfer *does* have a saddle and a reference barrier, and a barrier is
+ab-initio data worth fitting to, so `threebody` leaves `fit_amplitude` untouched
+— `g = 0` at the reference triangle, so `V = A` there exactly, which is the one
+property the inversion above needs — and changes only the metric the **width**
+lives in.  An RMSD is a tolerance on all `3N` coordinates at once, so any
+spectator switches the coupling off: with
+`h2o-autoionization`'s three transfer atoms held exactly at its transition state,
+displacing only the three spectators by 0.1 Å — less than thermal motion at 300 K
+— takes the RMSD coupling from 4.14 eV to 8.4e-3, while the triangle form holds
+at 4.14.  Under the RMSD form a 64-water box never admitted a single diabatic
+state at any `eps` (`datasets/Water/README.md`); neutral water at 300 K never
+puts all `3N` coordinates that close at once.
+
+A crossing-centred fit is equally not the right answer for a transfer:
+`h2o-autoionization`'s two diabats never cross along the proton coordinate at
+all, the products being 9.8 eV uphill in the gas phase, so there is no degeneracy
+to centre anything on.
+
+**No shipped channel uses `rmsd` any more.**  All 22 channels across HCombustion
+and Water carry a fitted `twobody` (6) or `threebody` (16) term, none on a
+placeholder and none decoupled.  The RMSD form is retained as the fallback for a
+channel that is neither a fission nor a transfer — two independent bond changes
+sharing no atom have no single coordinate to be a function of.
+
+Two conventions differ from `QForce`.  These `compute_*` methods return
+`(E, F)`, not a triple; `__call__` forms the virial once, from absolute
+positions:
+
+```
+W_ab  =  sum_i pos_a (dE/dpos_i)_b  =  -sum_i pos_a F_b
+```
+
+which is origin-independent because a coupling's forces sum to zero — for `rmsd`
+because the superposition removes the centroid, for the other two because they
+are pair and triangle terms.  (An RMSD to a fixed template is not
+scale-invariant the way it is rotation- and translation-invariant, which is why
+this term carries a stress at all rather than dropping out.)  And `pos` may carry
+a leading batch axis: every channel of one template in one force call shares `n`
+and the ensemble, so the fixed cost of the superposition is paid once per
+template instead of once per channel.  Under PBC the fragment is unwrapped by
+cumulative minimum image first, which is affine in the cell, so the expression
+above is still the strain derivative.
+
+The admission gate, the switching ramp that brings a channel's coupling in
+smoothly, and the caching of channel couplings are `basis.py`, not here.
 
 ---
 
 ## Gradient conventions
 
-Every term returns `(energy, forces, virial)`.
+Every diagonal term returns `(energy, forces, virial)`; a coupling returns
+`(energy, forces)` and `EVBCoupling.__call__` forms the virial for it.
 
 ```
 F_i     = -dE/d(pos_i)
@@ -269,17 +495,22 @@ W_ab    =  sum_v  v_a * (dE/dv)_b              virial, a 3x3
 stress  =  W / V                               what ase.py publishes
 ```
 
-Every energy here is a function of minimum-image displacement vectors alone, so
-a homogeneous strain maps `v -> (I + e) v` and the virial is built from the same
-per-pair gradient the forces are scattered from — no new derivative is needed.
+Every energy on the diagonal is a function of minimum-image displacement vectors
+alone, so a homogeneous strain maps `v -> (I + e) v` and the virial is built from
+the same per-pair gradient the forces are scattered from — no new derivative is
+needed.  A coupling is the one term written over absolute positions rather than
+separations, and it gets away with it because its forces sum to zero; see its
+section above.
 
 **Unit trap:** the virial is an energy.  It converts with `units.kJ / units.mol`
 and *no* length factor, unlike the forces.
 
 Adding a new functional form means adding one `compute_<type>` method returning
-that triple, plus a case in `tests/test_gradients.py` (finite differences of the
-forces) and one in `tests/test_stress.py` (finite differences of the virial
-against the cell).
+that triple — or that pair, for a coupling — plus a case in
+`tests/test_gradients.py` (finite differences of the forces) and one in
+`tests/test_stress.py` (finite differences of the virial against the cell).
+Nothing else needs to change: dispatch is by name, and a type with no matching
+method is silently skipped.
 
 ---
 
@@ -387,7 +618,7 @@ and what survives at 2.2 Å / 0.12 Å:
 | pair | bare | switched |
 | --- | --- | --- |
 | O–H bond, 0.958 Å | 953 eV | 0.031 eV |
-| H–H bond, 0.741 Å | 892 eV | 0.005 eV |
+| H–H bond, 0.741 Å | 892 eV | 0.004 eV |
 | O–O bond, 1.208 Å | 1375 eV | 0.353 eV |
 | water's 1-3 H···H, 1.51 Å | 0.138 eV | 0.0004 eV |
 | the H-bond O···H, 1.94 Å | 0.146 eV | 0.015 eV |
@@ -438,9 +669,14 @@ it for the process.  An unknown key is an error rather than a no-op: a typo
 would otherwise leave the default in force and produce a dataset whose manifest
 claims a radius the force field never saw.
 
-Both datasets in this repository pin their values explicitly, so a future change
-to a default cannot silently invalidate the `.jsonl` files already on disk.
-Changing a pinned value still requires re-running `scripts/fit.py
+Both datasets in this repository pin the eight parameters that enter the fitted
+surface — `bond_asymptote`, `taper_radius`, `taper_width`, `switch_radius`,
+`core_fraction`, `exclusion_depth`, `exclude_coulomb`, `gamma` — so a future
+change to one of *those* defaults cannot silently invalidate the `.jsonl` files
+already on disk.  `switch_width` follows from the pinned `taper_width` and
+`shape_decay` is a fallback only, which leaves `ccoul` and `zbl_ccoul` as the
+two that are still taken from the defaults and would move a fitted surface if
+they changed.  Changing a pinned value still requires re-running `scripts/fit.py
 --force-constants` for that dataset.
 
 **Two datasets fitted at different parameters cannot share one process.**

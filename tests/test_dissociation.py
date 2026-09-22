@@ -15,8 +15,9 @@ these tests are about:
 
   `qforce.BOND_ASYMPTOTE`     puts the dissociated limit of a bonded diabat
                               *above* the free-fragment one, so the two diabats
-                              genuinely cross -- at 2.39 A for H2, 2.94 for OH,
-                              3.33 for H2O.
+                              genuinely cross -- at 1.80 A for H2, 1.95 for OH,
+                              1.93 for H2O, where each bond's fitted asymptote
+                              `h` (not the global floor) puts them.
   `fit.coupling.fit_twobody`  fits a Gaussian in the breaking bond's *length*,
                               centred on that crossing, so there is a real
                               off-diagonal for the ordinary gate to admit.
@@ -53,7 +54,11 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # Where each fission's diabats cross, from `fit.coupling.find_crossing` -- the
 # `r0` written into the channel's own term file.  A refit is allowed to move
 # these; they are quoted so a scan can be aimed, not as a bar.
-CROSSINGS = {"H2": 2.210, "OH": 2.078}
+#
+# 2026-09-22, the per-bond asymptote replacing the shape term: 2.210 -> 1.800
+# (H2), 2.078 -> 1.950 (OH).  A higher `h` lifts the bonded diabat faster, so
+# it meets the fragments' sooner.
+CROSSINGS = {"H2": 1.800, "OH": 1.950}
 
 
 @pytest.fixture(scope="module")
@@ -129,7 +134,7 @@ class TestFission:
         lower one at every separation and neither the `eps` gate nor `argmax`
         could ever let go.
 
-        The break lands slightly *past* the crossing -- 2.44 A against 2.39 for
+        The break lands slightly *past* the crossing -- 1.83 A against 1.80 for
         H2 -- and that is `System._pivot`, not a mis-centred coupling: it swaps
         on a squared eigenvector weight past a threshold, so it waits until the
         dissociated state clearly dominates rather than flipping at degeneracy.
@@ -152,7 +157,10 @@ class TestFission:
         previous energy, so the bond's own steepness -- 1.45 eV/A at the H2
         crossing -- is not mistaken for a discontinuity.
         """
-        steps = stretch(reaction_set, "H2", np.arange(2.0, 2.8, 0.002), True)
+        centre = CROSSINGS["H2"]
+        steps = stretch(
+            reaction_set, "H2", np.arange(centre - 0.2, centre + 0.6, 0.002), True
+        )
         before, after = steps[first_flip(steps) - 1], steps[first_flip(steps)]
         extrapolated = before["energy"] - before["force"] * (after["x"] - before["x"])
         assert after["energy"] == pytest.approx(extrapolated, abs=5e-3)
@@ -230,7 +238,8 @@ class TestFission:
         assert steps[0]["bonds"] == 2
         assert steps[-1]["bonds"] == 1
         broke = next(s for s in steps if s["bonds"] == 1)
-        assert broke["x"] == pytest.approx(2.42, abs=0.4)
+        # 2.42 before the per-bond asymptote; 2.00 after, against a 1.93 crossing.
+        assert broke["x"] == pytest.approx(2.00, abs=0.4)
 
 
 class TestAdmission:
@@ -276,8 +285,13 @@ class TestAdmission:
         reactant carries one O-H at 0.600 A against a 0.95 A minimum, and
         quenching 0.35 A inside the wall would leave the coupling four times
         `eps` where the molecule actually sits.
+
+        1.3 A used to be on this list and is not any more: with the crossing at
+        1.80 A rather than 2.21, H2's channel is admitted from 1.16 A, so a bond
+        stretched 0.56 A past equilibrium -- about 2 eV up the well -- is inside
+        the window.  1.1 A is still outside it.
         """
-        steps = stretch(reaction_set, "H2", [0.7445, 0.9, 1.1, 1.3], True)
+        steps = stretch(reaction_set, "H2", [0.7445, 0.9, 1.1], True)
         assert all(s["nstates"] == 1 for s in steps)
         assert all(s["bonds"] == 1 for s in steps)
 
@@ -335,7 +349,7 @@ class TestRecombination:
         Gaussian serves fission and recombination without a second fit.  It does
         need the crossing to fall *inside* `bimol_cutoff`, because that is the
         only region where the reverse channel is enumerated at all; H2's is at
-        2.39 A against a 4.0 A cutoff.
+        1.80 A against a 4.0 A cutoff.
         """
         steps = stretch(reaction_set, "H2", np.arange(4.0, 0.99, -0.02), False)
         assert steps[0]["bonds"] == 0
@@ -379,14 +393,15 @@ class TestRecombination:
         no stabilization to lose.  Fitted without the outer condition, `rxn_08`'s
         coupling was still worth 0.2 eV at 4.0 A and the energy stepped by
         exactly that when a dissociating OH...H drifted past the cutoff.  With it,
-        H2 leaves the basis at 3.16 A -- through the `eps` gate, well inside the
-        cutoff, which is the point -- for 1.5e-6 eV.
+        H2 leaves the basis at 2.47 A -- through the `eps` gate, well inside the
+        cutoff, which is the point -- for 1.9e-6 eV.
 
         The distance is a force-field property and a refit moves it, so the scan
         starts well inside it; what is asserted is that the exit is decided by
         the `eps` gate rather than by the cutoff, and that it is free.
         """
-        steps = stretch(reaction_set, "H2", np.arange(2.60, 4.20, 0.002), False)
+        start = CROSSINGS["H2"] + 0.1
+        steps = stretch(reaction_set, "H2", np.arange(start, 4.20, 0.002), False)
         left = next(
             i
             for i in range(1, len(steps))

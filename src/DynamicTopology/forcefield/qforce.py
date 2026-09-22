@@ -4,19 +4,18 @@ from typing import Callable
 
 from DynamicTopology.forcefield.params import active
 
-# `SHAPE_DECAY` and `BOND_ASYMPTOTE` are now fields of
-# `params.ForceFieldParams` -- `shape_decay` and `bond_asymptote`.  Both change
-# what `fit/dissociation.py` solves against, so they belong to the dataset
-# fitted at them and not to whichever source tree is installed: a checkout whose
-# asymptote had moved evaluated every template up to 73 meV high and said
-# nothing.  The `b` sweep that demoted `shape_decay` to a fallback, and the
-# diabatic argument for lifting the dissociated limit off zero, moved there with
-# the numbers.
+# `BOND_ASYMPTOTE` is now a field of `params.ForceFieldParams`,
+# `bond_asymptote`.  It changes what `fit/dissociation.py` solves against, so it
+# belongs to the dataset fitted at it and not to whichever source tree is
+# installed: a checkout whose asymptote had moved evaluated every template up to
+# 73 meV high and said nothing.  The diabatic argument for lifting the
+# dissociated limit off zero moved there with the numbers.
 #
 # `bond_asymptote` is stated in eV, as the README table and every measurement
 # quoted there are.  This class works in kJ/mol, so it reads
 # `params.bond_asymptote_kjmol`; mixing the two up is a factor of 96.5 on a
-# quantity that is supposed to be 1 eV.
+# quantity that is supposed to be 1 eV.  A bond's own `h` overrides it and is
+# stored in kJ/mol like `D`.
 
 
 class QForce:
@@ -111,106 +110,65 @@ class QForce:
             w += np.einsum("na,nb->ab", v, dE_dv)
         return w
 
-    def compute_bond(self, vecs, atoms, D, r0, k, c=0.0, b=None):
+    def compute_bond(self, vecs, atoms, D, r0, k, h=None):
         if self.bond_form == "morse":
-            return self._bond_morse(vecs, atoms, D, r0, k, c, b)
+            return self._bond_morse(vecs, atoms, D, r0, k, h)
         return self._bond_harmonic(vecs, atoms, D, r0, k)
 
-    def _bond_morse(self, vecs, atoms, D, r0, k, c=0.0, b=None):
-        """Morse with a one-sided Hulburt-Hirschfelder shape term.
+    def _bond_morse(self, vecs, atoms, D, r0, k, h=None):
+        """Morse with a per-bond asymptote on the stretched branch.
 
-            s = a*max(dr, 0),  a = sqrt(k / 2D)
-            E = D * [ (1 - exp(-a*dr))**2 - 1 + c * s**3 * exp(-b*s) ]
+            Dw = D + h  (dr > 0),   Dw = D  (dr <= 0),   a = sqrt(k / 2Dw)
+            E  = Dw * (1 - exp(-a*dr))**2 - D
 
         The `-D` offset puts the minimum at `-D`, so a topology's energy carries
         the depth of the bonds it contains and breaking a bond costs `+D` rather
-        than nothing.  The *dissociated* limit is `bond_asymptote` above zero,
-        not at it, and the well the exponential climbs is `D + bond_asymptote`
-        deep -- see that constant for why the two are not the same number.
+        than nothing.  The *dissociated* limit is `h` above zero, not at it, and
+        the well the exponential climbs is `D + h` deep.  `h` is in kJ/mol like
+        `D`; omitted, it is `bond_asymptote` for every bond.
 
-        **Why the third parameter exists.**  Plain Morse (`c = 0`) is exact at
-        the minimum and at dissociation and has nothing left over in between:
-        `D` is pinned by the atomization energy, `r0` by the geometry, and `k`
-        by the vibrational frequency.  It came out 0.55-1.83 eV too deep at the
-        stretched geometries where reactions happen, which put every reference
-        barrier *above* both diabats -- and `fit_amplitude` has a real root only
-        below both, so eighteen of nineteen coupling channels could not be fitted
-        at all.  Buying the depth back by inflating `k` works and costs the
-        frequency: reaching even 17 of 19 needed H2 at 12402 cm^-1 against an
-        experimental 4401, and no force constant whatever reached 18.
+        **Why `h` is per bond.**  Plain Morse is exact at the minimum and at
+        dissociation and has nothing left over in between: `D` is pinned by the
+        atomization energy, `r0` by the geometry and `k` by the vibrational
+        frequency, and the form comes out too deep at stretched geometries.  At
+        fixed `k`, `Dw (1 - exp(-a dr))**2` increases monotonically in `Dw` at
+        every `dr > 0`, towards the harmonic `k dr**2 / 2`, so raising `h` lifts
+        the whole stretched branch while the curvature at `dr = 0` stays
+        `2 Dw a**2 = k` -- no fitted frequency moves -- and the curve stays a
+        Morse, monotone out to its limit whatever `h` is.  That is what
+        `fit.dissociation.fit_force_constants` fits.  It replaced a
+        Hulburt-Hirschfelder shape term `c s**3 exp(-b s)`, which did the same
+        job with two parameters per bond, needed a monotonicity bound
+        `c <= c_max(b)` to keep the curve from turning over, and fitted ~40x
+        slower to the same 19 of 19 HCombustion channels.
 
-        `c` is the freedom that has no other job.  The correction is `O(s**3)`,
-        so it vanishes to second order at `dr = 0` and leaves `D`, `r0` and the
-        curvature there exactly as they were, and it decays to zero, so the
-        dissociation limit is untouched too.  `c = 0` is plain Morse, which is
-        what every term file that predates this reads as.
+        **Stretched branch only.**  The asymptote is a statement about
+        dissociation, so it has no business on the compressed side -- and it
+        does not arrive there harmlessly.  A deeper well at fixed `k` is a
+        *narrower* exponent, which softens compression: `exp(-a dr)` for
+        `dr < 0` grows more slowly, so a molecule squeezed head-on deforms
+        further.  Applied to both branches it cost 0.03 A of intermolecular
+        closest approach in `test_collapse.py`, against a bar with 0.03 A of
+        margin left.
 
-        **That is a statement about `dr = 0`, not about the molecule.**  It was
-        read as "the shape term is free of frequency" for as long as `r0` was
-        where the bond sat.  It is not: `fit.dissociation.fit_bond_lengths` now
-        displaces `r0` inside the reference bond length so the Morse can lean
-        against the repulsion, and this term's second derivative at that
-        displacement, `D c a**2 (6s - 6b s**2 + b**2 s**3) exp(-b s)`, is the
-        largest single contribution to the stiffness of most of HCombustion's
-        bonds.  See `fit.dissociation._bonded_curvature`.
-
-        `b` is per bond type and fitted alongside `c`; `shape_decay` is only
-        the fallback for a term file written before it was a parameter.  See
-        `params.ForceFieldParams.shape_decay` for the measurement that made it one, and
-        `fit.dissociation.shape_bound` for the `c <= c_max(b)` constraint
-        that couples the two.
-
-        **Why it is one-sided.**  `s**3 * exp(-b*s)` continued to `dr < 0` grows
-        without bound against a repulsive wall that only grows like
-        `exp(-2a*dr)`, so the compressed branch would turn over and run to minus
-        infinity -- an atom pushed hard enough would fall through the nucleus.
-        Clamping at `dr = 0` costs nothing in smoothness precisely because the
-        term is cubic there: value, slope and curvature are all zero, so the
-        join is C2 and the forces never see it.
+        The join is C2, so the forces never see it: both branches are `-D` at
+        `dr = 0` with zero slope, and the curvature there is `k` whatever `Dw`
+        is.  Only the third derivative jumps.
         """
-        ff = active()
-        if b is None:
-            # Term files that predate `b` being a parameter omit it entirely;
-            # resolved here rather than in the signature so that a dataset
-            # loaded after import gets its own fallback rather than the one that
-            # was current when this module was first imported.
-            b = ff.shape_decay
+        if h is None:
+            # Resolved here rather than in the signature so that a dataset
+            # loaded after import gets its own asymptote rather than the one
+            # that was current when this module was first imported.
+            h = active().bond_asymptote_kjmol
         v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3)  vec from atom0->atom1
         r = np.sqrt(np.sum(v * v, -1))  # (n,)
         dr = r - r0
-        # The depth of the well and the height of the asymptote are separate
-        # numbers.  `D` is the fitted atomization depth and fixes the *minimum*
-        # at `-D`; `Dw` is what the exponential climbs, and fixes the
-        # dissociated limit at `Dw - D = bond_asymptote`.  Setting them equal is
-        # the old behaviour and puts that limit at zero.
-        #
-        # **Stretched branch only, like the shape term and for a related reason.**
-        # The asymptote is a statement about dissociation, so it has no business
-        # on the compressed side -- and it does not arrive there harmlessly.  A
-        # deeper well at fixed `k` is a *narrower* exponent, `a = sqrt(k / 2Dw)`,
-        # which softens compression: `exp(-a dr)` for `dr < 0` grows more slowly,
-        # so a molecule squeezed head-on deforms further.  Applied to both
-        # branches it cost 0.03 A of intermolecular closest approach in
-        # `test_collapse.py`, against a bar with 0.03 A of margin left.
-        #
-        # The join is C2, so the forces never see it: both branches are `-D` at
-        # `dr = 0` with zero slope, and the curvature there is `2 Dw a**2 = k`
-        # whatever `Dw` is -- which is the same identity that keeps the asymptote
-        # free of every fitted frequency.  Only the third derivative jumps.
-        Dw = np.where(dr > 0.0, D + ff.bond_asymptote_kjmol, D)  # (n,)
+        Dw = np.where(dr > 0.0, D + h, D)  # (n,)
         al = np.sqrt(k / (2 * Dw))  # (n,)  1/nm
         exp_term = np.exp(-al * dr)  # (n,)
         e = Dw * (1 - exp_term) ** 2 - D
         # dE/dr  =  2*Dw*(1 - exp)*al*exp
         de_dr = 2 * Dw * (1 - exp_term) * al * exp_term  # (n,)
-
-        # Stretched branch only; `np.maximum` rather than a mask so that the
-        # zero-`c` case stays a single vectorised expression.
-        s = al * np.maximum(dr, 0.0)  # (n,)
-        decay = np.exp(-b * s)
-        e = e + Dw * c * s * s * s * decay
-        # d/ds [s**3 exp(-b s)] = (3 s**2 - b s**3) exp(-b s),  ds/dr = al (or 0)
-        de_dr = de_dr + Dw * c * al * s * s * (3.0 - b * s) * decay
 
         e_tot = np.sum(e)
         # dr/dv = v/r,  v = pos_atom1 - pos_atom0

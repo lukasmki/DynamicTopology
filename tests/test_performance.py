@@ -261,16 +261,31 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # `fit.dissociation.nonbonded_curvatures`, which had been charging the
 # objective's wavenumber cap an intramolecular repulsion the calculator does not
 # apply.
+# And again when the Morse shape term `c s**3 exp(-b s)` was removed in favour of
+# a per-bond asymptote `h`, and HCombustion refit from q-force's own bonds.  The
+# asymptote is a stretched-branch bonded term, so `energy_nonbonded` cannot move
+# and being bit-identical is the check on that:
+#
+#     d30  (dilute)   -508.26222 -> -508.26231 eV     -8.76e-05 eV
+#     d250 (dense)    -506.20370 -> -506.20379 eV     -9.16e-05 eV
+#     energy_nonbonded       identical          identical
+#     blocks                 identical          identical
+#
+# A tenth of a meV on a 200-atom box, because both forms leave the minimum, the
+# curvature there and -- since the `ZBL` taper -- `r0` on the bond length, so a
+# near-equilibrium box sees almost none of either.  The change is at stretched
+# geometries: the fission crossings moved in from 2.1-2.4 A to 1.8-2.0, which
+# `tests/test_dissociation.py` tracks, and no force constant moved at all.
 REFERENCE = {
     "tests/data/mix-n100-d30.xyz": (
-        -508.26222229257536,
-        -1201.0052254302248,
+        -508.2623098702167,
+        -1201.005313007866,
         -0.0771285657403261,
         87,
     ),
     "tests/data/mix-n100-d250.xyz": (
-        -506.2036976150183,
-        -1201.0993956482316,
+        -506.20378917911364,
+        -1201.099487212327,
         -2.1383859668755543,
         28,
     ),

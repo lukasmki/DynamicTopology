@@ -14,8 +14,8 @@ at wB97X-V/aug-cc-pVTZ.
 | id | channel | atoms | A (eV) | a (1/A^2) |
 |----|---------|-------|--------|-----------|
 | 1 | `reactions/h3o-h2o-transfer`  | H3O+ + H2O <-> H2O + H3O+ (Zundel) | 7 | -3.909 | 19.9 |
-| 2 | `reactions/h2o-oh-transfer`   | OH- + H2O <-> H2O + OH- (H3O2-)    | 5 | -3.896 | 23.4 |
-| 3 | `reactions/h2o-autoionization`| H2O + H2O <-> H3O+ + OH-           | 6 | -4.113 | 46.8 |
+| 2 | `reactions/h2o-oh-transfer`   | OH- + H2O <-> H2O + OH- (H3O2-)    | 5 | -3.895 | 23.4 |
+| 3 | `reactions/h2o-autoionization`| H2O + H2O <-> H3O+ + OH-           | 6 | -4.111 | 46.8 |
 
 The manifest's `global_params` block pins the force field constants these terms
 were fitted at -- the two taper radii and widths, `core_fraction`,
@@ -132,16 +132,21 @@ Term sources:
   this dataset's energies by `fit.py --force-constants`.
 - `h3o`: **by analogy to `h2o`**, and the weakest link in the set.  Angle and
   cross-term force constants are H2O's; `theta0` carries H2O's +2.73 deg q-force
-  offset onto H3O+'s 111.8; the Morse `r0`/`k` are H2O's (`r0` there is a fitted
-  parameter ~0.26 A inside the real bond, not a bond length).  Only the depth
-  and shape are genuinely fitted, and `--bonds` scales H3O+'s depths to 0.67 of
+  offset onto H3O+'s 111.8; the Morse `k` is H2O's and `r0` is solved against
+  the repulsion, which since the `ZBL` taper puts it on the bond length.  Only
+  the depth and asymptote are genuinely fitted, and `--bonds` scales H3O+'s depths to 0.67 of
   H2O's -- an artifact of a cation's atomization energy being small, not of its
   O-H bonds being weak.  Replace these with q-force output when it is available.
 
 ## Fit and cost
 
-All 3 channels are fittable; margins 0.78-3.24 eV after the refit.  Fastest mode
-4289 cm^-1 (h2o O-H), just under the 4400 cap, i.e. **dt = 0.5 fs**.
+All 3 channels are fittable; margins 1.47-3.91 eV after the refit.  Fastest mode
+3667 cm^-1 (h2o O-H), under the 4400 cap, i.e. **dt = 0.5 fs**.
+
+Refit 2026-09-22 when the Morse shape term was removed, from the q-force
+parameters above: every bond's asymptote `h` stays at the `bond_asymptote` floor
+(1.0 eV), since all three channels are feasible at plain Morse, and no force
+constant moves.  The amplitudes are unchanged to 3 meV.
 
 Refit twice, for the two changes to the repulsion, both of which sit inside the
 `E_nonbonded` the fit solves against: `ZBL` acquiring its taper

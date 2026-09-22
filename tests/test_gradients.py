@@ -12,6 +12,7 @@ from ase import units
 from DynamicTopology.forcefield.params import active
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.acks2 import ACKS2
+from DynamicTopology.forcefield.pointcharge import PointCharge
 from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.lj import LennardJones
 from DynamicTopology.forcefield.zbl import ZBL
@@ -144,33 +145,32 @@ class TestQForceGradients:
         td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0])
         self._check(POS_2, td)
 
-    @pytest.mark.parametrize("c", [1.0, 4.0, -1.5])
-    def test_bond_morse_shape(self, c):
-        """The Hulburt-Hirschfelder term `c` on the stretched branch.
+    @pytest.mark.parametrize("h", [96.5, 482.4, 1929.7])
+    def test_bond_morse_asymptote(self, h):
+        """A per-bond asymptote height `h` (kJ/mol) on the stretched branch.
 
-        `POS_2` sits near `r0`, which is exactly where the correction and its
-        first two derivatives vanish -- a gradient checked only there would pass
-        against an implementation that computed the term wrongly, or not at all.
-        So this walks out along the stretch, through the peak of `s**3 exp(-2s)`
-        at `s = 1.5` and past it, and back onto the compressed branch where the
-        term is clamped off.
+        `h` enters through both `Dw` and `a = sqrt(k / 2Dw)`, and only for
+        `dr > 0`, so the walk crosses the join and goes well out past the
+        inflection, where the two dependences stop cancelling.
         """
-        td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0], c=[c])
-        al = np.sqrt(251200.0 / (2 * 436.0))
+        td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0], h=[h])
+        al = np.sqrt(251200.0 / (2 * (436.0 + h)))
         for s in (-1.0, 0.0, 0.5, 1.5, 3.0, 6.0):
             pos = np.array([[0.0, 0.0, 0.0], [0.07772 + s / al, 0.0, 0.0]])
             self._check(pos, td)
 
-    def test_bond_morse_shape_is_off_by_default(self):
-        """A term file with no `c` must read as exactly the old Morse."""
+    def test_bond_morse_asymptote_defaults_to_global(self):
+        """A term file with no `h` must read as `bond_asymptote` for every bond."""
         kwargs = dict(r0=[0.07772], k=[251200.0], D=[436.0])
         plain = make_term("bond", [[0, 1]], **kwargs)
-        zeroed = make_term("bond", [[0, 1]], c=[0.0], **kwargs)
+        stated = make_term(
+            "bond", [[0, 1]], h=[active().bond_asymptote_kjmol], **kwargs
+        )
         qf = QForce()
-        for offset in (-0.02, 0.0, 0.05, 0.2):
+        for offset in (-0.02, 0.0, 0.05, 0.2, 3.0):
             pos = np.array([[0.0, 0.0, 0.0], [0.07772 + offset, 0.0, 0.0]])
             assert qf(pos, PBC, CELL, plain)[0] == pytest.approx(
-                qf(pos, PBC, CELL, zeroed)[0], abs=1e-12
+                qf(pos, PBC, CELL, stated)[0], abs=1e-12
             )
 
     def test_bond_harmonic(self):
@@ -534,6 +534,108 @@ class TestACKS2Gradients:
 
         assert energy == pytest.approx(reference_e, abs=1e-10)
         np.testing.assert_allclose(forces, reference_f, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Point-charge gradient tests
+# ---------------------------------------------------------------------------
+
+# Two three-atom molecules, 0-1-2 and 3-4-5, bent and a hydrogen bond apart, so
+# every intermolecular separation is one the kernel actually evaluates.
+POS_PC = np.array(
+    [
+        [0.00, 0.00, 0.00],
+        [0.96, 0.00, 0.05],
+        [-0.24, 0.93, -0.03],
+        [2.85, 0.10, 0.20],
+        [3.30, 0.85, -0.25],
+        [3.25, -0.72, 0.35],
+    ]
+)
+# An H3O+-like +1 on the second molecule, so the system is charged and the
+# periodic case exercises the neutralizing background.
+Q_PC = np.array([-0.69, 0.345, 0.345, -0.43, 0.715, 0.715])
+PAIRS_PC = [[0, 1], [0, 2], [1, 2], [3, 4], [3, 5], [4, 5]]
+
+
+def _pointcharge_term_dict(q=Q_PC, pairs=PAIRS_PC):
+    term_dict = make_term("charge", [[i] for i in range(len(q))], q=q)
+    term_dict["coulombexclusion"] = {
+        "atoms": np.array(pairs, dtype=int),
+        "kwargs": {},
+    }
+    return term_dict
+
+
+class TestPointChargeGradients:
+    """`PointCharge` forces against central finite differences.
+
+    Fixed charges carry no response term, so `evaluate` is the whole gradient;
+    what is left to get wrong is the sign of the exclusion's pair force, which
+    enters with a plus, and the periodic kernel's reciprocal half.
+    """
+
+    @pytest.mark.parametrize("periodic", [False, True], ids=["open", "ewald"])
+    def test_call_forces(self, periodic):
+        pbc = np.ones(3, dtype=bool) if periodic else PBC
+        cell = np.eye(3) * 9.0 if periodic else CELL
+        term_dict = _pointcharge_term_dict()
+
+        def energy_fn(p):
+            return PointCharge()(p, pbc, cell, term_dict)[0]
+
+        _, f_analytical, _ = PointCharge()(POS_PC, pbc, cell, term_dict)
+        f_fd = finite_difference_forces(energy_fn, POS_PC)
+        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
+
+    @pytest.mark.parametrize("periodic", [False, True], ids=["open", "ewald"])
+    def test_weighted_block_forces(self, periodic):
+        """Two states on one block, one on the other, at fixed fractional weights.
+
+        This is the Hellmann-Feynman object `System` differentiates: within the
+        mixed block the weight matrix is `sum_s w_s q_s q_s^T`, which is not
+        `qbar qbar^T`, and each state's exclusions enter at that state's weight.
+        """
+        pbc = np.ones(3, dtype=bool) if periodic else PBC
+        cell = np.eye(3) * 9.0 if periodic else CELL
+        # State 1 moves a proton's worth of charge and a bond across the block.
+        charges = np.array([Q_PC[:3], [-0.43, 0.715, 0.715]])
+        pairs = [
+            np.array([[0, 1], [0, 2], [1, 2]]),
+            np.array([[0, 1], [1, 2]]),
+        ]
+        weights = np.array([0.7, 0.3])
+
+        def evaluate(p):
+            pc = PointCharge()
+            pc.prepare(p, pbc, cell, _pointcharge_term_dict())
+            pc._add_block(np.arange(3), charges, pairs, 0)
+            pc._add_block(
+                np.arange(3, 6), Q_PC[None, 3:], [np.array(PAIRS_PC[3:]) - 3], 0
+            )
+            pc.update(0, weights)
+            return pc.evaluate()
+
+        _, f_analytical, _ = evaluate(POS_PC)
+        f_fd = finite_difference_forces(lambda p: evaluate(p)[0], POS_PC)
+        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
+
+    def test_exclusions_are_removed(self):
+        """Fully excluded, well separated molecules: the energy is the intermolecular sum.
+
+        Written out pair by pair against `erf(gamma r) / r`, so the test does not
+        lean on the kernel it is checking.
+        """
+        from scipy.special import erf
+
+        energy, _, _ = PointCharge()(POS_PC, PBC, CELL, _pointcharge_term_dict())
+        gamma, ccoul = active().gamma, active().ccoul
+        expected = 0.0
+        for i in range(3):
+            for j in range(3, 6):
+                r = np.linalg.norm(POS_PC[i] - POS_PC[j])
+                expected += ccoul * Q_PC[i] * Q_PC[j] * erf(gamma * r) / r
+        assert energy == pytest.approx(expected, rel=1e-12)
 
 
 # ---------------------------------------------------------------------------

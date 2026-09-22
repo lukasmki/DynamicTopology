@@ -1,7 +1,7 @@
 """The force field's global parameters: the constants a dataset is fitted at.
 
 Every field here used to be a module constant (`zbl.TAPER_RADIUS`,
-`qforce.SHAPE_DECAY`, `ewald.GAMMA`, ...).  Each sits inside
+`qforce.BOND_ASYMPTOTE`, `ewald.GAMMA`, ...).  Each sits inside
 `E_bonded + E_nonbonded`, which `fit/dissociation.py` solves every template
 against, so a module constant made the fitted surface a property of whichever
 source tree happened to be installed.  A manifest now states these under
@@ -23,6 +23,10 @@ from typing import Any, Iterator
 from ase import units
 
 
+# The values `ForceFieldParams.electrostatics` accepts.
+ELECTROSTATICS: frozenset[str] = frozenset({"acks2", "pointcharge"})
+
+
 @dataclass(frozen=True)
 class ForceFieldParams:
     """The constants a dataset is fitted at.  Frozen: see `replace` to derive one.
@@ -41,12 +45,9 @@ class ForceFieldParams:
     # `fit.coupling.fit_amplitude`'s discriminant vanishes at dissociation and
     # there is nothing for an EVB off-diagonal to interpolate between.
     # Changing it invalidates every `.jsonl` in the dataset that states it.
+    # It is also the default and the lower bound for each bond's own fitted
+    # asymptote `h`; see `qforce.QForce._bond_morse`.
     bond_asymptote: float = 1.0
-
-    # Default decay rate of the Morse shape term, `c * s**3 * exp(-b * s)`,
-    # used as a fallback for any bond whose term file predates `b` being fitted
-    # per bond type.  Dimensionless.
-    shape_decay: float = 4.0
 
     # --- the screened-nuclear repulsion (`zbl`) ----------------------------
 
@@ -98,7 +99,19 @@ class ForceFieldParams:
     # cancel the intramolecular ZBL it excludes.
     exclude_coulomb: bool = True
 
-    # --- the charge kernel (`ewald`, `acks2`) ------------------------------
+    # --- the electrostatics -------------------------------------------------
+
+    # Which electrostatic term the dataset was fitted with: `"acks2"`, charge
+    # equilibration solved once per force call and identical on every diabatic
+    # state, or `"pointcharge"`, fixed charges carried by each template's
+    # `charge` terms and therefore different on every state that moves a proton.
+    # The second is what localizes the +1 on a hydronium and the -1 on a
+    # hydroxide, which ACKS2's single sum-zero constraint cannot; see
+    # `forcefield/pointcharge.py`.  Changing it invalidates every `.jsonl` in the
+    # dataset, since the fit solves against whichever term this names.
+    electrostatics: str = "acks2"
+
+    # --- the charge kernel (`ewald`, `acks2`, `pointcharge`) -----------------
 
     # Charge-smearing width of the ACKS2 kernel `erf(gamma r) / r`, in
     # 1/Angstrom.  Shared by both kernel forms, so the open-boundary and
@@ -136,10 +149,15 @@ class ForceFieldParams:
             )
         object.__setattr__(self, "exclusion_depth", int(self.exclusion_depth))
         object.__setattr__(self, "exclude_coulomb", bool(self.exclude_coulomb))
+        if self.electrostatics not in ELECTROSTATICS:
+            raise ValueError(
+                f"electrostatics must be one of {sorted(ELECTROSTATICS)}, "
+                f"got {self.electrostatics!r}"
+            )
         # Every other field is a float; coerce by exclusion rather than an
         # inclusion list, so a new float field needs no update here.
         for f in fields(self):
-            if f.name in ("exclusion_depth", "exclude_coulomb"):
+            if f.name in ("exclusion_depth", "exclude_coulomb", "electrostatics"):
                 continue
             object.__setattr__(self, f.name, float(getattr(self, f.name)))
         for name in ("taper_width", "switch_width", "gamma", "accuracy"):

@@ -117,7 +117,7 @@ def bond_graph(terms: list[dict], natoms: int | None = None) -> nx.Graph:
     """
     graph = nx.Graph()
     for term in terms:
-        if term["type"] in ("atom", "lennardjones"):
+        if term["type"] in ("atom", "charge", "lennardjones"):
             graph.add_node(next(iter(term["atoms"].values())))
     if natoms is not None:
         graph.add_nodes_from(range(natoms))

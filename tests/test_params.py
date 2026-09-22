@@ -86,7 +86,6 @@ class TestTheDefaults:
 
     def test_values(self):
         assert DEFAULTS.bond_asymptote == 1.0
-        assert DEFAULTS.shape_decay == 4.0
         assert DEFAULTS.taper_radius == 1.5
         assert DEFAULTS.taper_width == 0.12
         assert DEFAULTS.switch_radius == 0.22
@@ -97,6 +96,7 @@ class TestTheDefaults:
         assert DEFAULTS.accuracy == 1e-8
         assert DEFAULTS.ccoul == 14.4
         assert DEFAULTS.zbl_ccoul == 14.399645
+        assert DEFAULTS.electrostatics == "acks2"
 
     def test_the_asymptote_converts_to_qforce_units(self):
         """1 eV, read in kJ/mol, is 96.485 -- not 1.
@@ -179,6 +179,11 @@ class TestTheManifest:
     def test_a_non_object_block_is_an_error(self):
         with pytest.raises(ValueError, match="must be a JSON object"):
             ForceFieldParams.from_dict([1.5])
+
+    def test_an_unknown_electrostatics_is_an_error(self):
+        """A misspelt term name must not fall back to ACKS2."""
+        with pytest.raises(ValueError, match="electrostatics must be one of"):
+            ForceFieldParams.from_dict({"electrostatics": "point_charge"})
 
     @pytest.mark.parametrize("field", ["taper_width", "gamma", "accuracy"])
     def test_a_nonpositive_width_is_an_error(self, field):
@@ -352,8 +357,8 @@ class TestTheParametersReachTheForceField:
                 energy = QForce()(far, PBC, CELL, term_dict)[0]
             assert energy == pytest.approx(params.bond_asymptote, abs=1e-6)
 
-    def test_the_shape_decay_reaches_the_morse_fallback(self):
-        """A term file without `b` reads the dataset's fallback, not the import's."""
+    def test_a_bonds_own_asymptote_overrides_the_global_one(self):
+        """A bond carrying `h` dissociates to `h`, whatever `bond_asymptote` is."""
         term_dict = {
             "bond": {
                 "atoms": np.array([[0, 1]]),
@@ -361,16 +366,15 @@ class TestTheParametersReachTheForceField:
                     "D": np.array([436.0]),
                     "r0": np.array([0.07772]),
                     "k": np.array([251200.0]),
-                    "c": np.array([1.3]),
+                    "h": np.array([2.5 * DEFAULTS.bond_asymptote_kjmol]),
                 },
             }
         }
-        pos = np.array([[0.0, 0.0, 0.0], [1.1, 0.0, 0.0]])
-        with use(shape_decay=2.0):
-            slow = QForce()(pos, PBC, CELL, term_dict)[0]
-        with use(shape_decay=8.0):
-            fast = QForce()(pos, PBC, CELL, term_dict)[0]
-        assert slow != pytest.approx(fast)
+        far = np.array([[0.0, 0.0, 0.0], [20.0, 0.0, 0.0]])
+        for asymptote in (1.0, 3.0):
+            with use(bond_asymptote=asymptote):
+                energy = QForce()(far, PBC, CELL, term_dict)[0]
+            assert energy == pytest.approx(2.5 * DEFAULTS.bond_asymptote, abs=1e-6)
 
     def test_the_smearing_width_reaches_acks2(self):
         """`gamma` sets the contact value of the charge kernel, `2 gamma/sqrt(pi)`.
@@ -394,6 +398,59 @@ class TestTheParametersReachTheForceField:
         with use(gamma=0.5):
             wide = ACKS2()(pos, PBC, CELL, term_dict)[0]
         assert narrow != pytest.approx(wide)
+
+    def test_the_electrostatics_choice_reaches_the_calculator_and_the_fitter(self):
+        """`System`, `EVBSystem` and the fitter all resolve the term per call.
+
+        A template carrying both parameter sets scores differently under each,
+        through `fit.dissociation.nonbonded_energy` -- the sum every `.jsonl` is
+        solved against, so a site that ignored the switch would fit a dataset
+        to the wrong electrostatics.
+        """
+        from ase import Atoms
+
+        from DynamicTopology.fit.dissociation import nonbonded_energy
+        from DynamicTopology.forcefield.electrostatics import Electrostatics
+        from DynamicTopology.forcefield.pointcharge import PointCharge
+
+        term_dict = {
+            "atom": {
+                "atoms": np.array([[0], [1]]),
+                "kwargs": {
+                    "mu": np.array([8.12, 1.88]),
+                    "eta": np.array([3.74, 7.28]),
+                    "soft_amp": np.array([3.88, 2.10]),
+                    "soft_decay": np.array([0.44, 0.27]),
+                },
+            },
+            "charge": {
+                "atoms": np.array([[0], [1]]),
+                "kwargs": {"q": np.array([-1.0, 1.0])},
+            },
+            "lennardjones": {
+                "atoms": np.array([[0], [1]]),
+                "kwargs": {"sigma": np.zeros(2), "eps": np.zeros(2)},
+            },
+        }
+        atoms = Atoms("OH", positions=[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], cell=CELL)
+        electrostatics = Electrostatics()
+        assert isinstance(electrostatics.get(), ACKS2)
+        equilibrated = nonbonded_energy(atoms, term_dict)
+        with use(electrostatics="pointcharge"):
+            assert isinstance(electrostatics.get(), PointCharge)
+            fixed = nonbonded_energy(atoms, term_dict)
+        # ZBL and the 12-6 are common to both, so the whole difference is the
+        # electrostatics: an ion pair 2 A apart, -14.4 * erf(4) / 2 = -7.2 eV,
+        # against ACKS2's fractional charges.
+        pos, pbc, cell = atoms.positions, atoms.pbc, atoms.cell
+        assert fixed - equilibrated == pytest.approx(
+            PointCharge()(pos, pbc, cell, term_dict)[0]
+            - ACKS2()(pos, pbc, cell, term_dict)[0]
+        )
+        assert PointCharge()(pos, pbc, cell, term_dict)[0] == pytest.approx(
+            -7.2, abs=1e-6
+        )
+        assert abs(fixed - equilibrated) > 1.0
 
     def test_the_coulomb_constant_reaches_acks2(self):
         assert ACKS2().CCOUL == pytest.approx(14.4)

@@ -1,4 +1,4 @@
-from DynamicTopology.forcefield.acks2 import ACKS2
+from DynamicTopology.forcefield.electrostatics import Electrostatics
 from DynamicTopology.forcefield.lj import LennardJones
 from DynamicTopology.forcefield.zbl import ZBL
 from DynamicTopology.forcefield.qforce import QForce
@@ -38,7 +38,7 @@ class EVBSystem:
         self.reaction_set = reaction_set
 
         self.hardness: float = hardness
-        self.nonbonded_ff = ACKS2()
+        self.electrostatics = Electrostatics()
         self.zbl_ff = ZBL()
         self.lj_ff = LennardJones()
         self.bonded_ff = QForce()
@@ -63,7 +63,7 @@ class EVBSystem:
         ham = np.zeros((nstates, nstates))
         state_forces = np.zeros((nstates,) + pos.shape)
 
-        # Electrostatics are topology-independent, so they are the same number
+        # ACKS2 electrostatics are topology-independent, so they are the same number
         # for every state; adding them here would still change the result,
         # because the coupling sqrt((1+h)*H_ii*H_jj) is nonlinear in the
         # diagonal and a common shift does not pass through it.  They are added
@@ -86,12 +86,24 @@ class EVBSystem:
         # depend on the diagonal at all, so for `D + V` with `V` fixed a common
         # shift of `d_i` shifts the eigenvalue by exactly that constant.  There
         # the placement is free; here it is forced.
+        #
+        # `PointCharge` is the exception: see the loop body.
+        nonbonded = self.electrostatics.get()
+        state_dependent = nonbonded.self_consistent
+        state_nb = np.zeros(nstates)
         for i, istate in enumerate(self.states):
             if not istate.term_dict:
                 continue
             # `EVBSystem` reports no stress -- it holds a fixed state list and
             # is the simple alternative to `System` -- so the virial is dropped.
             en, fr, _ = self.bonded_ff(pos, pbc, cell, istate.term_dict)
+            if state_dependent:
+                # Fixed template charges differ between states, so here the
+                # electrostatics are part of what distinguishes the diabats and
+                # belong on the diagonal with everything else that does.
+                en_q, fr_q, _ = nonbonded(pos, pbc, cell, istate.term_dict)
+                en, fr = en + en_q, fr + fr_q
+                state_nb[i] = en_q
             ham[i, i] = en
             state_forces[i] = fr
 
@@ -134,10 +146,14 @@ class EVBSystem:
         # term_dict is representative; a state with no terms at all (a fully
         # dissociated topology) would carry none, hence the search.
         en_nb, fr_nb = 0.0, np.zeros_like(pos)
-        for state in self.states:
-            if state.term_dict:
-                en_nb, fr_nb, _ = self.nonbonded_ff(pos, pbc, cell, state.term_dict)
-                break
+        if state_dependent:
+            # Already on the diagonal; reported as the ground state's share.
+            en_nb = float(statevecsq @ state_nb)
+        else:
+            for state in self.states:
+                if state.term_dict:
+                    en_nb, fr_nb, _ = nonbonded(pos, pbc, cell, state.term_dict)
+                    break
 
         # `EVBSystem` holds a fixed state list and reports no stress; the
         # virials are discarded here rather than threaded through.
@@ -153,10 +169,12 @@ class EVBSystem:
                 en_lj, fr_lj, _ = self.lj_ff(pos, pbc, cell, state.term_dict)
                 break
 
+        # With state-dependent electrostatics `energy` already contains them.
+        energy_bonded = energy - en_nb if state_dependent else energy
         results: dict[str, Any] = {
-            "energy": energy + en_nb + en_zbl + en_lj,
+            "energy": energy_bonded + en_nb + en_zbl + en_lj,
             "forces": forces + fr_nb + fr_zbl + fr_lj,
-            "energy_bonded": energy,
+            "energy_bonded": energy_bonded,
             "energy_nonbonded": en_nb,
             "energy_zbl": en_zbl,
             "energy_lj": en_lj,

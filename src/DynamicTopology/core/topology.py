@@ -121,8 +121,8 @@ class Topology:
                 # Every term of a type must state the same parameters, because
                 # this layout is column-oriented: a key that only some terms
                 # carry produces a short column silently misaligned against the
-                # others.  It became reachable when `bond` gained the optional
-                # Hulburt-Hirschfelder `c` -- merging a refitted template with
+                # others.  It is reachable because `bond` has an optional
+                # per-bond asymptote `h` -- merging a refitted template with
                 # one that predates it puts both kinds in a single `term_dict`.
                 # Caught here rather than in the force field, where it surfaces
                 # as an unattributable broadcasting error.

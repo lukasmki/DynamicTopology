@@ -70,7 +70,7 @@ manifest omits it, and read through `params.active()` at call time:
 "global_params": { "taper_radius": 1.5, "exclusion_depth": 3 }
 ```
 
-All but `accuracy` and `shape_decay` sit inside $E_{\text{bonded}} +
+All but `accuracy` sit inside $E_{\text{bonded}} +
 E_{\text{nonbonded}}$, which `fit/dissociation.py` solves each template's depth
 scale against (§5.2), so each one is part of the definition of the surface a
 dataset's `.jsonl` files were fitted to. As module constants they were a property of
@@ -295,75 +295,48 @@ $(E, \mathbf{F}, \mathbf{W})$ in q-force's internal units; `__call__` converts
 ([qforce.py:69](forcefield/qforce.py#L69)). `bond_form` is validated in
 `__init__` and defaults to `"morse"`.
 
-**Bond — Morse with a one-sided Hulburt–Hirschfelder shape term** (default;
-required for reactive work, `compute_bond` [qforce.py:135](forcefield/qforce.py#L135)
-→ `_bond_morse` [qforce.py:140](forcefield/qforce.py#L140)):
+**Bond — Morse with a per-bond asymptote** (default; required for reactive
+work, `compute_bond` [qforce.py:113](forcefield/qforce.py#L113) → `_bond_morse`
+[qforce.py:118](forcefield/qforce.py#L118)):
 
 $$
-E = D\Big[\big(1 - e^{-\alpha \Delta r}\big)^2 - 1 + c\,s^3 e^{-b s}\Big],
+E = D_w\big(1 - e^{-\alpha \Delta r}\big)^2 - D,
 \qquad
-\alpha = \sqrt{\frac{k}{2D}},\quad
+\alpha = \sqrt{\frac{k}{2D_w}},\quad
 \Delta r = r - r_0,\quad
-s = \alpha\,\max(\Delta r, 0),
+D_w = \begin{cases} D + h & \Delta r > 0 \\ D & \Delta r \le 0 \end{cases}
 $$
 
-with $b$ fitted per bond type alongside $c$; `shape_decay` $= 4.0$
-([params.py](forcefield/params.py)) is only the fallback a term file
-written before $b$ was a parameter reads as. The $-D$ offset
-puts the dissociated limit at zero, so a topology's energy carries the depth of
-the bonds it contains and breaking a bond costs $+D$; boundedness above is what
-keeps a product diabat whose new bond is still several Å long from costing an
-unbounded $\tfrac12 k \Delta r^2$.
+with $h$ fitted per bond type and, when a term file omits it, `bond_asymptote`
+$= 1.0$ eV ([params.py](forcefield/params.py)). The $-D$ offset puts the minimum
+at $-D$, so a topology's energy carries the depth of the bonds it contains and
+breaking a bond costs $+D$; the dissociated limit sits $h$ above zero, which is
+what makes a bonded diabat cross its own fragments' rather than converge to it.
+Boundedness above is what keeps a product diabat whose new bond is still several
+Å long from costing an unbounded $\tfrac12 k \Delta r^2$.
 
-The shape term is $O(s^3)$, so it perturbs neither $D$, $r_0$, nor the curvature
-at $r_0$, and it decays to zero, so the dissociation limit is untouched. It
-exists because plain Morse ($c=0$) is exact at the minimum and at dissociation
-with nothing left over in between, and came out 0.55–1.83 eV too deep at the
-stretched geometries where reactions happen. Removing it costs every coupling:
-with $c=0$ none of the thirteen metathesis channels can be inverted. Buying them
-back by inflating $k$ instead does not work either — reaching even 17 of 19
-needed H₂ at **12402 cm⁻¹** against an experimental 4401, and no force constant
-reached 18.
+The curvature at $\Delta r = 0$ is $2D_w\alpha^2 = k$ on both branches whatever
+$h$ is, so the join is $C^2$ and no fitted frequency sees $h$. At fixed $k$,
+$D_w(1-e^{-\alpha\Delta r})^2$ increases monotonically in $D_w$ at every
+$\Delta r > 0$, towards the harmonic $\tfrac12 k\Delta r^2$: raising $h$ lifts the
+whole stretched branch, which is the freedom plain Morse lacks. With $D$ pinned
+by the atomization energy, $r_0$ by the geometry and $k$ by the frequency, plain
+Morse is too deep at stretched geometries; buying the depth back by inflating $k$
+instead once needed H₂ at **12402 cm⁻¹** against an experimental 4401. $h$ is
+applied on the stretched branch only, because a deeper well at fixed $k$ is a
+narrower exponent and would soften compression.
 
-The relevant $s$-bands, which are what fixes the useful range of $b$ (the term
-peaks at $s = 3/b$): bonds at their own equilibrium geometry sit at
-$s = 0.180$–$0.382$; metathesis transition states at $0.352$–$1.049$ (median
-$0.681$); homolysis mid-dissociation at $1.081$–$1.525$ (median $1.358$). Sweeping
-$b$ with everything else refitted ([qforce.py:26](forcefield/qforce.py#L26)):
-
-| $b$ | 2.0 | 2.5 | 3.0 | 4.0 | 5.0 | 6.0 |
-| --- | --- | --- | --- | --- | --- | --- |
-| $c_\mathrm{max}$ | 1.31 | 3.84 | 7.80 | 19.33 | 34.50 | 52.20 |
-| metathesis channels | 12/13 | 13/13 | 13/13 | 13/13 | 13/13 | 12/13 |
-| dissociation rms (eV) | 0.700 | 0.783 | 1.098 | 1.710 | 2.660 | 3.181 |
-| fastest mode (cm⁻¹) | 4517 | 4402 | 4352 | 4400 | 4402 | 4432 |
-| stable $dt$ (fs) | 0.492 | 0.505 | 0.511 | 0.505 | 0.505 | 0.502 |
-
-At $b = 2.0$ the $c_\mathrm{max}$ bound binds on five of eight bonds, which is why
-the fit searches $c/c_\mathrm{max}(b)$ with $b$ free rather than pinning either.
-
-That $O(s^3)$ property is about $r_0$ and **not** about the vibrational
-frequency, which is a distinction this section used to elide. `fit_bond_lengths`
-displaces $r_0$ inside the bond so the Morse can lean against the repulsion, and
-at that displacement the term's curvature,
-$D c \alpha^2 s\,(b^2s^2 - 6bs + 6)\,e^{-bs}$, is not small. Its bracket is
-negative for $1.268/b < s < 4.732/b$, so whether the shape term stiffens or
-softens a bond depends on where that bond sits relative to $3/b$ — which is one
-of the reasons $b$ is fitted rather than fixed.
-
-$c$ is bounded by the requirement that the curve still dissociate downhill, and
-that bound moves steeply with $b$ — $1.31$ at $b=2$, $19.33$ at $b=4$, $52.20$
-at $b=6$ — so the fit searches the fraction $c/c_\mathrm{max}(b)$ rather than
-$c$ itself. See `fit.dissociation.shape_bound`.
-It is clamped at $\Delta r = 0$: continued to compression, $s^3 e^{-bs}$ would
-outgrow the $e^{-2\alpha\Delta r}$ wall and run to $-\infty$. The clamp is $C^2$
-because the term is cubic there.
+$h$ replaced a one-sided Hulburt–Hirschfelder shape term
+$D_w\,c\,s^3 e^{-bs}$, $s = \alpha\max(\Delta r, 0)$, which lifted the mid-range
+with two parameters per bond under a monotonicity bound $c \le c_\mathrm{max}(b)$.
+From the same q-force start (2026-09-22) both reach 19/19 HCombustion channels at
+q-force's own frequencies; $h$ needs one parameter, no bound, and 16 s of fitting
+against about 650.
 
 Radial derivative:
 
 $$
-\frac{dE}{dr} = 2D\big(1-e^{-\alpha\Delta r}\big)\alpha e^{-\alpha\Delta r}
-+ D\,c\,\alpha\,s^2\big(3 - b s\big)e^{-bs}.
+\frac{dE}{dr} = 2D_w\big(1-e^{-\alpha\Delta r}\big)\alpha e^{-\alpha\Delta r}.
 $$
 
 **Bond — harmonic** (non-reactive use only, [qforce.py:218](forcefield/qforce.py#L218)):
@@ -1458,11 +1431,11 @@ the force), so `fit_template` ([fit/dissociation.py:975](fit/dissociation.py#L97
 alternates them `LENGTH_DEPTH_ROUNDS` $= 4$ times. The residual force falls
 1.5e-3 → 1.2e-4 → 1.9e-5 → 1.9e-6 eV/Å.
 
-**(3) Shape and stiffness — `fit_force_constants` ([fit/dissociation.py:1395](fit/dissociation.py#L1395)).**
-A Powell search over three per-bond-type variables — the shape *fraction*
-$u = c/c_\mathrm{max}(b)$, the log force-constant scale, and the shape decay $b$ —
-with layers 1 and 2 re-solved inside every objective evaluation. `mode` selects
-which of the three blocks are free (`"shape"`, `"k"`, `"both"`; default `"both"`).
+**(3) Asymptote and stiffness — `fit_force_constants` ([fit/dissociation.py:1319](fit/dissociation.py#L1319)).**
+A Powell search over one or two per-bond-type variables — the asymptote height
+$h$ in eV and the log force-constant scale — with layers 1 and 2 re-solved inside
+every objective evaluation. `mode` selects which blocks are free (`"asymptote"`,
+`"k"`, `"asymptote-k"`; default `"asymptote"`).
 
 $$
 J \;=\; \underbrace{\sum_r \max\!\big(0,\ m - m_r\big)^2}_{\text{channel margins}}
@@ -1472,8 +1445,8 @@ J \;=\; \underbrace{\sum_r \max\!\big(0,\ m - m_r\big)^2}_{\text{channel margins
 $$
 
 Three of the four are hinges: they cost nothing until a constraint is violated.
-The last pulls toward "the unchanged force field" — $u = 0$, zero log $k$-scale,
-$b = $ `shape_decay`.
+The last pulls toward "the unchanged force field" — $h = $ `bond_asymptote`,
+zero log $k$-scale.
 
 | symbol | option | constant | default |
 | --- | --- | --- | --- |
@@ -1483,8 +1456,7 @@ $b = $ `shape_decay`.
 | $\tilde\nu_{\max}$ | `--max-wavenumber` | `DEFAULT_MAX_WAVENUMBER` | 4400 cm⁻¹ |
 | $\omega$ | `--frequency-weight` | `DEFAULT_FREQUENCY_WEIGHT` | 0.005 |
 | $k$-scale bound | `--max-k-scale` | `DEFAULT_MAX_SCALE` | 2.0 (1.41× in $\tilde\nu$) |
-| $u$ bound | `--max-shape` | `DEFAULT_MAX_SHAPE_FRACTION` | 1.0 |
-| $b$ bounds | `--min-decay` / `--max-decay` | `DEFAULT_MIN_DECAY` / `DEFAULT_MAX_DECAY` | 1.5 / 8.0 |
+| $h$ bounds | `--max-asymptote` | `bond_asymptote` / `DEFAULT_MAX_ASYMPTOTE` | 1.0 / 10.0 eV |
 
 $\tilde\nu_{\max}$ is a **timestep** constraint, not a spectroscopic one:
 $33356/(15\,dt)$ is 4450 cm⁻¹ at $dt = 0.5$ fs, rounded to H₂'s experimental 4401.
@@ -1492,22 +1464,16 @@ It is evaluated on the *total* curvature (`stretch_curvatures`), bonded plus
 nonbonded, since that is what actually sets the fastest mode:
 $\tilde\nu = \frac{1}{2\pi c}\sqrt{k_\text{tot}/\mu}$.
 
-**The shape bound `shape_bound(b)` ([fit/dissociation.py:1150](fit/dissociation.py#L1150)).**
-$c$ is bounded by the requirement that the curve still dissociate downhill.
-Setting $dE/dr \ge 0$ on the stretched branch gives
+**Which channels the margins gate.** A fission routed to `fit_twobody` takes its
+amplitude from the diabatic crossing, not from its margin, so it is fitted even
+when its margin is negative; what the bond fit moves for it is where that crossing
+sits. On HCombustion plain Morse ($h = $ `bond_asymptote` everywhere) makes 14 of
+19 margins positive and still fits all 19 couplings; the five negative margins are
+all fissions, and the fitted $h$ moves their crossings from 2.1–2.4 Å in to
+1.8–2.0 Å.
 
-$$
-c \;\le\; \min_{s > 3/b}\ \frac{2\big(e^{(b-1)s} - e^{(b-2)s}\big)}{s^2\,(bs - 3)} ,
-$$
-
-evaluated on a 200k-point grid and memoized, not solved. The bound moves steeply
-with $b$ — 0 at $b=1$, 0.180 at $1.5$, **1.31 at $2$, 19.33 at $4$, 52.20 at $6$** —
-which is exactly why the search variable is the fraction $u = c/c_\mathrm{max}(b)$
-rather than $c$ itself: with $c$ free, the box would have to be sized for the
-loosest $b$ and would be infeasible everywhere else.
-
-`ForceConstantFit` ([fit/dissociation.py:1031](fit/dissociation.py#L1031)) reports
-`terms`, `variables`, `scales` (absolute $c$), `decays`, `k_scales`, `depths`,
+`ForceConstantFit` ([fit/dissociation.py:1043](fit/dissociation.py#L1043)) reports
+`terms`, `variables`, `scales` ($h$ in eV, or the $k$-scale in `mode="k"`), `k_scales`, `depths`,
 `curvatures`, and `margins` against `margins_before`. `BondVariable` is keyed
 **per template**, not shared across templates — H–O in water and H–O in HO₂ are
 separate variables.

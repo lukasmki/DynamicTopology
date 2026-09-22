@@ -476,6 +476,68 @@ class ACKS2:
         forces[self.indices] = f_tot
         return e_tot, forces, w_tot
 
+    # -- the block interface `System.calculate` drives -----------------------
+    #
+    # Shared with `pointcharge.PointCharge`, so `System` diagonalizes against
+    # either without branching.  Here it is bookkeeping over the methods above:
+    # the corrections are the per-state exclusion energies, fixed once the
+    # charges are, and `evaluate` is the screened `compute`.
+
+    # The corrections do not depend on any other block's weights, so one pass
+    # over the blocks is already self-consistent.
+    self_consistent: bool = False
+
+    def bind(self, blocks) -> None:
+        """Each state's `coulombexclusion` pairs and what they are worth.
+
+        Global atom indices, straight off the state's own term dict --
+        `EVBBasis` has already given every state in a block its terms in order
+        to evaluate its bonded energy.  A dataset that ships no
+        `coulombexclusion` terms yields nothing and the electrostatics are
+        unscreened, exactly as before they existed.
+        """
+        self.block_pairs = []
+        self.block_corrections = []
+        self.block_weights = []
+        for block in blocks:
+            pairs = []
+            for state in block.states:
+                params = state.term_dict.get("coulombexclusion")
+                pairs.append(
+                    np.zeros((0, 2), dtype=int)
+                    if params is None
+                    else params["atoms"][:, :2]
+                )
+            self.block_pairs.append(pairs)
+            self.block_corrections.append(
+                np.array([self.exclusion_energy(p) for p in pairs])
+            )
+            weights = np.zeros(block.nstates)
+            weights[block.seed_index] = 1.0
+            self.block_weights.append(weights)
+
+    def corrections(self, index: int) -> np.ndarray:
+        return self.block_corrections[index]
+
+    def update(self, index: int, weights: np.ndarray) -> None:
+        self.block_weights[index] = weights
+
+    def evaluate(self) -> tuple[float, np.ndarray, np.ndarray]:
+        """`compute` under the screen the current weights describe.
+
+        The screen is `1 - sum_s w_s M_s`: a pair intramolecular in every state
+        of its block drops out entirely, one intramolecular in only some of them
+        drops out by however much ground state those states hold.  That is
+        `sum_s w_s d(correction_s)/dr` written as one weight matrix, which the
+        linearity of the kernel contraction permits.
+        """
+        weighted_pairs = [
+            (pairs, float(w))
+            for block_pairs, weights in zip(self.block_pairs, self.block_weights)
+            for pairs, w in zip(block_pairs, weights)
+        ]
+        return self.compute(self.screen_matrix(weighted_pairs))
+
     def __call__(
         self, pos, pbc, cell, term_dict: dict
     ) -> tuple[float, np.ndarray, np.ndarray]:

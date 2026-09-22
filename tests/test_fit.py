@@ -22,13 +22,13 @@ order of magnitude more than the sum of the parts.
 
 Three things it is *not*, each measured rather than reasoned about:
 
-  * Not the search budget.  A `mode="shape"` fit converges on `xtol`/`ftol` at
-    1219 evaluations and about fifty seconds -- under its own `maxfev`, so there
-    is nothing to cap.  See the comment on the `minimize` call in
+  * Not the search budget.  The retired shape term's `mode="shape"` fit
+    converged on `xtol`/`ftol` at 1219 evaluations and about fifty seconds --
+    under its own `maxfev`, so there was nothing to cap.  See the comment on the `minimize` call in
     `fit.dissociation.fit_force_constants` for the sweep.
   * Not the cost of an objective evaluation.  A full refit of every template is
     26 ms and a full `reaction_margins` pass is 13 ms, neither depending on the
-    shape parameter.
+    bond parameters.
   * Not machine contention.  Confirmed with nothing else running.
 
 That leaves an interaction between this file and the others, and the obvious
@@ -54,8 +54,7 @@ from DynamicTopology.fit.coupling import (
     fit_coupling,
 )
 from DynamicTopology.fit.dissociation import (
-    DEFAULT_MAX_DECAY,
-    DEFAULT_MIN_DECAY,
+    bond_asymptotes,
     bond_curvatures,
     bond_types,
     bonded_energy,
@@ -64,9 +63,7 @@ from DynamicTopology.fit.dissociation import (
     frequency,
     reaction_margins,
     scale_force_constants,
-    set_shape_decays,
-    set_shape_parameters,
-    shape_bound,
+    set_asymptotes,
     stretch_curvatures,
     total_wavenumber,
     wavenumber,
@@ -175,9 +172,9 @@ class TestDissociationFit:
 class TestForceConstantFit:
     """The `k` route: raise the diabats by stiffening the bonds.
 
-    Superseded as the default by the Morse shape parameter -- which reaches more
+    Superseded as the default by the per-bond asymptote -- which reaches more
     channels for no frequency at all -- but kept, and kept tested, because it is
-    the thing the shape term has to be measured against.  Every test here names
+    the thing the asymptote has to be measured against.  Every test here names
     `mode="k"` explicitly rather than relying on the default, so that changing
     the default cannot quietly turn these into tests of something else.
     """
@@ -270,11 +267,12 @@ class TestForceConstantFit:
 
         `mode="k"` rather than the default, and for a runtime reason worth
         writing down.  What this asserts -- that the mutation happened -- is the
-        same in every mode, but `mode="both"` searches twice as many variables,
-        and once the templates on disk already satisfy every margin the hinge is
-        flat and Powell spends its whole 200-iteration budget trading the
-        regularizer against the geometry penalty for nothing.  Measured: 22
-        seconds in `k`, over an hour in `both`, with the same assertion passing.
+        same in every mode, but a mode with more variables and templates on disk
+        that already satisfy every margin leaves the hinge flat, and Powell can
+        spend its whole budget trading the regularizer against the geometry
+        penalty for nothing.  Measured under the retired shape term: 22 seconds
+        in `k`, over an hour in its `both` mode, with the same assertion
+        passing.
         The offline `scripts/fit.py` can afford that; a test cannot.
         """
         reaction_set = ReactionSet(RSET_PATH)
@@ -331,220 +329,162 @@ class TestDecoupledChannels:
         assert basis._switch(-10.0, -10.0, 0.0) == 0.0
 
 
-class TestMorseShape:
-    """The Hulburt-Hirschfelder term `c`, and the two things it must not break.
+class TestMorseAsymptote:
+    """The per-bond asymptote `h`, and the things it must not break.
 
-    `D`, `r0` and the curvature *at `r0`* come through untouched.  That is an
-    exact algebraic claim about an `O(dr**3)` correction, so it is testable
-    exactly rather than to a tolerance someone picked, and the tests below
-    evaluate it at `r0` for that reason.
-
-    **What this class does not say, and used to imply.**  It said `c` "is free"
-    and that the frequency comes through untouched, full stop.  That reading
-    held only while `r0` was where the bond sat.  `fit_bond_lengths` now
-    displaces `r0` inside the reference bond length so the Morse can lean
-    against the repulsion, and away from `r0` this term is the largest single
-    contribution to the stiffness of most of HCombustion's bonds.  See
-    `TestStretchCurvature` below, which measures it, and
-    `fit.dissociation._bonded_curvature`.
+    `D`, `r0` and the curvature *at `r0`* come through untouched whatever `h`
+    is, since `h` only enters on the stretched branch and `2 Dw a**2 = k` there.
+    That is an exact algebraic claim, so it is testable exactly rather than to a
+    tolerance someone picked, and the tests below evaluate it at `r0` for that
+    reason.  Away from `r0` it does move the curvature; see
+    `TestStretchCurvature` and `fit.dissociation._bonded_curvature`.
     """
 
     D, R0, K = 436.0, 0.07772, 251200.0
 
-    def _curve(self, r, c, b=None):
+    def _curve(self, r, h=None):
         """The Morse at one separation, in q-force units.
 
-        `b=None` omits the argument entirely rather than passing `None` through,
-        because that is what a term file predating `b` actually produces: the
-        key is absent from the `term_dict` and `_bond_morse` is called without
-        it, so the fallback it resolves is the one under test.
+        `h=None` omits the argument entirely rather than passing `None` through,
+        because that is what a term file without `h` actually produces: the key
+        is absent from the `term_dict` and `_bond_morse` is called without it,
+        so the fallback it resolves is the one under test.
         """
         positions = np.array([[0.0, 0.0, 0.0], [r, 0.0, 0.0]])
         vectors = positions[None, :, :] - positions[:, None, :]
-        decay = () if b is None else (np.array([b]),)
+        height = () if h is None else (np.array([h]),)
         return QForce(bond_form="morse")._bond_morse(
             vectors,
             np.array([[0, 1]]),
             np.array([self.D]),
             np.array([self.R0]),
             np.array([self.K]),
-            np.array([c]),
-            *decay,
+            *height,
         )[0]
 
-    @pytest.mark.parametrize("c", [0.0, 0.5, 1.3, -0.8])
-    @pytest.mark.parametrize("b", [2.0, 4.0, 8.0])
-    def test_the_shape_term_moves_neither_the_well_nor_the_limit(self, c, b):
-        """Both ends, in q-force units: `-D` at the minimum, `bond_asymptote` far out.
+    @pytest.mark.parametrize("h", [96.5, 300.0, 965.0])
+    def test_the_asymptote_moves_the_limit_and_not_the_well(self, h):
+        """`-D` at the minimum and `h` far out, both in q-force units."""
+        assert self._curve(self.R0, h) == pytest.approx(-self.D, abs=1e-9)
+        assert self._curve(5.0, h) == pytest.approx(h, abs=1e-6)
 
-        The limit is not zero.  `params.bond_asymptote` lifts the dissociated end
-        of every Morse off the free-fragment energy so that a bonded diabat and
-        its own fragments' diabat cross rather than converge -- which is what the
-        claim here has to be stated against, since `c` leaving the limit alone is
-        a statement about the shape term and not about where the limit is.
-        """
-        assert self._curve(self.R0, c, b) == pytest.approx(-self.D, abs=1e-9)
-        assert self._curve(2.0, c, b) == pytest.approx(
-            active().bond_asymptote_kjmol, abs=1e-9
-        )
-
-    @pytest.mark.parametrize("c", [0.0, 0.5, 1.3, -0.8])
-    def test_the_shape_term_moves_no_frequency(self, c):
-        """The curvature at the minimum is `k`, whatever `c` is.
+    @pytest.mark.parametrize("h", [96.5, 300.0, 965.0])
+    def test_the_asymptote_moves_no_frequency(self, h):
+        """The curvature at the minimum is `k`, whatever `h` is.
 
         Checked numerically rather than symbolically because it is the
         *implementation* that has to have this property, not the algebra.
         """
-        h = 1e-6
+        step = 1e-6
         curvature = (
-            self._curve(self.R0 + h, c)
-            - 2.0 * self._curve(self.R0, c)
-            + self._curve(self.R0 - h, c)
-        ) / h**2
+            self._curve(self.R0 + step, h)
+            - 2.0 * self._curve(self.R0, h)
+            + self._curve(self.R0 - step, h)
+        ) / step**2
         assert curvature == pytest.approx(self.K, rel=1e-4)
 
     def test_the_compressed_branch_is_untouched(self):
-        """`c` is clamped off below `r0`, where it would run to minus infinity.
-
-        `s**3 exp(-2s)` continued to negative `s` grows faster than the Morse
-        repulsion, so an unclamped correction turns the wall over and an atom
-        pushed hard enough falls through.
-        """
+        """`h` is a statement about dissociation and stays off the wall."""
         for r in (0.03, 0.05, 0.07, self.R0):
-            assert self._curve(r, 1.3) == pytest.approx(self._curve(r, 0.0), abs=1e-12)
-
-    @pytest.mark.parametrize(
-        "b", [DEFAULT_MIN_DECAY, 2.0, 2.5, 3.0, 4.0, 6.0, DEFAULT_MAX_DECAY]
-    )
-    def test_the_bound_is_where_dissociation_stops_being_downhill(self, b):
-        """`shape_bound(b)` must bind exactly, in both directions, at every `b`.
-
-        Below it the curve rises monotonically to the dissociation limit; above
-        it a barrier appears on a channel that has none, and a bound state
-        beyond the barrier that would trap fragments that should separate.  A
-        bound that is merely *safe* would pass the first half of this and make
-        the second half unreachable, so both are asserted.
-
-        Swept over the whole fitted range rather than checked at one decay,
-        because `b` is now a fitted parameter and the bound moves with it by a
-        factor of five hundred -- 0.180 at b = 1.5, 92.49 at b = 8.  A bound
-        that were correct only at the old fixed b = 4 would let the fit walk
-        onto a non-monotone curve anywhere else it went.
-        """
-        radii = self.R0 + np.linspace(1e-4, 1.2, 20000)
-
-        def monotonic(c):
-            energies = np.array([self._curve(r, c, b) for r in radii])
-            return bool(np.all(np.diff(energies) > -1e-12))
-
-        bound = shape_bound(b)
-        assert monotonic(bound), (
-            f"c = {bound} at b = {b} already puts a barrier on a dissociation "
-            "curve, so the bound is not protecting what it claims to"
-        )
-        assert not monotonic(1.05 * bound), (
-            f"c = {1.05 * bound} at b = {b} still dissociates downhill, so "
-            f"{bound} is leaving usable freedom on the table and this test is "
-            "not measuring where the limit actually is"
-        )
-
-    def test_the_decay_bounds_are_where_the_parameter_stops_meaning_anything(self):
-        """Both ends of the `b` box are the edge of usefulness, not a taste.
-
-        At the bottom the monotonicity bound collapses -- it is exactly zero at
-        b = 1, so no positive `c` is admissible at all -- and at the top the
-        correction has retreated inside the bond, delivering less at its own
-        peak than it does in the middle of the range.
-        """
-        assert shape_bound(1.0) < 1e-3, (
-            "the bound has not collapsed by b = 1, so the low end of the box is "
-            "not where the parameter stops existing"
-        )
-        assert shape_bound(DEFAULT_MIN_DECAY) > 0.0
-
-        def delivered(b):
-            """Largest correction available at this decay, as a fraction of D."""
-            return shape_bound(b) * (3.0 / b) ** 3 * np.exp(-3.0)
-
-        assert delivered(DEFAULT_MIN_DECAY) < 0.10, (
-            "the low end of the box still delivers a usable correction, so it "
-            "is cutting off freedom the fit could have used"
-        )
-        assert delivered(DEFAULT_MAX_DECAY) < delivered(4.0), (
-            "the correction is still growing at the top of the box, so the "
-            "bound is not where the parameter stops paying"
-        )
-
-    def test_setting_the_decay_leaves_every_other_parameter_alone(self, templates):
-        for _, _, terms in templates:
-            decayed = set_shape_decays(terms, [2.5] * len(bond_types(terms)))
-            for before, after in zip(terms, decayed):
-                assert before["type"] == after["type"]
-                if before["type"] != "bond":
-                    assert before["kwargs"] == after["kwargs"]
-                    continue
-                assert after["kwargs"]["b"] == pytest.approx(2.5)
-                for key in ("D", "r0", "k"):
-                    assert after["kwargs"][key] == before["kwargs"][key]
-
-    def test_a_missing_decay_reads_as_the_documented_default(self):
-        """Term files predating `b` must be unchanged by its introduction."""
-        for r in (self.R0 + 0.02, self.R0 + 0.05, self.R0 + 0.12):
-            assert self._curve(r, 1.3) == pytest.approx(
-                self._curve(r, 1.3, active().shape_decay), abs=1e-12
+            assert self._curve(r, 965.0) == pytest.approx(
+                self._curve(r, 96.5), abs=1e-12
             )
 
-    def test_setting_the_shape_leaves_every_other_parameter_alone(self, templates):
+    def test_raising_the_asymptote_lifts_every_stretch_below_harmonic(self):
+        """What makes `h` the replacement for the shape term.
+
+        At fixed `k`, `Dw (1 - exp(-a dr))**2` rises monotonically in `Dw` at
+        every stretch and is bounded by the harmonic `k dr**2 / 2`, so a higher
+        asymptote lifts the curve everywhere without ever overshooting it.
+        """
+        heights = [96.5, 200.0, 500.0, 1000.0, 5000.0]
+        for dr in (0.005, 0.02, 0.05, 0.1):
+            energies = [self._curve(self.R0 + dr, h) + self.D for h in heights]
+            assert np.all(np.diff(energies) > 0.0), dr
+            assert energies[-1] < 0.5 * self.K * dr * dr
+
+    @pytest.mark.parametrize("h", [96.5, 965.0, 9650.0])
+    def test_dissociation_is_downhill_at_every_height(self, h):
+        """No bound is needed: a Morse cannot turn over, whatever its depth.
+
+        The retired shape term needed `c <= c_max(b)` to keep a barrier off
+        every dissociation channel.  This is the property that made it
+        unnecessary, asserted over a range well past anything the fit reaches.
+        """
+        radii = self.R0 + np.linspace(1e-4, 1.2, 5000)
+        energies = np.array([self._curve(r, h) for r in radii])
+        assert np.all(np.diff(energies) > -1e-12)
+
+    def test_a_missing_asymptote_reads_as_bond_asymptote(self):
+        """Term files without `h` read the dataset's global value."""
+        for r in (self.R0 + 0.02, self.R0 + 0.05, self.R0 + 0.5):
+            assert self._curve(r) == pytest.approx(
+                self._curve(r, active().bond_asymptote_kjmol), abs=1e-12
+            )
+
+    def test_setting_the_asymptote_leaves_every_other_parameter_alone(self, templates):
         for _, _, terms in templates:
-            shaped = set_shape_parameters(terms, [0.7] * len(bond_types(terms)))
-            for before, after in zip(terms, shaped):
+            count = len(bond_types(terms))
+            lifted = set_asymptotes(terms, [2.5] * count)
+            assert bond_asymptotes(lifted) == pytest.approx([2.5] * count)
+            for before, after in zip(terms, lifted):
                 assert before["type"] == after["type"]
                 if before["type"] != "bond":
                     assert before["kwargs"] == after["kwargs"]
                     continue
-                assert after["kwargs"]["c"] == pytest.approx(0.7)
                 for key in ("D", "r0", "k"):
                     assert after["kwargs"][key] == before["kwargs"][key]
 
-    def test_a_frozen_shape_makes_no_progress(self, templates, reactions):
-        """Vacuity check, the shape-mode twin of the force-constant one."""
+    def test_a_frozen_asymptote_makes_no_progress(self, templates, reactions):
+        """Vacuity check, the asymptote twin of the force-constant one."""
         reaction_set = ReactionSet(RSET_PATH)
+        base = active().bond_asymptote
         fit = fit_force_constants(
-            reaction_set, templates, reactions, mode="shape", max_shape=0.0
+            reaction_set,
+            _plain(templates),
+            reactions,
+            mode="asymptote",
+            max_asymptote=base,
         )
-        assert fit.scales == [0.0] * len(fit.variables)
+        assert fit.scales == [base] * len(fit.variables)
         for name, after in fit.margins.items():
             assert after == pytest.approx(fit.margins_before[name], abs=1e-12)
 
-    def test_the_shape_alone_buys_channels_at_no_frequency_cost(
+    def test_the_asymptote_alone_buys_channels_at_no_frequency_cost(
         self, templates, reactions
     ):
-        """The claim the whole third parameter rests on.
+        """The claim the per-bond asymptote rests on.
 
-        Starting from plain Morse -- which is what `c = 0` is, and what every
-        template ships as before this fit runs -- the shape term has to gain
-        feasible channels while leaving every force constant exactly alone.
+        Starting from plain Morse -- `h = bond_asymptote` on every bond -- the
+        fit has to gain feasible channels while leaving every force constant
+        exactly alone.
         """
-        plain = [
-            (name, atoms, set_shape_parameters(terms, [0.0] * len(bond_types(terms))))
-            for name, atoms, terms in templates
-        ]
+        plain = _plain(templates)
         reaction_set = ReactionSet(RSET_PATH)
-        fit = fit_force_constants(reaction_set, plain, reactions, mode="shape")
+        fit = fit_force_constants(reaction_set, plain, reactions, mode="asymptote")
 
         before = sum(value > 0.0 for value in fit.margins_before.values())
         after = sum(value > 0.0 for value in fit.margins.values())
         assert after > before, (
             f"{before} channels were feasible with plain Morse and {after} with "
-            "the shape term; it is not buying anything"
+            "a per-bond asymptote; it is not buying anything"
         )
         for (_, _, original), terms in zip(plain, fit.terms.values()):
             for a, b in zip(original, terms):
                 if a["type"] == "bond":
                     assert a["kwargs"]["k"] == b["kwargs"]["k"], (
-                        "the shape fit moved a force constant, which is the one "
-                        "thing it exists to avoid"
+                        "the asymptote fit moved a force constant, which is the "
+                        "one thing it exists to avoid"
                     )
+
+
+def _plain(templates):
+    """Every template with its bonds back at `h = bond_asymptote`: plain Morse."""
+    base = active().bond_asymptote
+    return [
+        (name, atoms, set_asymptotes(terms, [base] * len(bond_types(terms))))
+        for name, atoms, terms in templates
+    ]
 
 
 class TestStretchCurvature:

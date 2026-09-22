@@ -35,53 +35,48 @@ becomes four.  Templates are stored and looked up independently, so this costs
 nothing mechanically, but the depths are no longer a per-element-pair table.
 
 
-Making the barriers reachable: the third Morse parameter
---------------------------------------------------------
+Making the barriers reachable: the per-bond asymptote
+-----------------------------------------------------
 
 Scaling `D` fixes the minimum and the dissociation limit and leaves the shape in
 between untouched, which is where the remaining error lives.  With `D` pinned by
 the atomization energy, `r0` by the geometry and `k` by the vibrational
-frequency, two-parameter Morse has nothing left, and what it produces is 0.55 to
-1.83 eV *too deep* at stretched geometries.  A reference barrier then lands below
-a diabat, and `fit.coupling.fit_amplitude` -- which has a real root only below
-*both* -- cannot fit the channel at all.  Eighteen of nineteen HCombustion
-channels failed for that reason alone.
+frequency, two-parameter Morse has nothing left, and it comes out *too deep* at
+stretched geometries.  A reference barrier then lands below a diabat, and
+`fit.coupling.fit_amplitude` -- which has a real root only below *both* --
+cannot fit the channel at all.
 
 **The route that does not work.**  Since `a = sqrt(k / 2D)`, raising `k` steepens
 the exponential and lifts the curve mid-range, and `mode="k"` still does exactly
 that.  It buys the depth with the frequency, and the exchange rate is terrible:
-reaching even 17 of 19 channels needs H2 at 12402 cm^-1 against an experimental
-4401, and *no* force constant whatever reaches 18 -- the count saturates at 17,
-so a cap of 100 buys precisely what a cap of 16 does.  At frequencies anyone
-would defend, one channel in nineteen is fittable.  That is not a knob setting,
-it is the functional form running out.
+before the repulsion was tapered, reaching even 17 of 19 channels needed H2 at
+12402 cm^-1 against an experimental 4401, and the count saturated there.
 
-**The route that does.**  `compute_bond` carries a Hulburt-Hirschfelder shape
-term,
+**The route that does.**  Each bond carries its own asymptote height `h`, so the
+well the exponential climbs is `Dw = D + h` on the stretched branch.  At fixed
+`k`, raising `h` lifts every `dr > 0` monotonically towards the harmonic
+`k dr**2 / 2` while the curvature at `dr = 0` stays `k`, and the curve stays a
+Morse, so it cannot turn over.  `h` is bounded below by `bond_asymptote`, which
+is also what a term file without `h` reads as.
 
-    s = a * max(dr, 0),   E = D * [ (1 - exp(-a*dr))**2 - 1 + c * s**3 exp(-2s) ]
+`fit_force_constants` fits one `h` per distinct bond type (`asymptote`), the
+force constants alone (`k`), or both (`asymptote-k`), always with
+`fit_template` re-solved underneath it, so neither the atomization energy nor
+the geometry is something the objective can spend.  The objective is a hinge:
+once a margin is positive the barrier is reproduced exactly by the amplitude,
+which is free per reaction, so overshooting buys nothing.
 
-whose whole point is that it is `O(dr**3)` at the minimum: it leaves `D`, `r0`
-and the curvature -- and therefore every vibrational frequency -- *exactly*
-where q-force put them, while raising the stretched branch by up to
-`0.168 * c * D`.  `c = 0` is plain Morse, which is what every term file
-predating the parameter reads as.
-
-`c` is bounded, and not arbitrarily: past `c = shape_bound(b)` the correction
-beats the exponential and the dissociation curve turns over, putting a barrier on
-a channel that has none and a bound state beyond it.  The decay `b` is fitted per
-bond type alongside `c` -- see `params.ForceFieldParams.shape_decay` for the measurement that made
-it a parameter -- and because the bound moves with it (1.31 at b = 2, 19.33 at
-b = 4, 52.20 at b = 6) the search variable is the fraction `c / shape_bound(b)`
-rather than `c` itself.
-
-`fit_force_constants` fits one variable per distinct bond type in any of three
-modes -- `shape` (`c` only, no frequency cost), `k` (the old route), or `both`
--- always with `fit_template` re-solved underneath it, so neither the
-atomization energy nor the geometry is something the objective can spend.  The
-objective is a hinge: once a margin is positive the barrier is reproduced
-exactly by the amplitude, which is free per reaction, so overshooting buys
-nothing.
+**This replaced a Hulburt-Hirschfelder shape term** `c s**3 exp(-b s)`, fitted
+as a `(c, b)` pair per bond under a monotonicity bound `c <= c_max(b)`.  From
+the same q-force start on HCombustion (2026-09-22) both routes make 19 of 19
+margins positive at the frequencies q-force fitted; `h` does it with one
+parameter per bond, no bound to enforce, and in 16 s against the pair's 650.
+The two lift different parts of the curve -- the shape term mid-range, `h` out
+towards dissociation -- and the channels that needed lifting at all are the
+fissions, whose couplings `fit.coupling.fit_twobody` places at the diabatic
+crossing rather than inverting a barrier.  Plain Morse (`h = bond_asymptote`
+everywhere) fits all 19 couplings end to end; what `h` moves is where those
+crossings sit, 2.1-2.4 A in to 1.8-2.0.
 
 
 Where the minimum is: `r0` against a repulsion that is not zero there
@@ -109,11 +104,10 @@ neither is fitted and neither competes with the barriers.
 
 It is also not always solvable, which is worth stating plainly: a Morse pulls at
 most `D*a/2`, and `ZBL` pushes O-O in HO2 apart with 25.0 eV/A against a ceiling
-of 8.3 at q-force's own force constants.  The ceiling rises with `D`, `k` and
-`c`, so the geometry condition is really a constraint on the search box -- seven
-of HCombustion's eight bond types come inside it at `c = 19.3` and the eighth at
-`k`-scale 2 -- which is why the origin is no longer a feasible starting point
-and `_feasible_start` exists.
+of 8.3 at q-force's own force constants, measured against the untapered
+repulsion.  The ceiling is `sqrt(k Dw / 8)`, so it rises with `D`, `k` and `h`.
+Since `ZBL` was tapered no HCombustion bond is near it: the solved `r0` sits
+within 0.008 A of the reference bond length.
 """
 
 import logging
@@ -125,7 +119,7 @@ from ase.data import atomic_masses, atomic_numbers
 from scipy.optimize import brentq, minimize
 
 from DynamicTopology.core.types import Term
-from DynamicTopology.forcefield.acks2 import ACKS2
+from DynamicTopology.forcefield.electrostatics import Electrostatics
 from DynamicTopology.forcefield.params import active
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.zbl import ZBL
@@ -153,27 +147,18 @@ DEFAULT_MARGIN: float = 0.02
 DEFAULT_FREQUENCY_WEIGHT: float = 0.005
 
 # Hard bound on each k-scale; the cap on frequency drift is its square root.
-# Set it to 1.0 to freeze the force constants, which in `mode="k"` is the
-# vacuity check.
+# Only read by `mode="k"` and `mode="asymptote-k"` -- the default `asymptote`
+# mode leaves every force constant where q-force put it.  Set it to 1.0 to
+# freeze the force constants, which in `mode="k"` is the vacuity check.
 #
-# Two -- 1.41x in wavenumbers -- is where the knee is, and the knee is sharp.
-# Swept over HCombustion in the default `both` mode, with `c` doing as much as
-# it can before any frequency is spent:
+# Two -- 1.41x in wavenumbers -- was the knee of a sweep over the retired
+# `(c, b)` shape term's `both` mode, where it took HCombustion from 13 to 18 of
+# 19 channels.  Since the per-bond asymptote reaches 19 of 19 with the force
+# constants frozen, nothing currently needs it: `asymptote-k` from the same start
+# spends up to 1.19x in `k` (H2 at 4021 cm^-1) for margins the hinge does not
+# value.
 #
-#     cap 1.0 (shape only)  13 / 19   1.00x
-#     cap 1.1               13 / 19   1.05x
-#     cap 1.2               13 / 19   1.10x
-#     cap 1.5               15 / 19   1.22x
-#     cap 1.7               16 / 19   1.30x
-#     cap 1.85              16 / 19   1.36x
-#     cap 2.0               18 / 19   1.41x   <- shipped
-#
-# For contrast, `mode="k"` with no shape term at all needs 2.00x to reach 12,
-# 3.00x to reach 16, and saturates at 17 -- a cap of 100 buys exactly what a cap
-# of 16 does.  The third Morse parameter is what turns "spend 3.31x and still
-# fall short" into "spend 1.41x and stop".
-#
-# **No nonbonded term moves this curve, and one of them provably cannot.**  A
+# **No nonbonded term moves the margins, and one of them provably cannot.**  A
 # Lennard-Jones with per-state exclusions was added on the hypothesis that Pauli
 # repulsion would lift the diabats at the transition states and make the channels
 # fittable for free, and the numbers looked emphatic: 14 of 19 feasible with no
@@ -187,27 +172,6 @@ DEFAULT_FREQUENCY_WEIGHT: float = 0.005
 # module computes.  It cannot help here and it cannot hurt here, by construction.
 # The overbinding this fit exists to repair is in the Morse form, and the bonded
 # parameters are the only thing that can pay for it.
-#
-# **The knee is not a preference, and the lower caps are not usable.**  A
-# decoupled channel is switched off entirely, so a cap that leaves six of them
-# off does not merely fit fewer barriers -- it takes the EVB basis apart.  At cap
-# 1.0 and at cap 1.5 the standard test geometries drop from three diabatic states
-# to two, and nine tests across `test_evb_invariants`, `test_gradients` and
-# `test_trajectory_io` fail their own vacuity guards: there is no longer a
-# multi-state block to be pivot-invariant about, no channel inside the admission
-# ramp, and no topology change along a trajectory.  Only cap 2.0 leaves a
-# reactive model behind, which is why the 1.41x is spent.
-#
-# Re-running this fit from q-force's own force constants -- rather than from the
-# twice-stiffened ones the dataset had drifted to -- reproduces the single-pass
-# result exactly and changes only O2, from 3259 cm^-1 back to 2305.  That is what
-# undoing the double application is worth; the rest of the drift is the fit
-# genuinely wanting it.
-#
-# The one channel no cap reaches is `rxn_06`.  `rxn_08` -- whose stored
-# transition state is not a saddle but a *minimum*, 4.87 eV below its own
-# reactant; see `tests/test_reference_energies.py` -- was the holdout before the
-# shape term existed and is fittable now, at cap 2.0, by 0.011 eV.
 #
 # Note that this bounds the scale relative to whatever `k` the templates handed
 # in already carry, not relative to q-force's original fit, so **running the fit
@@ -223,8 +187,8 @@ DEFAULT_MAX_SCALE: float = 2.0
 # It is a penalty rather than a constraint, and that is a deliberate second
 # attempt.  Treating it as a constraint -- `score` returning `inf` wherever
 # `fit_bond_lengths` had no solution -- is exactly right on paper and
-# catastrophic in practice: at `c = 0` and q-force's own force constants most
-# of these bonds cannot cancel `ZBL` at any length, so the infeasible set is
+# catastrophic in practice: at plain Morse, q-force's own force constants and
+# the then-untapered `ZBL`, most of these bonds could not cancel it at any length, so the infeasible set is
 # most of the box, and Powell line-searching across a plateau of infinities
 # turned a 40 second fit into one that ran for half an hour without converging.
 # A quadratic penalty puts the same pressure on a surface the optimizer can
@@ -248,61 +212,33 @@ DEFAULT_GEOMETRY_WEIGHT: float = 10.0
 #
 # Nothing priced this before, and the result was a surface with an 11735 cm^-1
 # mode on it -- a 2.84 fs period, which is what pinned the sweep at 0.05 fs.
-# See `_bonded_curvature` for where the stiffness was coming from: not from the
-# `k`-scale this fit reports, which is bounded at 1.41x, but from the shape term
-# at a displaced `r0`.
+# The stiffness was coming not from the `k`-scale this fit reports, which was
+# bounded at 1.41x, but from the retired shape term at an `r0` displaced inside
+# the bond.  Neither survives: `h` adds no curvature at `dr = 0` and `r0` now
+# sits on the bond, so the asymptote fit leaves every mode where q-force put it
+# (fastest 3748 cm^-1, H2) and this cap does not bind.
 DEFAULT_MAX_WAVENUMBER: float = 4400.0
 
 # Weight on `max(0, nu - max_wavenumber)**2`, in 1/cm**-2.
 #
 # A hinge and not a bound, for the reason `DEFAULT_GEOMETRY_WEIGHT` records:
-# a hard constraint here would return `inf` over most of the box at `c = 0`,
+# a hard constraint here returned `inf` over most of the box at plain Morse,
 # and Powell line-searching a plateau of infinities is what turned a 40 second
 # fit into an hour-long one last time.
 #
-# **The cap costs no channels at all, which was not the expected answer.**
-# Swept over HCombustion from the `8f32706` reset in the default `both` mode at
-# `--max-k-scale 3`, cap 4400.  The first table is the cap at the weight it was
-# first guessed at, 1e-6, and it is the shape of a hinge too soft to bind:
-#
-#     cap        fastest mode   dt at 15 steps/period   channels   over cap
-#     none            11697            0.190 fs           14/19      6 of 8
-#     6000             6160            0.361              13/19      2 of 8
-#     5000             5781            0.385              13/19      3 of 8
-#     4400             5309            0.419              13/19      4 of 8
-#     4000             5262            0.423              13/19      6 of 8
-#
-# It saturates around 5260 cm^-1 and stops responding to the cap, having bought
-# 2.2x in timestep for one channel.  That reads like a floor and is not one: a
-# scan of the whole `(k-scale, c)` box for water's O-H alone reaches 4337 cm^-1
-# -- its repulsion's own curvature, 4342 -- across every `k`-scale at `c <= 5`.
-# The fit was not failing to go lower, it was declining to.  Weight, at cap 4400:
-#
-#     weight     fastest mode   dt at 15 steps/period   channels   over cap
-#     1e-6             5309            0.419              13/19      4 of 8
-#     1e-5             4636            0.480              14/19      5 of 8
-#     1e-4             4546            0.489              13/19      4 of 8
-#     1e-3             4401            0.505              14/19      1 of 8
-#     1e-2             4399            0.506              14/19      0 of 8
-#     3e-2             4399            0.506              14/19      0 of 8
-#     1e-1             4501            0.494              14/19      1 of 8
-#
-# 14 of 19 is what the *uncapped* fit gets.  So the whole 2.7x in timestep --
-# 0.190 fs to 0.506 -- is bought for nothing, and the trade this hinge was
-# written to manage turns out not to exist on this dataset.  What the cap
-# actually does is stop the fit spending `c` in the region where `c` is
-# expensive; there was another region, equally good for the margins, that it had
-# no reason to prefer until now.
-#
-# 1e-2 is the middle of a plateau three decades wide, and the two weights that
-# reach the cap on every bond type are inside it.  Higher is not better: at 1e-1
-# the fit is back to one bond over, because the penalty starts distorting the
-# search before it binds any harder.
+# 1e-2 was chosen by a sweep over the retired shape term's `both` mode, where
+# it was the middle of a plateau three decades wide: every bond type under a
+# 4400 cap, no channel lost against the uncapped fit, and the timestep up 2.7x
+# (0.190 fs to 0.506).  Higher was not better -- at 1e-1 the penalty distorted
+# the search before it bound any harder.  In the default `asymptote` mode the
+# force constants are frozen and nothing is over the cap, so the weight only
+# matters for `k` and `asymptote-k`.
 DEFAULT_CURVATURE_WEIGHT: float = 1e-2
 
 # Stateless, and constructed once: the outer fit calls `bonded_energy`
 # thousands of times.
-_ACKS2 = ACKS2()
+# `ACKS2` or `PointCharge`, whichever the active `global_params` names.
+_ELECTROSTATICS = Electrostatics()
 _ZBL = ZBL()
 _LJ = LennardJones()
 
@@ -345,7 +281,7 @@ def _scaled(terms: list[Term], scale: float) -> list[Term]:
 # **Why this is safe, and why it matters.**  All three nonbonded terms are
 # functions of the geometry alone -- `ZBL` reads only atomic numbers, `ACKS2`
 # reads the `atom` terms and `LennardJones` the `lennardjones` terms, and no
-# part of this module fits either.  The fit moves `D`, `r0`, `k` and `c`, every
+# part of this module fits either.  The fit moves `D`, `r0`, `k` and `h`, every
 # one of them bonded.  So across an entire
 # `fit_force_constants` run, at a fixed template geometry, this pair of numbers
 # never changes.
@@ -387,6 +323,7 @@ def _nonbonded_key(atoms: Atoms, term_dict: dict) -> tuple:
         # neither is fitted here, but a caller that fitted one should miss the
         # cache rather than read a stale number out of it.
         _params("atom"),
+        _params("charge"),
         _params("lennardjones"),
         # And the exclusions, which `nonbonded_curvatures` now reads.  Without
         # them a raw `.jsonl` and the same list `with_exclusions` has been
@@ -394,6 +331,10 @@ def _nonbonded_key(atoms: Atoms, term_dict: dict) -> tuple:
         # one's answer -- which is the whole-system sum, uncorrected.
         _params("exclusion"),
         _params("zblexclusion"),
+        # Which pairs the Coulomb sum drops.  Under `pointcharge` two diabats of
+        # one reaction at one geometry differ in exactly this and in `charge`,
+        # so without both the product diabat would read the reactant's energy.
+        _params("coulombexclusion"),
     )
 
 
@@ -408,7 +349,9 @@ def _nonbonded(atoms: Atoms, term_dict: dict) -> tuple[float, np.ndarray]:
     key = _nonbonded_key(atoms, term_dict)
     hit = _NONBONDED_CACHE.get(key)
     if hit is None:
-        energy, forces, _ = _ACKS2(atoms.positions, atoms.pbc, atoms.cell, term_dict)
+        energy, forces, _ = _ELECTROSTATICS(
+            atoms.positions, atoms.pbc, atoms.cell, term_dict
+        )
         zbl_energy, zbl_forces, _ = _ZBL(
             atoms.positions, atoms.numbers, atoms.pbc, atoms.cell
         )
@@ -545,12 +488,12 @@ MAX_LENGTH_SHIFT: float = 0.03
 LENGTH_DEPTH_ROUNDS: int = 4
 
 
-def _morse_stretch_force(r, D: float, r0, k: float, c: float, b: float):
+def _morse_stretch_force(r, D: float, r0, k: float, h: float | None = None):
     """`-dE/dr` of one Morse bond, in q-force units (kJ/mol/nm).
 
     Positive is the force pulling the two atoms *apart*, i.e. the sign a
     compressed bond carries.  This mirrors `QForce._bond_morse` exactly,
-    including the one-sided shape term; it is written out a second time here
+    including the one-sided asymptote; it is written out a second time here
     because the fit needs the derivative of a single bond as a function of `r0`
     with everything else held still, and the force field only ever offers the
     assembled Cartesian forces of a whole system.
@@ -565,13 +508,14 @@ def _morse_stretch_force(r, D: float, r0, k: float, c: float, b: float):
     """
     dr = np.asarray(r, dtype=float) - np.asarray(r0, dtype=float)
     # `Dw`, not `D`: the well the exponential climbs is the depth plus the
-    # asymptote, on the stretched branch only.  See `params.bond_asymptote`.
-    Dw = np.where(dr > 0.0, D + active().bond_asymptote_kjmol, D)
+    # asymptote, on the stretched branch only.  See `params.bond_asymptote`;
+    # `h` is the per-bond override `QForce._bond_morse` accepts.
+    if h is None:
+        h = active().bond_asymptote_kjmol
+    Dw = np.where(dr > 0.0, D + h, D)
     al = np.sqrt(k / (2 * Dw))
     exp_term = np.exp(-al * dr)
     de_dr = 2 * Dw * (1 - exp_term) * al * exp_term
-    s = al * np.maximum(dr, 0.0)
-    de_dr = de_dr + (Dw * c * al * s * s * (3.0 - b * s) * np.exp(-b * s))
     return -de_dr
 
 
@@ -673,12 +617,11 @@ def bond_curvatures(atoms: Atoms, terms: list[Term]) -> list[float]:
         forces = forces + _nonbonded(moved, term_dict)[1]
         return float(np.dot(forces[j], unit))
 
-    # 1e-4, not the 1e-3 a central difference would otherwise want.  The shape
-    # term is clamped at `dr = 0` (`s = a max(dr, 0)`), so a bond sitting
-    # exactly there has the correction on one side of the stencil and not the
-    # other, and the difference picks up an O(step) contribution that the true
-    # second derivative does not have -- `c * s**3` is cubic, so it contributes
-    # nothing to the curvature at the clamp.
+    # 1e-4, not the 1e-3 a central difference would otherwise want.  The Morse
+    # switches branch at `dr = 0` (`Dw = D + h` only when stretched), and its
+    # third derivative jumps there, so a bond sitting exactly there has a
+    # different cubic on each side of the stencil and the difference picks up
+    # an O(step) contribution that the true second derivative does not have.
     #
     # A bond sits exactly there whenever `fit_bond_lengths` can solve its
     # geometry condition exactly, which after `forcefield/exclusions.py` is
@@ -691,7 +634,9 @@ def bond_curvatures(atoms: Atoms, terms: list[Term]) -> list[float]:
     #     step 1e-4   217.930   +0.074
     #     step 1e-5   217.863   +0.007
     #
-    # Linear in the step, as an artifact of straddling the clamp has to be.
+    # (measured with the retired shape term, which was clamped at the same
+    # point).  Linear in the step, as an artifact of straddling the join has to
+    # be.
     # 1e-4 puts it under a tenth of an eV/A**2 -- 0.03% on O2, a few cm^-1 on
     # the wavenumber this feeds -- at no cost, since this function is called for
     # the report and the tests and never from the objective's inner loop, which
@@ -719,43 +664,32 @@ def _bonded_curvature(kwargs: dict, r: float) -> float:
     only offers assembled Cartesian forces of a whole system.  Differentiating
     `QForce._bond_morse` twice,
 
-        d2/dr2 [ D (1 - exp(-a dr))**2 ]  =  2 D a**2 exp(-a dr) (2 exp(-a dr) - 1)
-        d2/dr2 [ D c s**3 exp(-b s) ]     =  D c a**2 (6 s - 6 b s**2 + b**2 s**3) exp(-b s)
+        d2/dr2 [ Dw (1 - exp(-a dr))**2 ]  =  2 Dw a**2 exp(-a dr) (2 exp(-a dr) - 1)
 
-    with `s = a max(dr, 0)`, so the shape term contributes nothing on the
-    compressed branch -- where it is clamped -- and nothing at `dr = 0`, where
-    it is cubic.
-
-    **It contributes a great deal anywhere else**, which is the finding this
-    function exists to price.  The claim that `c` is `O(dr**3)` at the minimum
-    and therefore free of frequency was true while `r0` *was* the minimum.
-    `fit_bond_lengths` ended that: `r0` is now pulled 0.04-0.22 A inside the
-    reference bond length so the Morse can lean against the repulsion, and at
-    that displacement this term is the largest single contribution to the
-    stiffness -- 63 eV/A**2 of H2's 115, 509 of O2's 793, 323 of HO's 480.
+    which is `k` at `dr = 0` whatever `Dw` is.  Away from it the asymptote does
+    move the curvature, and `fit_bond_lengths` can put a bond there: `r0` is
+    solved against the repulsion rather than set to the bond length.  With the
+    tapered `ZBL` the displacement is under 0.008 A on every HCombustion bond,
+    so this is `k` to within a few cm^-1; before the taper it was 0.04-0.22 A,
+    and the retired shape term's curvature at that displacement was most of the
+    stiffness (509 eV/A**2 of O2's 793).
 
     `r` in Angstrom; `kwargs` in q-force units, as stored.
     """
     D = kwargs["D"]
     k = kwargs["k"]
-    c = kwargs.get("c", 0.0)
-    b = kwargs.get("b", active().shape_decay)
     dr = r / 10.0 - kwargs["r0"]  # nm
     # `Dw`, not `D`, and on the stretched branch only.  The curvature *at the
     # minimum* is `k` either way, which is what makes the asymptote free of the
     # fitted frequencies -- but `fit_bond_lengths` displaces `r0` *inside* the
     # reference bond length, so the bond sits at `dr > 0` and this is exactly
     # where the two differ.  See `params.bond_asymptote`.
-    Dw = D + active().bond_asymptote_kjmol if dr > 0.0 else D
+    h = kwargs.get("h", active().bond_asymptote_kjmol)
+    Dw = D + h if dr > 0.0 else D
     al = np.sqrt(k / (2 * Dw))
 
     exp_term = np.exp(-al * dr)
     curvature = 2 * Dw * al * al * exp_term * (2 * exp_term - 1)
-
-    s = al * max(dr, 0.0)
-    curvature += (
-        Dw * c * al * al * (6 * s - 6 * b * s**2 + b**2 * s**3) * np.exp(-b * s)
-    )
     # kJ/mol/nm**2 -> eV/A**2
     return float(curvature * units.kJ / units.mol / units.nm**2)
 
@@ -972,8 +906,7 @@ def fit_bond_lengths(
         key: (
             t["kwargs"]["D"],
             t["kwargs"]["k"],
-            t["kwargs"].get("c", 0.0),
-            t["kwargs"].get("b", active().shape_decay),
+            t["kwargs"].get("h"),
         )
         for t in working
         if t["type"] == "bond"
@@ -983,23 +916,23 @@ def fit_bond_lengths(
     lengths = bond_lengths(working, atoms)
 
     for index, (r0, k) in enumerate(bond_types(working)):
-        D, k_value, c, decay = params[(r0, k)]
+        D, k_value, height = params[(r0, k)]
         # The type's own Morse contribution to `total[index]`, so that what
         # is left is the part no choice of `r0` can change.
         bond_r = np.asarray(lengths[index], dtype=float)
         own = (
-            float(_morse_stretch_force(bond_r, D, r0, k_value, c, decay).sum())
+            float(_morse_stretch_force(bond_r, D, r0, k_value, height).sum())
             * ev_per_qforce
         )
         external = total[index] - own
 
-        def residual(trial, _r=bond_r, _D=D, _k=k_value, _c=c, _b=decay, _e=external):
+        def residual(trial, _r=bond_r, _D=D, _k=k_value, _h=height, _e=external):
             """Total force along this bond type if its `r0` were `trial`.
 
             Vectorized over `trial`, so the grid below is a single call.
             """
             mine = _morse_stretch_force(
-                _r, _D, np.asarray(trial, dtype=float)[..., None], _k, _c, _b
+                _r, _D, np.asarray(trial, dtype=float)[..., None], _k, _h
             ).sum(-1)
             return mine * ev_per_qforce + _e
 
@@ -1012,11 +945,11 @@ def fit_bond_lengths(
         # naming: `ZBL` pushes O-O in HO2 apart with 25.0 eV/A and that
         # bond's Morse, as q-force parameterizes it, tops out at 8.3.
         #
-        # The ceiling moves with `D`, `k` and `c`, all of which the outer
-        # fit and the depth solve are free to raise, so infeasible here
-        # means "not at these force constants" rather than "not at all":
-        # at `c = 19.3` seven of HCombustion's eight bond types come
-        # inside it, and the eighth does at `k`-scale 2.
+        # The ceiling is `sqrt(k Dw / 8)`, so it moves with `D`, `k` and
+        # `h`, all of which the outer fit and the depth solve are free to
+        # raise: infeasible here means "not at these parameters" rather
+        # than "not at all".  (The numbers above predate the `ZBL` taper;
+        # no HCombustion bond is near the ceiling now.)
         # The search window is `MAX_LENGTH_SHIFT` either side of the
         # length the template arrived with, so both branches below are
         # bounded by the same tripwire rather than by whatever bracket
@@ -1073,7 +1006,7 @@ def fit_template(
     the gradient at a fixed geometry -- so alternating them converges rather
     than needing a joint solve.
 
-    This is the inner solve of `fit_force_constants`: whatever `c` and `k` the
+    This is the inner solve of `fit_force_constants`: whatever `h` and `k` the
     outer search is trying, the geometry and the atomization energy are restored
     underneath it, so neither is something the margin objective can spend.
     """
@@ -1122,30 +1055,23 @@ class ForceConstantFit:
     terms: dict[str, list[Term]] = field(default_factory=dict)
     # The fitted variables, in the order they were solved for.
     variables: list[BondVariable] = field(default_factory=list)
-    # Multiplier applied to each variable's `k`, aligned with `variables`.
+    # Per variable, aligned with `variables`: the fitted asymptote height `h` in
+    # eV in the `asymptote` modes, the multiplier on `k` in `mode="k"`.
     scales: list[float] = field(default_factory=list)
     # Reaction name -> min(H_reactant, H_product) - E_reference at its
     # transition state.  Positive is fittable.
     margins: dict[str, float] = field(default_factory=dict)
     # The same, before anything was refitted.
     margins_before: dict[str, float] = field(default_factory=dict)
-    # "shape" -> `scales` holds Hulburt-Hirschfelder `c` values; "k" -> force
-    # constant scale factors.  The two are reported in different units and the
-    # reader has no way to tell them apart from the numbers alone.
-    mode: str = "shape"
-    # Fitted Morse depth per `(template, r0, k)`, in eV, so a report can quote
-    # the shape term's bump as an energy rather than as a bare coefficient.
+    # Which of the two `scales` means, since they are reported in different
+    # units and the reader has no way to tell them apart from the numbers alone.
+    mode: str = "asymptote"
+    # Fitted Morse depth per `(template, r0, k)`, in eV.
     # Keyed on the *input* `(r0, k)` because that is what `BondVariable` carries.
     # The inner solve moves `D` and `r0`; `k` is the outer search's.
     depths: dict[tuple[str, float, float], float] = field(default_factory=dict)
-    # Force-constant scale per bond type; all 1.0 unless `mode == "both"`, where
-    # `scales` holds `c` and the frequencies move as well.
+    # Force-constant scale per bond type; all 1.0 unless `mode` fits `k`.
     k_scales: list[float] = field(default_factory=list)
-    # Fitted shape decay `b` per bond type, aligned with `variables`.  Reported
-    # because `c` alone is not readable: the same `c` means a 40% correction at
-    # one decay and a 4% one at another, and the monotonicity bound it is
-    # measured against moves with `b` too.
-    decays: list[float] = field(default_factory=list)
     # Total second derivative along each bond type at its template's reference
     # geometry, in eV/A**2, aligned with `variables`.  Reported separately from
     # the fitted `k` because they are no longer the same quantity: `ZBL` adds
@@ -1204,117 +1130,31 @@ def scale_force_constants(terms: list[Term], scales: list[float]) -> list[Term]:
     return out
 
 
-# Upper bound on the Hulburt-Hirschfelder shape parameter, and not an arbitrary
-# one: it is the largest `c` for which the bond still dissociates downhill.
-#
-# On the stretched branch the slope is
-#
-#     dE/dr  =  D * a * exp(-b*s) * [ 2(exp((b-1)s) - exp((b-2)s))
-#                                       + c * s**2 * (3 - b*s) ]
-#
-# and the bracket is what can go negative, since `(3 - b*s) < 0` beyond
-# `s = 3/b`.  Requiring it to stay non-negative everywhere gives
-#
-#     c  <=  min over s > 3/b of  2(exp((b-1)s) - exp((b-2)s)) / (s**2 (b s - 3))
-#
-# Past that the correction wins over the exponential and the curve turns over: a
-# barrier appears on a dissociation channel that has none, and beyond the barrier
-# a *bound* state at long range that would trap two fragments that should have
-# separated.  The fit will happily walk there -- nothing in a margin objective
-# knows what a dissociation curve is supposed to look like -- so the constraint
-# has to be in the bound.
-#
-# **The bound moves with `b`, which is why `c` is not fitted directly.**  It is
-# 1.31 at b = 2, 19.33 at b = 4 and 52.20 at b = 6, so a rectangular box on
-# `(c, b)` would be mostly outside the feasible region and its shape would
-# change under the optimizer's feet.  `fit_force_constants` searches the
-# *fraction* `u = c / shape_bound(b)` in [0, 1] instead, which is rectangular,
-# feasible everywhere, and makes the regularizer scale-free for free.
-_SHAPE_BOUND_CACHE: dict[float, float] = {}
+# Upper bound on a fitted per-bond asymptote height `h`, in eV.  The lower bound
+# is `bond_asymptote` itself: below it the curve is *deeper* at every stretch,
+# which is the wrong direction, and it is the height the twobody crossings were
+# placed against.
+DEFAULT_MAX_ASYMPTOTE: float = 10.0
 
 
-def shape_bound(decay: float) -> float:
-    """Largest `c` at this `b` for which the bond still dissociates downhill.
+def set_asymptotes(terms: list[Term], values: list[float]) -> list[Term]:
+    """Copy of `terms` with each bond type's asymptote `h` set, in eV.
 
-    Evaluated on a grid rather than solved: the minimand is smooth and shallow
-    near its minimum, the answer is wanted to about three digits, and this is
-    called once per bond type per objective evaluation, so it is memoized on
-    `b` and the grid cost is paid a few dozen times per fit.
-
-    Tends to zero as `b` falls to 1: below that the Morse repulsion no longer
-    outruns the correction at *any* separation, the minimand's infimum moves out
-    to infinity, and no positive `c` is monotone.  The grid truncates at s = 60,
-    so what comes back near b = 1 is a small positive number rather than an
-    exact zero -- `DEFAULT_MIN_DECAY` keeps the fit well clear of it.
+    `values` is in `bond_types` order and in eV, as `bond_asymptote` is; the
+    term file stores `h` in q-force's kJ/mol, like `D`.  Unlike
+    `scale_force_constants` this *sets* rather than scales, because the search
+    is over absolute heights bounded below by `bond_asymptote`.
     """
-    key = round(float(decay), 9)
-    if key not in _SHAPE_BOUND_CACHE:
-        grid = np.linspace(3.0 / max(key, 1e-9) + 1e-6, 60.0, 200_000)
-        ratio = (
-            2.0
-            * (np.exp((key - 1.0) * grid) - np.exp((key - 2.0) * grid))
-            / (grid * grid * (key * grid - 3.0))
+    order = {pair: index for index, pair in enumerate(bond_types(terms))}
+    out: list[Term] = []
+    for term in terms:
+        if term["type"] != "bond":
+            out.append(term)
+            continue
+        kwargs = dict(term["kwargs"])
+        kwargs["h"] = (
+            float(values[order[(kwargs["r0"], kwargs["k"])]]) * units.mol / units.kJ
         )
-        _SHAPE_BOUND_CACHE[key] = max(float(np.min(ratio)), 0.0)
-    return _SHAPE_BOUND_CACHE[key]
-
-
-# Bounds on the fitted decay `b`, and both are the point where the parameter
-# stops meaning anything rather than a preference.
-#
-# Below 1.5 the monotonicity bound has collapsed -- `shape_bound` is 0.180 at
-# 1.5 and exactly 0 at 1.0 -- so the term can deliver under 7% of `D` even at
-# its own peak and the optimizer is wandering on a plateau.
-#
-# Above 8 the correction has retreated inside the bond: the negative-curvature
-# window `1.268/b < s < 4.732/b` reaches down to s = 0.158, and every
-# HCombustion bond sits at s = 0.180-0.382, so nothing is gained by going
-# further and the delivered correction is already falling (0.406 D at b = 4,
-# 0.243 D at b = 8).  Eight is chosen so that O2 -- the tightest bond at
-# s = 0.180, and the mode that sets the timestep -- can just reach the window
-# where the shape term softens it instead of stiffening it.
-DEFAULT_MIN_DECAY: float = 1.5
-DEFAULT_MAX_DECAY: float = 8.0
-
-# Upper bound on `u = c / shape_bound(b)`.  One is the monotonicity limit
-# itself; zero freezes the shape term, which is the vacuity check for it.
-DEFAULT_MAX_SHAPE_FRACTION: float = 1.0
-
-
-def set_shape_parameters(terms: list[Term], values: list[float]) -> list[Term]:
-    """Copy of `terms` with each bond type's `c` set, in `bond_types` order.
-
-    Unlike `scale_force_constants` this *sets* rather than scales, because `c`
-    starts at zero -- a term file that predates the parameter reads as plain
-    Morse -- and zero has no scale factor.
-    """
-    order = {pair: index for index, pair in enumerate(bond_types(terms))}
-    out: list[Term] = []
-    for term in terms:
-        if term["type"] != "bond":
-            out.append(term)
-            continue
-        kwargs = dict(term["kwargs"])
-        kwargs["c"] = float(values[order[(kwargs["r0"], kwargs["k"])]])
-        out.append({**term, "kwargs": kwargs})
-    return out
-
-
-def set_shape_decays(terms: list[Term], values: list[float]) -> list[Term]:
-    """Copy of `terms` with each bond type's `b` set, in `bond_types` order.
-
-    Companion to `set_shape_parameters`, and always applied with it: `c` and `b`
-    are only meaningful together, since the constraint that keeps the
-    dissociation curve monotone is `c <= shape_bound(b)`.
-    """
-    order = {pair: index for index, pair in enumerate(bond_types(terms))}
-    out: list[Term] = []
-    for term in terms:
-        if term["type"] != "bond":
-            out.append(term)
-            continue
-        kwargs = dict(term["kwargs"])
-        kwargs["b"] = float(values[order[(kwargs["r0"], kwargs["k"])]])
         out.append({**term, "kwargs": kwargs})
     return out
 
@@ -1339,11 +1179,10 @@ def total_wavenumber(curvature: float, mass_a: float, mass_b: float) -> float:
     """Harmonic wavenumber (cm^-1) of a diatomic with this *total* curvature.
 
     `frequency` above answers the same question about a bonded force constant,
-    which used to be the same number and is not any more.  The repulsion adds
-    curvature at the bond length -- 68.5 eV/A**2 at O-H, on its own worth
-    4431 cm^-1 -- and `fit_bond_lengths` displaces `r0` far enough that the
-    shape term adds more again, so the bonded `k` understates the stiffness the
-    integrator actually sees by a factor of two to four.
+    which used to be the same number and need not be.  The nonbonded terms add
+    curvature at the bond length (68.5 eV/A**2 at O-H before the `ZBL` taper,
+    on its own worth 4431 cm^-1), and `fit_bond_lengths` can displace `r0` off
+    the bond, where the Morse's own curvature is no longer `k`.
 
     This is the number the timestep is set by: a stable velocity-Verlet run
     wants ~15 steps per period, so a step of `dt` femtoseconds needs every mode
@@ -1462,9 +1301,12 @@ def reaction_margins(
     return margins
 
 
-def bond_decays(terms: list[Term]) -> list[float]:
-    """Fitted shape decay `b` of each bond type, in `bond_types` order."""
-    decays: list[float] = []
+def bond_asymptotes(terms: list[Term]) -> list[float]:
+    """Asymptote height `h` of each bond type in eV, in `bond_types` order.
+
+    A bond without its own `h` reads as `bond_asymptote`, as `QForce` does.
+    """
+    heights: list[float] = []
     seen: list[tuple[float, float]] = []
     for term in terms:
         if term["type"] != "bond":
@@ -1473,8 +1315,13 @@ def bond_decays(terms: list[Term]) -> list[float]:
         if key in seen:
             continue
         seen.append(key)
-        decays.append(float(term["kwargs"].get("b", active().shape_decay)))
-    return decays
+        height = term["kwargs"].get("h")
+        heights.append(
+            active().bond_asymptote
+            if height is None
+            else float(height) * units.kJ / units.mol
+        )
+    return heights
 
 
 def fit_force_constants(
@@ -1484,20 +1331,19 @@ def fit_force_constants(
     margin: float = DEFAULT_MARGIN,
     frequency_weight: float = DEFAULT_FREQUENCY_WEIGHT,
     max_scale: float = DEFAULT_MAX_SCALE,
-    mode: str = "both",
-    max_shape: float = DEFAULT_MAX_SHAPE_FRACTION,
-    min_decay: float = DEFAULT_MIN_DECAY,
-    max_decay: float = DEFAULT_MAX_DECAY,
+    mode: str = "asymptote",
     geometry_weight: float = DEFAULT_GEOMETRY_WEIGHT,
     max_wavenumber: float = DEFAULT_MAX_WAVENUMBER,
     curvature_weight: float = DEFAULT_CURVATURE_WEIGHT,
+    max_asymptote: float = DEFAULT_MAX_ASYMPTOTE,
 ) -> ForceConstantFit:
-    """Refit every template's force constants so the couplings become fittable.
+    """Refit every template's bonds so the couplings become fittable.
 
-    Outer variables are `log(k-scale)`, one per `BondVariable`; the inner solve
-    is `fit_dissociation_energies`, which re-derives each template's `D` scale
-    so its atomization energy is reproduced exactly whatever `k` the outer solve
-    is trying.  The atomization condition is therefore a constraint the
+    Outer variables are, per `BondVariable`, the asymptote height `h` in eV
+    (`mode="asymptote"`, the default), `log(k-scale)` (`mode="k"`), or both
+    (`mode="asymptote-k"`).  The inner solve is `fit_template`, which re-derives
+    each template's `D` scale and bond lengths so its atomization energy and
+    geometry are reproduced exactly whatever the outer solve is trying.  The atomization condition is therefore a constraint the
     objective cannot trade away, not a term competing with the barriers.
 
     The objective is a hinge, not a least squares:
@@ -1513,11 +1359,8 @@ def fit_force_constants(
     on it.  The same shape is used for the wavenumber: a mode under the cap is
     free, and one over it pays.
 
-    The third term is the timestep, and it was missing for as long as this fit
-    existed.  Everything here was priced in `k`, whose bound is 1.41x in
-    wavenumbers, while the stiffness the integrator sees came mostly from
-    elsewhere -- the repulsion's own curvature and the shape term at a displaced
-    `r0` -- and reached 11735 cm^-1 with the `k`-scale reporting 1.41x.  See
+    The third term is the timestep: the stiffness the integrator sees is the
+    total curvature at the reference geometry, not the fitted `k`.  See
     `DEFAULT_MAX_WAVENUMBER` and `_bonded_curvature`.
 
     Args:
@@ -1531,9 +1374,14 @@ def fit_force_constants(
         margin: how far below the reference barrier a diabat must sit.
         frequency_weight: pull back towards the original force constants.
         max_scale: hard bound on each k-scale, in both directions.
+        mode: which bonded parameters the outer search moves.
         max_wavenumber: stretching modes above this cost the objective.
         curvature_weight: how much they cost.  Zero restores the old objective,
             which is the vacuity check for the cap.
+        max_asymptote: upper bound on each `h`, in eV; the lower bound is
+            `bond_asymptote`.  Setting it there freezes `h`, which is the
+            vacuity check for the asymptote -- plain Morse must make no
+            progress.
     """
     variables: list[BondVariable] = []
     for name, atoms, terms in templates:
@@ -1564,37 +1412,30 @@ def fit_force_constants(
         spans.append((start, stop))
         start = stop
 
-    if mode not in ("shape", "k", "both"):
-        raise ValueError(f"mode must be 'shape', 'k' or 'both', got {mode!r}")
+    modes = ("asymptote", "k", "asymptote-k")
+    if mode not in modes:
+        raise ValueError(f"mode must be one of {modes}, got {mode!r}")
 
     # The search vector is laid out in fixed-width blocks of one entry per bond
     # type, so a `spans` slice indexes into any block with the same offsets:
     #
-    #     shape   [ u | b ]
-    #     k       [ log k-scale ]
-    #     both    [ u | log k-scale | b ]
+    #     asymptote     [ h ]
+    #     k             [ log k-scale ]
+    #     asymptote-k   [ h | log k-scale ]
     #
-    # `u` is the *fraction* of the monotonicity bound used, not `c` itself; see
-    # `shape_bound` for why the bound cannot be a constant.
+    # `h` is the absolute asymptote height in eV, not a scale: its lower bound
+    # is `bond_asymptote`, which is also what a bond without one reads as.
     width = len(variables)
-    shaped = mode in ("shape", "both")
-    decay_at = width if mode == "shape" else 2 * width
+    lifted = mode in ("asymptote", "asymptote-k")
+    k_at = width if mode == "asymptote-k" else 0
+    base_asymptote = active().bond_asymptote
 
     def apply(terms: list[Term], x: np.ndarray, lo: int, hi: int) -> list[Term]:
-        if mode == "k":
-            return scale_force_constants(terms, list(np.exp(x[lo:hi])))
-        decays = [float(value) for value in x[decay_at + lo : decay_at + hi]]
-        if mode == "both":
-            terms = scale_force_constants(
-                terms, list(np.exp(x[width + lo : width + hi]))
-            )
-        return set_shape_parameters(
-            set_shape_decays(terms, decays),
-            [
-                float(fraction) * shape_bound(decay)
-                for fraction, decay in zip(x[lo:hi], decays)
-            ],
-        )
+        if mode != "asymptote":
+            terms = scale_force_constants(terms, list(np.exp(x[k_at + lo : k_at + hi])))
+        if lifted:
+            terms = set_asymptotes(terms, [float(value) for value in x[lo:hi]])
+        return terms
 
     # Both constant across the entire search: the elements do not change, and
     # the nonbonded curvature is a function of the fixed template geometry.
@@ -1619,33 +1460,22 @@ def fit_force_constants(
             for (_, atoms, terms), (lo, hi) in zip(templates, spans)
         ]
 
-    # Per-variable normalizer for the regularizer: the half-width of each
-    # variable's box, so `used` below is "fraction of the freedom taken".
-    #
-    # `u` needs none -- it is already a fraction, which is the second reason the
-    # search is parameterized that way.  The decay block is normalized on its own
-    # half-width and measured from `shape_decay`, so that every block's origin is
-    # the *unchanged* force field: `u = 0` is plain Morse, a zero log k-scale is
-    # q-force's own constant, and `b = shape_decay` is what a term file without a
-    # decay reads as.  Measuring the decay from zero instead would make the
-    # regularizer a preference for short-ranged corrections, and measuring it
-    # from the middle of the box would make it a preference for whatever the
-    # bounds happened to be.
+    # Per-variable normalizer for the regularizer: the width of each variable's
+    # box, so `used` below is "fraction of the freedom taken", and an origin at
+    # the *unchanged* force field -- `h = bond_asymptote` is plain Morse as every
+    # term file without an `h` reads, and a zero log k-scale is q-force's own
+    # constant.
     log_bound = max(float(np.log(max_scale)), 1e-12)
-    decay_scale = max(0.5 * (max_decay - min_decay), 1e-12)
+    height_scale = max(max_asymptote - base_asymptote, 1e-12)
     blocks = {
-        "shape": [np.full(width, 1.0), np.full(width, decay_scale)],
+        "asymptote": [np.full(width, height_scale)],
         "k": [np.full(width, log_bound)],
-        "both": [
-            np.full(width, 1.0),
-            np.full(width, log_bound),
-            np.full(width, decay_scale),
-        ],
+        "asymptote-k": [np.full(width, height_scale), np.full(width, log_bound)],
     }[mode]
     scale_of = np.concatenate(blocks)
     origin = np.zeros(scale_of.size)
-    if shaped:
-        origin[decay_at : decay_at + width] = active().shape_decay
+    if lifted:
+        origin[:width] = base_asymptote
 
     def score(x: np.ndarray) -> float:
         try:
@@ -1691,13 +1521,11 @@ def fit_force_constants(
             ]
         )
         # The regularizer is on the *fraction of the available box* each
-        # variable uses, not on its raw value.  `c` and `log(k-scale)` live on
-        # scales that differ by an order of magnitude, and `c`'s own bound moves
-        # with `shape_decay`, so penalizing raw magnitudes silently reweights
-        # the objective whenever any of those change -- which it did: raising
-        # the decay from 2 to 4 lifted the bound on `c` from 1.3 to 19.3 and
-        # multiplied this penalty by ~200, crushing the fit for reasons that had
-        # nothing to do with the physics.
+        # variable uses, not on its raw value.  `h` in eV and `log(k-scale)`
+        # live on scales that differ by an order of magnitude, so penalizing raw
+        # magnitudes would silently reweight the objective whenever either box
+        # changed.  (It did once: under the retired shape term, raising a decay
+        # bound multiplied this penalty by ~200 for no physical reason.)
         used = (x - origin) / scale_of
         return float(
             np.dot(shortfall, shortfall)
@@ -1706,32 +1534,17 @@ def fit_force_constants(
             + frequency_weight * np.dot(used, used)
         )
 
-    # Length of the search vector, from the block layout above: `both` carries
-    # `u`, a log k-scale and `b` per bond type; `shape` carries `u` and `b`; `k`
-    # carries the k-scale alone.
-    n_x = width * {"shape": 2, "k": 1, "both": 3}[mode]
-
-    # The baseline is taken with the geometry solve in best-effort mode.  At
-    # `c = 0` and `k`-scale 1 several bond types cannot cancel `ZBL` at any
-    # length -- see `fit_bond_lengths` -- so the strict solve has no answer
-    # there, and refusing to report a "before" column because the *starting*
-    # point is infeasible would be reporting nothing at all.
-    # `x = start` is the *unchanged* force field: `u = 0` is plain Morse and a
-    # zero log k-scale is q-force's own constant.  Zero is not the identity for
-    # the decay block -- `b = 0` is not a shape term with no effect, it is a
-    # correction that never decays -- so that block starts at `shape_decay`,
-    # which is what a term file without a `b` reads as.  Getting this wrong
-    # makes the "before" column a report on a force field nobody ever had.
-    start = np.zeros(n_x)
-    if shaped:
-        start[decay_at : decay_at + width] = active().shape_decay
+    # `x = start` is the *unchanged* force field, so the "before" column reports
+    # on the force field the templates arrived with.  The geometry solve is
+    # best-effort there, for the reason `DEFAULT_GEOMETRY_WEIGHT` gives.
+    start = origin.copy()
     install_templates(reaction_set, templates, refit(start))
     before = reaction_margins(reaction_set, reactions)
 
     frozen = {
-        "shape": max_shape <= 0.0,
+        "asymptote": max_asymptote <= base_asymptote,
         "k": max_scale <= 1.0,
-        "both": max_shape <= 0.0 and max_scale <= 1.0,
+        "asymptote-k": max_asymptote <= base_asymptote and max_scale <= 1.0,
     }[mode]
     if frozen or not variables:
         # No freedom at all.  Say so by returning the unrefitted point rather
@@ -1739,21 +1552,20 @@ def fit_force_constants(
         # the vacuity check takes.
         solution = start
     else:
-        # `u` is a fraction of the monotonicity bound, so its box is [0, 1]
-        # whatever `b` does; a k-scale is bounded symmetrically in the log, so
-        # that halving and doubling are the same distance from the starting
-        # point; `b` gets the range over which it still means something.
+        # A k-scale is bounded symmetrically in the log, so that halving and
+        # doubling are the same distance from the starting point.  `h` only
+        # goes up: below `bond_asymptote` the curve is deeper at every stretch.
         bound = float(np.log(max_scale))
+        heights = [(base_asymptote, max(max_asymptote, base_asymptote))] * width
         box = {
-            "shape": [(0.0, max_shape)] * width + [(min_decay, max_decay)] * width,
+            "asymptote": heights,
             "k": [(-bound, bound)] * width,
-            "both": [(0.0, max_shape)] * width
-            + [(-bound, bound)] * width
-            + [(min_decay, max_decay)] * width,
+            "asymptote-k": heights + [(-bound, bound)] * width,
         }[mode]
         # **The search converges on its own; there is nothing here to cap.**
         # Worth writing down because it was twice diagnosed wrongly.  Swept over
-        # `mode="shape"` from plain Morse, which is the slowest configuration:
+        # the retired shape term's `mode="shape"` from plain Morse, which was the
+        # slowest configuration (the asymptote fit converges in ~16 s):
         #
         #     budget         time    nfev   objective   channels
         #     maxfev=200     8.0s     200   135.18145   12 -> 14
@@ -1836,26 +1648,14 @@ def fit_force_constants(
     return ForceConstantFit(
         terms={name: terms for (name, _, _), terms in zip(templates, fitted)},
         variables=variables,
-        # `scales` is reported as the absolute `c` a reader can put back into
-        # the Morse, not as the fraction the search actually moved.
         scales=(
-            [float(value) for value in np.exp(solution)]
-            if mode == "k"
-            else [
-                float(fraction) * shape_bound(float(decay))
-                for fraction, decay in zip(
-                    solution[:width], solution[decay_at : decay_at + width]
-                )
-            ]
-        ),
-        decays=(
-            [float(value) for value in solution[decay_at : decay_at + width]]
-            if shaped
-            else [active().shape_decay] * width
+            [float(value) for value in solution[:width]]
+            if lifted
+            else [float(value) for value in np.exp(solution)]
         ),
         k_scales=(
-            [float(value) for value in np.exp(solution[width:])]
-            if mode == "both"
+            [float(value) for value in np.exp(solution[k_at : k_at + width])]
+            if mode != "asymptote"
             else [1.0] * width
         ),
         mode=mode,

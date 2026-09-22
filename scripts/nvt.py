@@ -59,7 +59,7 @@ DEFAULT_INTERVAL = 5  # steps between trajectory frames
 # `k`-scale the fit reports is *not* the frequency cost.  It is bounded at 1.41x
 # while the surface it produced carried an 11735 cm^-1 mode -- a 2.84 fs period,
 # so 0.19 fs -- because most of the stiffness came from the repulsion's own
-# curvature and from the shape term at a displaced `r0`, neither of which the
+# curvature and from the (since retired) shape term at a displaced `r0`, neither of which the
 # `k`-scale knows about.
 DEFAULT_TIMESTEP = 0.5  # fs
 

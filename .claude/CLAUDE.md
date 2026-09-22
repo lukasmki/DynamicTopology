@@ -68,6 +68,17 @@ diagonalized state also decides the topology carried into the next step.
    that module's docstring lays out — charges solved once from the unmasked kernel, a per-state
    scalar on the diagonal, and a single ground-state-weighted screen on the energy at the end.
    `ACKS2.prepare` therefore runs *before* the diagonalization and `ACKS2.compute` after it.
+7. **Or, with `global_params.electrostatics = "pointcharge"`, fixed charges instead of ACKS2**
+   (`forcefield/pointcharge.py`, dataset `datasets/Water-fixed-pc`). Each template carries a
+   `charge` term per atom summing to its formal charge, so the +1 of an H3O+ moves with the
+   proton — which ACKS2's single sum-zero constraint cannot do. The Coulomb energy is then
+   state-dependent and goes *on* the diagonal, and blocks couple through each other's
+   ground-state-averaged charges, so `System.calculate` sweeps the multi-state blocks until no
+   weight moves (`SCF_TOLERANCE`; one sweep when at most one block is multi-state). Both terms
+   sit behind one protocol — `prepare` / `bind` / `corrections` / `update` / `evaluate`, plus
+   `__call__` for one topology — chosen per call by `forcefield/electrostatics.py`, which the
+   fitter and `evb.py` use too. The admission gate in `basis.py` still screens on the bonded
+   gap only.
 
 **Electrostatics is the one nonbonded term that is not short ranged**, so under full periodicity it
 is summed over images rather than truncated at the nearest one. `forcefield/ewald.py` holds both
@@ -225,6 +236,10 @@ note above and `forcefield/README.md`.
   Madelung constant (which `MinimumImage` misses by 17%), independence from the Ewald splitting
   parameter, and the 1/L³ approach to the open-boundary kernel. Finite differences cannot see a
   lattice sum converging to the wrong number, which is what this file is for.
+- `test_pointcharge.py` — the point-charge path through `System`: the block sweep (forces are
+  off by 0.058 eV/Å on two interacting Zundels if it stops after one pass), a charged Ewald cell's
+  forces and virial, and the exclusion's periodic self-image. Runs Water-fixed-pc under
+  `params.use` so it cannot collide with the other datasets in the process.
 - `test_get_network.py` — fingerprint regression over `ReactionSet.get_network` (node/edge counts,
   reaction hashes, atom mappings) on a 250-molecule H2/O2 box.
 - `test_optimizations.py` — locks in the caching behavior of `Topology.hash`/`molecules` and

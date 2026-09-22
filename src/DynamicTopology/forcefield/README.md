@@ -24,6 +24,12 @@ are the same number on every state and are evaluated once, outside the
 Hamiltonian — which is what makes the exclusions the interesting term rather
 than a bookkeeping detail.
 
+**The exception is `electrostatics = "pointcharge"`** (`pointcharge.py`), which
+replaces ACKS2 with charges fixed per template.  Those differ between the states
+of a proton transfer, so `E_Coulomb` joins `E_bonded` as a function of the
+bonding pattern and sits on the diagonal — see "Electrostatics — fixed point
+charges" below.
+
 ## Units
 
 | where | length | energy | notes |
@@ -33,7 +39,7 @@ than a bookkeeping detail.
 | `coupling.py` | Å | eV | ASE units throughout; nothing to convert |
 | everything returned to ASE | Å | eV | forces eV/Å, stress eV/Å³ |
 
-Angles are radians.  `shape_decay`, `PHI_B` and the like are dimensionless;
+Angles are radians.  `PHI_B` and the like are dimensionless;
 `SCREENING_LENGTH` is Å, `ccoul` is eV·Å, `gamma` is 1/Å.  A coupling's `A` is
 eV and its `a` is 1/Å²; `r0`, `ra0`, `rb0` are Å and `t0` radians.  The global
 parameters and their units are tabulated at the bottom of this file.
@@ -48,19 +54,20 @@ has no method for.  Every type in play, and where it comes from:
 
 | type | evaluated by | kwargs | comes from |
 | --- | --- | --- | --- |
-| `bond` | `QForce` | `D, r0, k, c, b` | template `.jsonl` |
+| `bond` | `QForce` | `D, r0, k, h` | template `.jsonl` |
 | `angle` | `QForce` | `theta0, k` | template `.jsonl` |
 | `bondbond`, `bondangle`, `angleangle` | `QForce` | see cross terms | template `.jsonl` |
 | `periodicdihedral`, `dihedralbond`, `dihedralangle`, `dihedralangleangle` | `QForce` | see dihedrals | template `.jsonl` |
 | `reference` | `QForce` | `E0` | set by `ReactionSet.load` |
 | `atom` | `ACKS2` | `mu, eta, soft_amp, soft_decay` | template `.jsonl` |
+| `charge` | `PointCharge` | `q`, in e | template `.jsonl` |
 | `lennardjones` | `LennardJones` | `sigma, eps` | template `.jsonl` |
 | `exclusion` | `QForce` | `sigma, eps`, already combined | derived at load |
 | `zblexclusion` | `QForce` | `z1, z2` | derived at load |
-| `coulombexclusion` | `ACKS2` | none — the pair is the whole term | derived at load |
+| `coulombexclusion` | `ACKS2` or `PointCharge` | none — the pair is the whole term | derived at load |
 | `twobody`, `threebody`, `rmsd` | `EVBCoupling` | see coupling | reaction `.jsonl` |
 
-`atom` and `lennardjones` carry no energy of their own; they are how a template
+`atom`, `charge` and `lennardjones` carry no energy of their own; they are how a template
 hands its per-atom nonbonded parameters to a whole-system sum.  `ZBL` takes no
 terms at all — it reads atomic numbers straight off the `Atoms`, so the only
 thing it can be a function of is the geometry and the elements.
@@ -85,25 +92,33 @@ dc  = cos θ - cos θ0               cosines, never as angles
 cosφ_n = 1 + cos(n φ - φ0)
 ```
 
-### bond — Morse with a one-sided shape term (default)
+### bond — Morse with a per-bond asymptote (default)
 
 ```
-a  = sqrt( k / 2 Dw )              Dw = D + bond_asymptote   if dr > 0
-                                   Dw = D                    if dr <= 0
-s  = a * max(dr, 0)
+a  = sqrt( k / 2 Dw )              Dw = D + h   if dr > 0
+                                   Dw = D       if dr <= 0
 
-E  = Dw [ 1 - exp(-a dr) ]^2  -  D  +  Dw * c * s^3 * exp(-b s)
+E  = Dw [ 1 - exp(-a dr) ]^2  -  D
 ```
 
-Parameters `D, r0, k, c, b`.  The `-D` offset puts the minimum at `-D`; the
-dissociated limit is `bond_asymptote = 1.0 eV` above zero, so the well the
-exponential climbs is `D + bond_asymptote` deep while the minimum stays at `-D`.
-The join at `dr = 0` is C2 (the curvature there is `2 Dw a^2 = k` whatever `Dw`
-is), so no fitted frequency sees the branch.  The shape term is
-`O(s^3)`, so `D`, `r0` and the curvature at `dr = 0` are untouched by `c`; it is
-clamped off on the compressed branch.  `b` defaults to `shape_decay` for term
-files that predate it, and is subject to `c <= c_max(b)` from
-`fit.dissociation.shape_bound`.
+Parameters `D, r0, k, h`, with `h` optional (kJ/mol, like `D`) and defaulting to
+`bond_asymptote`.  The `-D` offset puts the minimum at `-D`; the dissociated
+limit is `h` above zero, so the well the exponential climbs is `D + h` deep while
+the minimum stays at `-D`.  The join at `dr = 0` is C2 (the curvature there is
+`2 Dw a^2 = k` whatever `Dw` is), so no fitted frequency sees the branch or `h`.
+At fixed `k`, raising `h` lifts every stretched geometry monotonically towards
+the harmonic `k dr^2 / 2`, and the curve stays a Morse, so it cannot turn over.
+`fit.dissociation.fit_force_constants` fits `h` per bond type, bounded below by
+`bond_asymptote`; HCombustion's fitted values run from 1.0 (the floor) to 6.6 eV
+(O2).
+
+This replaced a one-sided Hulburt-Hirschfelder shape term
+`Dw c s^3 exp(-b s)`, `s = a max(dr, 0)`, which lifted the mid-range with two
+parameters per bond under a monotonicity bound `c <= c_max(b)`.  From the same
+q-force start both reach 19/19 HCombustion channels at q-force's frequencies;
+`h` does it with one parameter and no bound, in 16 s against about 650.  The two
+lift different parts of the curve, the shape term mid-range and `h` out towards
+dissociation.
 
 ### bond — harmonic (`bond_form="harmonic"`, non-reactive use)
 
@@ -287,6 +302,46 @@ so `dA/dr` must be contracted against an unmasked weight.
 
 ---
 
+## Electrostatics — fixed point charges (`pointcharge.py`)
+
+Selected by `electrostatics = "pointcharge"` in the manifest, in place of ACKS2.
+Every template carries a `charge` term per atom, summing to its formal charge,
+so an H3O+ carries +1 and the water it hops to carries 0: the charge moves with
+the proton, which ACKS2's single sum-zero constraint cannot express.  Same
+kernel `K` as ACKS2, so the same Ewald sum under full periodicity.
+
+Each state `s` of a block `B` gets, on its diagonal,
+
+```
+H_ss += E_intra(q_s) + q_s . V_B
+E_intra(q_s) = (ccoul/2) q_s . K_BB . q_s  -  ccoul sum_{(i,j) in excl(s)} q_si q_sj g(r_ij)
+V_B          = ccoul K_{B, not B} . qbar,      qbar_B' = sum_t w_t q_t   (other blocks)
+```
+
+with `g(r) = erf(gamma r)/r` at the minimum image.  The blocks see each other only
+through their averaged charges, so `System.calculate` diagonalizes each
+multi-state block in turn and repeats until no weight moves (`SCF_TOLERANCE`);
+with one multi-state block that is one pass.  The total is
+
+```
+E = sum_B lambda_B - E_inter          E_inter = (ccoul/2) sum_{i,j in different blocks} qbar_i qbar_j K_ij
+```
+
+and at fixed weights the whole Coulomb term is one contraction,
+`W_ij = (ccoul/2) sum_s w_s q_si q_sj` within a block and
+`(ccoul/2) qbar_i qbar_j` between blocks, less the excluded pairs.  Stationary in
+every eigenvector at convergence, so Hellmann-Feynman forces and virial are
+exact.  No solve, no response term.
+
+**The exclusion removes only the direct pair `g(r_ij)`, not `K_ij`.**  Under Ewald
+`K_ij` also contains `i`'s interaction with every image of `j`; removing that as
+well leaves `(ccoul/2) K_self sum_i q_i^2` per molecule — −0.91 eV per water in a
+12.43 Å box, falling only as 1/L, so it acts on the pressure.  With the direct
+pair alone the residue is the molecule's dipole–image energy, −1.9 meV.  ACKS2's
+screen removes the whole `K_ij`; see the note in `pointcharge.py`.
+
+---
+
 ## Exclusions (`exclusions.py`)
 
 The three nonbonded terms above are summed over every pair with no reference to
@@ -298,6 +353,7 @@ removed, so that a molecule's geometry is set by its bonded terms:
 | 12-6 | `exclusion` term, `E = -u_126(r, σ_ij, ε_ij)` | `QForce.compute_exclusion` |
 | ZBL | `zblexclusion` term, `E = -u_ZBL(r, Z1, Z2)` | `QForce.compute_zblexclusion` |
 | Coulomb | `coulombexclusion` term, in two places (below) | `ACKS2`, `System.calculate` |
+| Coulomb, point charges | `coulombexclusion` term, per state inside `E_intra` | `PointCharge` |
 
 The first two are ordinary additive pair corrections, evaluated per diabatic
 state alongside the bonded terms, and they go through the *same* `pair_potential`
@@ -524,7 +580,6 @@ are what a manifest that omits a key gets.
 | parameter | default | unit | read by | changing it invalidates |
 | --- | --- | --- | --- | --- |
 | `bond_asymptote` | 1.0 | eV | `qforce`, `fit` | every `.jsonl` in the dataset |
-| `shape_decay` | 4.0 | — | `qforce`, `fit` | — (fallback `b` only) |
 | `taper_radius` | 1.5 | Å | `zbl` | every `.jsonl` in the dataset |
 | `taper_width` | 0.12 | Å | `zbl`, and `switch_width` by default | every `.jsonl` in the dataset |
 | `switch_radius` | 0.22 | nm | `lj` | every `.jsonl` in the dataset |
@@ -533,8 +588,9 @@ are what a manifest that omits a key gets.
 | `exclusion_depth` | 3 | bonds | `exclusions` | every `.jsonl` in the dataset |
 | `exclude_coulomb` | `true` | — | `exclusions` | every `.jsonl` in the dataset |
 | `gamma` | 2.0 | 1/Å | `ewald` | every `.jsonl` in the dataset |
+| `electrostatics` | `"acks2"` | — | `system`, `evb`, `fit` | every `.jsonl` in the dataset |
 | `accuracy` | 1e-8 | — | `ewald` | — (periodic only; templates are non-periodic) |
-| `ccoul` | 14.4 | eV·Å | `acks2` | every `.jsonl` in the dataset |
+| `ccoul` | 14.4 | eV·Å | `acks2`, `pointcharge` | every `.jsonl` in the dataset |
 | `zbl_ccoul` | 14.399645 | eV·Å | `zbl` | every `.jsonl` in the dataset |
 
 `switch_width` is the same physical width as `taper_width` stated in the other
@@ -561,7 +617,8 @@ margins, refit at each candidate value:
 | 1.50 | 16 | +0.333 | +1.068 | +0.938 |
 | 2.00 | 16 | +0.567 | +1.371 | +1.190 |
 
-1.0 is the first value at which `rxn_16` — a genuine saddle, the one channel
+It is also the floor and default for each bond's fitted `h`.  1.0 is the first
+value at which `rxn_16` — a genuine saddle, the one channel
 that was ever a fitting failure rather than a barrierless one — comes out
 fittable; past 1.5 nothing further is fittable. It also sets where a bonded
 diabat crosses its own fragments':
@@ -573,25 +630,6 @@ diabat crosses its own fragments':
 
 Both rows are inside `ReactionSet.get_network`'s 4.0 Å bimolecular cutoff, so
 the reverse channel is enumerated where the forward one hands over.
-
-**`shape_decay` (4.0, fallback only — `b` is fitted per bond type).**
-Refitting the whole pipeline from the q-force baseline at each fixed `b`:
-
-| b | c_max | metathesis | dissociation rms | fastest mode | dt |
-| --- | --- | --- | --- | --- | --- |
-| 2.0 | 1.31 | 12/13 | 0.700 eV | 4517 cm⁻¹ | 0.492 fs |
-| 2.5 | 3.84 | 13/13 | 0.783 | 4402 | 0.505 |
-| 3.0 | 7.80 | 13/13 | 1.098 | 4352 | 0.511 |
-| 4.0 | 19.33 | 13/13 | 1.710 | 4400 | 0.505 |
-| 5.0 | 34.50 | 13/13 | 2.660 | 4402 | 0.505 |
-| 6.0 | 52.20 | 12/13 | 3.181 | 4432 | 0.502 |
-
-The timestep is flat across the whole range — the curvature cap absorbs
-whatever `b` does — so `b` costs nothing and 4.0 was simply the worst
-reachable value for the dissociation curves; hence `fit.dissociation` fits it
-instead of fixing it. `c_max(b)` is the monotonicity limit
-(`fit.dissociation.shape_bound`), and it is why low `b` isn't free either: at
-2.0 it is 1.31 and binds on five of eight bonds.
 
 **`taper_radius` (1.5 Å), bounded from both sides.** From below, the wall has
 to stay ahead of the ACKS2 contact funnel at every separation: at 1.2 Å the
@@ -648,7 +686,7 @@ truncation error itself. At 1e-8 it lands around 1e-6 eV, comfortably under
 
 ### Why they live in the manifest
 
-Everything in the table but `accuracy` and `shape_decay` sits inside
+Everything in the table but `accuracy` sits inside
 `E_bonded + E_nonbonded`, which `fit/dissociation.py` solves each template's
 depth scale against.  As module constants they were a property of the installed
 **source tree**: a checkout whose `zbl.TAPER_RADIUS` had moved evaluated every
@@ -673,8 +711,7 @@ Both datasets in this repository pin the eight parameters that enter the fitted
 surface — `bond_asymptote`, `taper_radius`, `taper_width`, `switch_radius`,
 `core_fraction`, `exclusion_depth`, `exclude_coulomb`, `gamma` — so a future
 change to one of *those* defaults cannot silently invalidate the `.jsonl` files
-already on disk.  `switch_width` follows from the pinned `taper_width` and
-`shape_decay` is a fallback only, which leaves `ccoul` and `zbl_ccoul` as the
+already on disk.  `switch_width` follows from the pinned `taper_width`, which leaves `ccoul` and `zbl_ccoul` as the
 two that are still taken from the defaults and would move a fitted surface if
 they changed.  Changing a pinned value still requires re-running `scripts/fit.py
 --force-constants` for that dataset.

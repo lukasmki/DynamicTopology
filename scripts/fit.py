@@ -12,30 +12,23 @@ stored in its `rxn_*.xyz` (reactant / transition state / product):
              off at the reactant and product minima.  Geometry only.
 
 Inverting the secular equation only has a real root where the reference barrier
-lies below both diabats, which with plain two-parameter Morse it mostly does not:
-the form is too deep at stretched geometries, and only 1 of the 19 HCombustion
-channels is fittable as q-force hands them over.  --force-constants refits the
+lies below both diabats, which with plain two-parameter Morse it does not always:
+the form is too deep at stretched geometries.  --force-constants refits the
 bonds first so that they are; see `fit.dissociation`.
 
-Three routes, and they are not equivalent:
+Three routes:
 
-  --fit-mode shape  fits the Morse shape parameters `c` and `b`, leaving every
-                    force constant where q-force put it.  13 of 19 channels.
-  --fit-mode k      buys the same depth by stiffening the bonds instead.  Tops
-                    out at 17 of 19 and needs H2 at 12402 cm^-1 against an
-                    experimental 4401 to get there; the count saturates, so a
-                    cap of 100 buys what a cap of 16 does.
-  --fit-mode both   the default.  Spends the free parameter first and the
-                    minimum frequency for the rest: 18 of 19 at 1.41x.
+  --fit-mode asymptote    the default.  Fits each bond type's asymptote height
+                          `h`, leaving every force constant where q-force put
+                          it.  19 of 19 HCombustion channels, fastest mode
+                          unchanged at 3748 cm^-1, in ~16 s.
+  --fit-mode k            buys the depth by stiffening the bonds instead.
+  --fit-mode asymptote-k  both; spends up to 1.19x in `k` for margins the hinge
+                          does not value.
 
-**`--fit-mode shape` is not free, and this file said it was.**  `c` costs no
-frequency *at `r0`*, which was the same thing as "at the minimum" only while the
-bonded terms were the whole potential.  `fit_bond_lengths` ended that: `r0` is
-now pulled 0.04-0.22 A inside the reference bond length so the Morse can lean
-against the repulsion, and at that displacement the shape term is the largest
-single contribution to the stiffness -- 63 eV/A**2 of H2's 115, 509 of O2's 793,
-323 of HO's 480.  The surface it produced had an 11735 cm^-1 mode on it while
-the `k`-scale reported 1.41x.
+Channels routed to `fit_twobody` (fissions) take their amplitude from the
+diabatic crossing, not from the margin, so a fission reported infeasible below
+still gets a coupling; what the bond fit moves for them is where the crossing is.
 
 `w total` in the table below is the honest number and `--max-wavenumber` is what
 prices it; see `fit.dissociation.DEFAULT_MAX_WAVENUMBER`.  The frequency table
@@ -47,7 +40,6 @@ from pathlib import Path
 import json
 import sys
 
-import numpy as np
 from ase import Atoms, io
 
 from DynamicTopology.core import ReactionSet
@@ -55,10 +47,8 @@ from DynamicTopology.fit.dissociation import (
     DEFAULT_CURVATURE_WEIGHT,
     DEFAULT_FREQUENCY_WEIGHT,
     DEFAULT_MARGIN,
+    DEFAULT_MAX_ASYMPTOTE,
     DEFAULT_MAX_SCALE,
-    DEFAULT_MAX_DECAY,
-    DEFAULT_MAX_SHAPE_FRACTION,
-    DEFAULT_MIN_DECAY,
     DEFAULT_MAX_WAVENUMBER,
     DissociationFitError,
     bonded_energy,
@@ -67,7 +57,6 @@ from DynamicTopology.fit.dissociation import (
     fit_force_constants,
     frequency,
     install_templates,
-    shape_bound,
     scale_factor,
     total_wavenumber,
 )
@@ -79,7 +68,7 @@ from DynamicTopology.fit.coupling import (
     fit_threebody,
     fit_twobody,
 )
-from DynamicTopology.forcefield.params import ForceFieldParams, active
+from DynamicTopology.forcefield.params import ForceFieldParams
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.exclusions import with_exclusions
 from DynamicTopology.io.json import read_jsonl, write_jsonl
@@ -258,57 +247,28 @@ def report_force_constants(fit, max_wavenumber: float = 0.0) -> None:
     integrated, and a fit that leaves one there has not bought a larger step
     however good its margins look.
     """
-    if fit.mode in ("shape", "both"):
+    if fit.mode in ("asymptote", "asymptote-k"):
         print(
-            f"{'bond':<22}{'b':>6}{'c':>8}{'c/c_max':>9}{'peak (eV)':>11}{'k scale':>9}"
+            f"{'bond':<22}{'h (eV)':>8}{'k scale':>9}"
             f"{'w before':>10}{'w total':>9}{'ratio':>7}  over cap"
         )
         k_scales = fit.k_scales or [1.0] * len(fit.variables)
-        curvatures = fit.curvatures or [None] * len(fit.variables)
-        decays = fit.decays or [active().shape_decay] * len(fit.variables)
-        for variable, shape, decay, k_scale, curvature in zip(
-            fit.variables, fit.scales, decays, k_scales, curvatures
+        for variable, height, k_scale, curvature in zip(
+            fit.variables, fit.scales, k_scales, fit.curvatures
         ):
             masses = [MASSES.get(element, 1.0) for element in variable.elements]
             label = f"{variable.template} {'-'.join(variable.elements)}"
-            # `D * c * s**3 * exp(-b s)` is maximal at `s = 3/b`, where it is
-            # `(3/b)**3 * exp(-3) * c * D`.  `D` is re-solved by the inner fit,
-            # so quote the bump against the depth the fitted terms ended up with
-            # rather than the input one.
-            depth = fit.depths.get((variable.template, variable.r0, variable.k), 0.0)
-            peak = (3.0 / decay) ** 3 * np.exp(-3.0) * shape * depth
-            bound = shape_bound(decay)
             before_w = frequency(variable.k, *masses)
-            after_w = (
-                total_wavenumber(curvature, *masses)
-                if curvature is not None
-                else frequency(variable.k * k_scale, *masses)
-            )
+            after_w = total_wavenumber(curvature, *masses)
             over = (
                 f"  +{after_w - max_wavenumber:.0f}"
                 if max_wavenumber > 0.0 and after_w > max_wavenumber
                 else ""
             )
             print(
-                f"{label:<22}{decay:>6.2f}{shape:>8.3f}"
-                f"{(shape / bound if bound > 0 else 0.0):>9.3f}{peak:>11.3f}"
-                f"{k_scale:>9.3f}{before_w:>10.0f}{after_w:>9.0f}"
-                f"{after_w / before_w:>7.2f}{over}"
+                f"{label:<22}{height:>8.3f}{k_scale:>9.3f}{before_w:>10.0f}"
+                f"{after_w:>9.0f}{after_w / before_w:>7.2f}{over}"
             )
-        # Measured on the total curvature, not on the k-scale.  The k-scale is
-        # what the fit *chose*; the ratio below is what the molecule ends up
-        # with, and with an untapered short-range repulsion in the force field
-        # the two are not the same number.
-        worst = max(
-            (
-                total_wavenumber(curvature, *[MASSES.get(e, 1.0) for e in v.elements])
-                / frequency(v.k, *[MASSES.get(e, 1.0) for e in v.elements])
-                for v, curvature in zip(fit.variables, curvatures)
-                if curvature is not None
-            ),
-            default=max((max(v, 1.0 / v) for v in k_scales), default=1.0) ** 0.5,
-        )
-        print(f"\nworst frequency drift {worst:.2f}x")
         _report_timestep(fit, max_wavenumber)
         _report_margins(fit)
         return
@@ -431,37 +391,19 @@ def main() -> int:
     )
     parser.add_argument(
         "--fit-mode",
-        choices=["shape", "k", "both"],
-        default="both",
-        help="`shape` fits the Hulburt-Hirschfelder pair `c` and `b` per bond "
-        "type, leaving every force constant as q-force fitted it -- though not "
-        "every frequency, since `c` is only free of curvature *at* `r0` and "
-        "`fit_bond_lengths` moves `r0` off the bond. `k` is the older route "
-        "that buys the same depth by stiffening the bonds instead; it tops out "
-        "at 17 of 19 channels and needs H2 at 12402 cm^-1 to get there.",
+        choices=["asymptote", "k", "asymptote-k"],
+        default="asymptote",
+        help="`asymptote` fits a per-bond asymptote height `h`, leaving every "
+        "force constant as q-force fitted it. `k` buys the depth by stiffening "
+        "the bonds instead; `asymptote-k` fits both.",
     )
     parser.add_argument(
-        "--max-shape",
+        "--max-asymptote",
         type=float,
-        default=DEFAULT_MAX_SHAPE_FRACTION,
-        help="upper bound on `c` as a fraction of the monotonicity limit "
-        "`shape_bound(b)`, which moves with the fitted decay. 1.0 is that limit; "
-        "0 freezes the shape term, which is the vacuity check: plain Morse must "
-        "make no progress.",
-    )
-    parser.add_argument(
-        "--min-decay",
-        type=float,
-        default=DEFAULT_MIN_DECAY,
-        help="lower bound on the fitted shape decay `b`",
-    )
-    parser.add_argument(
-        "--max-decay",
-        type=float,
-        default=DEFAULT_MAX_DECAY,
-        help="upper bound on the fitted shape decay `b`. Setting both bounds to "
-        "the same value pins it, which is how the b sweep in "
-        "`params.ForceFieldParams.shape_decay` was measured.",
+        default=DEFAULT_MAX_ASYMPTOTE,
+        help="upper bound (eV) on the per-bond asymptote height in the "
+        "`asymptote` modes; the lower bound is `bond_asymptote`. Setting it "
+        "there freezes `h`, which is the vacuity check: plain Morse.",
     )
     parser.add_argument(
         "--max-k-scale",
@@ -530,11 +472,9 @@ def main() -> int:
             frequency_weight=args.frequency_weight,
             max_scale=args.max_k_scale,
             mode=args.fit_mode,
-            max_shape=args.max_shape,
-            min_decay=args.min_decay,
-            max_decay=args.max_decay,
             max_wavenumber=args.max_wavenumber,
             curvature_weight=args.curvature_weight,
+            max_asymptote=args.max_asymptote,
         )
         report_force_constants(fit, args.max_wavenumber)
         if not args.dry_run:

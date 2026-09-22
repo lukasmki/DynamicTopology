@@ -37,6 +37,7 @@ import pytest
 
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.acks2 import ACKS2
+from DynamicTopology.forcefield.pointcharge import PointCharge
 from DynamicTopology.forcefield.zbl import ZBL
 from DynamicTopology.forcefield.lj import LennardJones
 
@@ -49,6 +50,8 @@ from test_gradients import (
     POS_4,
     POS_H2O2,
     POS_CONTACT,
+    POS_PC,
+    _pointcharge_term_dict,
 )
 from geometry import REACTION, REACTION_PATH_RAMP, reaction_path
 
@@ -114,6 +117,33 @@ def assert_symmetric(w, atol=1e-8):
         atol=atol,
         err_msg="virial is not symmetric -- check for a transposed contraction",
     )
+
+
+# ---------------------------------------------------------------------------
+# Point charges
+# ---------------------------------------------------------------------------
+
+
+class TestPointChargeStress:
+    """`PointCharge`'s virial against the cell.
+
+    Periodic is the case with something to catch: the reciprocal half's strain
+    derivative, and the background, which reaches the virial through the volume
+    alone and does not cancel here because the system is charged.
+    """
+
+    @pytest.mark.parametrize("periodic", [False, True], ids=["open", "ewald"])
+    def test_virial(self, periodic):
+        pbc = PBC if periodic else np.zeros(3, dtype=bool)
+        term_dict = _pointcharge_term_dict()
+
+        def energy_fn(p, c):
+            return PointCharge()(p, pbc, c, term_dict)[0]
+
+        _, _, w = PointCharge()(POS_PC, pbc, CELL, term_dict)
+        w_fd = finite_difference_virial(energy_fn, POS_PC, CELL)
+        assert_symmetric(w, atol=1e-8)
+        np.testing.assert_allclose(w, w_fd, atol=1e-6, rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -404,17 +434,11 @@ class TestQForceStress:
         td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0])
         self._check(POS_2, td)
 
-    @pytest.mark.parametrize("c", [1.0, 4.0, -1.5])
-    def test_bond_morse_shape(self, c):
-        """The shape term, walked along the stretched branch and back.
-
-        `POS_2` sits near `r0`, where the Hulburt-Hirschfelder correction and
-        its first two derivatives all vanish -- the same blind spot the force
-        test documents.  A virial checked only there would pass with the shape
-        term's contribution dropped entirely.
-        """
-        td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0], c=[c])
-        al = np.sqrt(251200.0 / (2 * 436.0))
+    @pytest.mark.parametrize("h", [96.5, 482.4, 1929.7])
+    def test_bond_morse_asymptote(self, h):
+        """The per-bond asymptote `h`, walked through the join and outwards."""
+        td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0], h=[h])
+        al = np.sqrt(251200.0 / (2 * (436.0 + h)))
         for offset in (-1.0, 0.0, 0.5, 1.5, 3.0):
             pos = np.array([[0.0, 0.0, 0.0], [0.07772 + offset / al, 0.0, 0.0]])
             self._check(pos, td)

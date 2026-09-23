@@ -5,20 +5,19 @@ import pytest
 from ase import units
 
 from DynamicTopology.io.json import read_jsonl, read_jsonls, write_jsonls
-from DynamicTopology.io.units import from_disk, to_disk
+from DynamicTopology.io.units import from_openmm, term_from_openmm, to_openmm
 
 
 def test_read_params_jsonl():
     """The legacy q-force exports in `tests/data` parse.
 
-    Read raw: they predate the term format (`D0`, not `D`) and so have no unit
-    convention for `io.units` to apply.
+    They predate the term format (`D0`, not `D`), and are read as they stand.
     """
     ff_path = Path("tests/data").resolve()
     for file in ff_path.iterdir():
         if file.suffix != ".jsonl":
             continue
-        read_jsonl(file.resolve(), convert=False)
+        read_jsonl(file.resolve())
 
 
 def test_write_params_jsonl():
@@ -29,33 +28,19 @@ def test_write_params_jsonl():
             "kwargs": {"r0": 1.0, "k": 10.0, "D": 100.0},
         }
     ]
-    datastr = write_jsonls(terms, convert=False)
+    datastr = write_jsonls(terms)
     expect = '{"type": "bond", "atoms": {"p1": 0, "p2": 1}, "kwargs": {"r0": 1.0, "k": 10.0, "D": 100.0}}'
     assert datastr == expect
 
 
-def test_writing_converts_to_nm_and_kj_per_mol():
-    """In memory Angstrom and eV, on disk nm and kJ/mol -- and back."""
-    kjmol = units.kJ / units.mol  # eV
+def test_rows_are_stored_as_held():
+    """eV and Angstrom in memory and on disk: nothing converts either way."""
     terms = [
         {
             "type": "bond",
             "atoms": {"p1": 0, "p2": 1},
-            "kwargs": {"r0": 1.0, "k": 10.0, "D": 4.0, "h": 1.0},
-        }
-    ]
-    row = json.loads(write_jsonls(terms))["kwargs"]
-    assert row["r0"] == pytest.approx(0.1)
-    assert row["k"] == pytest.approx(10.0 / kjmol * 100.0)
-    assert row["D"] == pytest.approx(4.0 / kjmol)
-    assert row["h"] == pytest.approx(1.0 / kjmol)
-    back = read_jsonls(write_jsonls(terms))[0]["kwargs"]
-    assert back == pytest.approx(terms[0]["kwargs"], rel=1e-14)
-
-
-def test_unconverted_parameters_are_written_verbatim():
-    """ACKS2, charges and couplings are stored in the units they are used in."""
-    terms = [
+            "kwargs": {"r0": 0.9593275127677754, "k": 46.6, "D": 4.98, "h": 1.0},
+        },
         {
             "type": "threebody",
             "atoms": {"p1": 0, "p2": 1, "p3": 2},
@@ -69,37 +54,60 @@ def test_unconverted_parameters_are_written_verbatim():
         },
         {"type": "charge", "atoms": {"p0": 0}, "kwargs": {"q": -0.834}},
     ]
+    assert json.loads(write_jsonls(terms).split("\n")[0]) == terms[0]
     assert read_jsonls(write_jsonls(terms)) == terms
 
 
-def test_every_dataset_file_rewrites_stably():
-    """A file read and written back changes no value that had 15 digits or fewer.
-
-    `x / f * f` is not always `x`, so converted values are written to 15
-    significant digits (`io.units.WRITE_DIGITS`).  Anything already stored at
-    that precision -- every q-force parameter -- comes back byte-identical, and
-    a second rewrite of anything is.  Without it a refit changed the last digit
-    of parameters it never touched.
-    """
+def test_every_dataset_file_rewrites_byte_identical():
+    """A file read and written back is the file.  With no conversion there is no
+    `x / f * f` to round, so a refit cannot touch a parameter it did not fit."""
     files = sorted(Path("datasets").glob("**/*.jsonl"))
     assert files
     for path in files:
-        disk = [
-            json.loads(line) for line in path.read_text().splitlines() if line.strip()
-        ]
-        once = write_jsonls(read_jsonl(path))
-        assert write_jsonls(read_jsonls(once)) == once, path
-        for before, after in zip(disk, (json.loads(line) for line in once.split("\n"))):
-            for name, value in before["kwargs"].items():
-                if len(repr(value).lstrip("-").replace(".", "").lstrip("0")) <= 15:
-                    assert after["kwargs"][name] == value, (path, name)
-                else:
-                    assert after["kwargs"][name] == pytest.approx(value, rel=1e-14)
+        text = path.read_text()
+        assert write_jsonls(read_jsonl(path)) == text.rstrip("\n"), path
+
+
+def test_every_dataset_bond_is_in_angstrom():
+    """No bond in the shipped datasets is left in nm."""
+    for path in sorted(Path("datasets").glob("**/*.jsonl")):
+        for term in read_jsonl(path):
+            if term["type"] == "bond":
+                assert 0.5 < term["kwargs"]["r0"] < 3.0, path
+
+
+def test_a_legacy_nm_file_is_refused(tmp_path):
+    """A row from before the move to eV/Angstrom would read ten times too short."""
+    row = {
+        "type": "bond",
+        "atoms": {"p1": 0, "p2": 1},
+        "kwargs": {"r0": 0.09593, "k": 449613.167, "D": 481.0},
+    }
+    path = tmp_path / "legacy.jsonl"
+    path.write_text(json.dumps(row))
+    with pytest.raises(ValueError, match="legacy.jsonl.*in nm.*term_from_openmm"):
+        read_jsonl(path)
+    converted = term_from_openmm(row)
+    assert read_jsonls(json.dumps(converted)) == [converted]
+
+
+def test_the_openmm_table_converts_to_nm_and_kj_per_mol():
+    """The q-force/OpenMM boundary: Angstrom and eV one side, nm and kJ/mol the other."""
+    kjmol = units.kJ / units.mol  # eV
+    assert to_openmm("bond", "r0", 1.0) == pytest.approx(0.1)
+    assert to_openmm("bond", "k", 10.0) == pytest.approx(10.0 / kjmol * 100.0)
+    assert to_openmm("bond", "D", 4.0) == pytest.approx(4.0 / kjmol)
+    assert from_openmm("bond", "r0", 0.11433) == pytest.approx(1.1433)
+    # q-force's 12-6 A/B, which only an XML import carries.
+    assert from_openmm("lennardjones", "B", 1.0) == pytest.approx(1e6 * kjmol)
+    # ACKS2, charges and couplings are the same number on both sides.
+    assert to_openmm("threebody", "A", -2.04) == -2.04
+    assert to_openmm("charge", "q", -0.834) == -0.834
 
 
 def test_an_unknown_parameter_is_refused():
-    """A unit nobody recorded is not read in whichever unit it happened to be in."""
+    """A unit nobody recorded is not converted by whichever factor happens to fit."""
     with pytest.raises(KeyError, match="bond.D0"):
-        from_disk("bond", "D0", 1.0)
+        from_openmm("bond", "D0", 1.0)
     with pytest.raises(KeyError, match="mystery"):
-        to_disk("mystery", "x", 1.0)
+        to_openmm("mystery", "x", 1.0)

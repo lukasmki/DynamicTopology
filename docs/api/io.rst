@@ -9,7 +9,7 @@ JSONL term files
 
 .. automodule:: DynamicTopology.io.json
 
-Unit conversion
----------------
+q-force and OpenMM units
+------------------------
 
 .. automodule:: DynamicTopology.io.units

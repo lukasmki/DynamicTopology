@@ -16,7 +16,7 @@ from DynamicTopology.forcefield.pointcharge import PointCharge
 from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.lj import LennardJones
 from DynamicTopology.forcefield.zbl import ZBL
-from DynamicTopology.io.units import from_disk
+from DynamicTopology.io.units import from_openmm
 from DynamicTopology.forcefield import zbl as zbl_module
 
 from geometry import REACTION, REACTION_PATH_RAMP, reaction_path
@@ -45,17 +45,16 @@ def finite_difference_forces(energy_fn, pos, delta=DELTA):
 def make_term(term_type, atoms_rows, **kwargs):
     """Build a term_dict in the format expected by QForce/ACKS2 __call__.
 
-    `kwargs` are stated as a `.jsonl` row states them -- nm and kJ/mol, the
-    units q-force emits -- and converted through `io.units.from_disk`, the same
-    path a dataset's parameters take on load.  So the literals below are
-    recognisable q-force numbers, and the conversion is exercised rather than
-    bypassed.
+    `kwargs` are stated in nm and kJ/mol, the units q-force emits, and
+    converted through `io.units.from_openmm`, the same path a q-force import
+    takes into a `.jsonl`.  So the literals below are recognisable q-force
+    numbers, and the conversion is exercised rather than bypassed.
     """
     return {
         term_type: {
             "atoms": np.array(atoms_rows, dtype=int),
             "kwargs": {
-                k: from_disk(term_type, k, np.atleast_1d(np.asarray(v, dtype=float)))
+                k: from_openmm(term_type, k, np.atleast_1d(np.asarray(v, dtype=float)))
                 for k, v in kwargs.items()
             },
         }

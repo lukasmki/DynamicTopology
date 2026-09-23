@@ -1,7 +1,8 @@
-"""Reaction network i/o: `.jsonl` term files, in nm and kJ/mol on disk.
+"""Reaction network i/o: `.jsonl` term files, in eV and Angstrom on disk.
 
-`io.units` is the table the conversion to the in-memory Angstrom and eV goes
-through.  Importing q-force XML is fitting-side, and lives in fast-forces
+The same units every term is held in, so nothing converts on the way in or out.
+`io.units` is the table for the q-force and OpenMM boundary (nm and kJ/mol).
+Importing q-force XML is fitting-side, and lives in fast-forces
 (`fastforces.qforce_xml`).
 """
 

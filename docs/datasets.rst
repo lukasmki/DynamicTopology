@@ -69,7 +69,7 @@ Each entry's ``path`` has no extension. Loading pairs ``<path>.xyz`` with
 
 * **Molecules**: the ``.xyz`` is one geometry. Its energy, if present, is the
   atomization energy used to put every template on a common reference scale.
-  The ``.jsonl`` holds the parameter terms, one per line.
+  The ``.jsonl`` holds the parameter terms, one per line, in eV and Å.
 * **Reactions**: the ``.xyz`` holds several frames, read as reactant,
   transition-state frames, then product. The ``.jsonl`` holds the coupling
   terms.

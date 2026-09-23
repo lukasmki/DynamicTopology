@@ -1,6 +1,6 @@
 {"type": "charge", "atoms": {"p0": 0}, "kwargs": {"q": -1.1983226825075168}}
 {"type": "charge", "atoms": {"p0": 1}, "kwargs": {"q": 0.19832268250751686}}
-{"type": "lennardjones", "atoms": {"p0": 0}, "kwargs": {"sigma": 0.305, "eps": 0.71128}}
+{"type": "lennardjones", "atoms": {"p0": 0}, "kwargs": {"sigma": 3.05, "eps": 0.007371897663100847}}
 {"type": "lennardjones", "atoms": {"p0": 1}, "kwargs": {"sigma": 0.0, "eps": 0.0}}
-{"type": "bond", "atoms": {"p1": 0, "p2": 1}, "kwargs": {"r0": 0.0964, "k": 449613.167, "D": 611.277230695907, "h": 96.54273805204576}}
+{"type": "bond", "atoms": {"p1": 0, "p2": 1}, "kwargs": {"r0": 0.964, "k": 46.59912067127814, "D": 6.335442003815535, "h": 1.000594962652167}}
 {"type": "reference", "atoms": {"a1": 0}, "kwargs": {"E0": 0.0}}

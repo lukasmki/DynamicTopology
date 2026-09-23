@@ -34,10 +34,10 @@ and therefore take the same value on every state.
 
 Dimensionless: `core_fraction`, `n`, `accuracy`.
 
-These are the units every parameter is held and evaluated in.  A `.jsonl` stores
-the bonded and 12-6 parameters as q-force and OpenMM state them, in nm and
-kJ/mol, and `io/units.py` converts them once on read and once on write; the
-ACKS2 block, `charge` and the couplings are stored in the units above.
+These are the units every parameter is held, evaluated and stored in: a
+`.jsonl` carries them as they are.  q-force and OpenMM state the bonded and 12-6
+parameters in nm and kJ/mol, and `io/units.py` is the table the conversion at
+that boundary goes through.
 `SCREENING_LENGTH` is Å; `ccoul` is eV·Å; `gamma` is 1/Å.  A coupling amplitude
 `A` is eV and its width `a` is 1/Å²; `r0`, `ra0`, `rb0` are Å and `t0` radians.
 
@@ -475,8 +475,9 @@ single coordinate to be a function of.
 | three-body coupling | `A, a, ra0, rb0, t0` | eV, 1/Å², Å, Å, rad |
 | RMSD coupling | `A, a` + TS ensemble | eV, 1/Å² |
 
-As held in memory; on disk every Å above is nm and every eV kJ/mol, except for
-the ACKS2, charge and coupling rows (`io/units.py`).
+As held in memory and as stored in a `.jsonl`.  In q-force's XML and OpenMM
+every Å above is nm and every eV kJ/mol, except for the ACKS2, charge and
+coupling rows, which neither states (`io/units.py`).
 
 Exclusion terms carry no independent parameters: they reuse the 12-6 pair
 parameters, the atomic numbers, and the charge kernel respectively.

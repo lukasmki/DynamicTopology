@@ -224,15 +224,16 @@ Force field classes dispatch by convention: `__call__` iterates `term_dict` and 
 functional form means adding a `compute_*` method that returns `(energy, forces, virial)` —
 nothing else needs to change.
 
-**Units: eV and Å everywhere in memory; nm and kJ/mol only on disk.** Every force field, every
-`Term`, every `term_dict` and `ForceFieldParams` is in ASE units. A `.jsonl` stores the bonded and
-12-6 parameters as q-force emits them (nm, kJ/mol), and `io/units.py` converts each row once on
-read (`io.json.read_jsonl`, which `ReactionSetData.from_manifest` uses) and once on write; the
-ACKS2 `atom` block, `charge` and the couplings are stored as used. `UNIT_POWERS` there is the one
-table of what converts how, and a parameter missing from it raises. Converted values are written
-to 15 significant digits so that a refit does not churn the last digit of untouched parameters.
-Hand-built test terms go through `test_gradients.make_term`, which states its literals in q-force
-units and converts them through the same path.
+**Units: eV and Å everywhere, on disk included.** Every force field, every `Term`, every
+`term_dict`, `ForceFieldParams` and every `.jsonl` is in ASE units, so `io.json.read_jsonl` /
+`write_jsonl` move rows through untouched. nm and kJ/mol exist only at the q-force/OpenMM boundary
+in fast-forces (`import-qforce` in, the OpenMM export out), and `io/units.py` is the table both
+convert through: `UNIT_POWERS` records each parameter's dimension, and a parameter missing from it
+raises. (Until 2026-09-23 the `.jsonl` was nm/kJ/mol, converted on every read; every shipped file
+was rewritten with the exact doubles the old reader produced, and `read_jsonl` refuses a bond `r0`
+under 0.5 as a file that missed the move.) Hand-built test terms go through
+`test_gradients.make_term`, which states its literals in q-force units and converts them through
+`io.units.from_openmm`.
 
 The `virial` is `dE/d(strain)`, a 3x3 — every energy here is a function of minimum-image
 displacement vectors only, so a homogeneous strain maps `v -> (I + e) v` and
@@ -243,8 +244,8 @@ and `ase.py` divides by the cell volume to publish `stress`, which is what the A
 
 ### I/O and datasets
 
-`io/json.py` reads/writes the canonical JSONL term format (one term per line), converting through
-`io/units.py`. There is no `.h5` route and no `ReactionSet.save()` — a manifest is the only thing a
+`io/json.py` reads/writes the canonical JSONL term format (one term per line), in eV/Å with
+no conversion. There is no `.h5` route and no `ReactionSet.save()` — a manifest is the only thing a
 set loads from. (q-force XML import is fitting-side: `fast-forces import-qforce`.)
 
 A dataset is a manifest JSON (`datasets/HCombustion/HCombustion.json`) listing molecule and
@@ -260,8 +261,8 @@ note above and `forcefield/README.md`.
 
 - `test_evaluate.py` — `forcefield.evaluate` against `System` on every lone template, open and
   periodic.
-- `test_paramio.py` — the `.jsonl` I/O and its unit conversion: nm/kJ/mol on disk, eV/Å in memory,
-  and a read/write of every dataset file changes no value stored at ≤15 digits.
+- `test_paramio.py` — the `.jsonl` I/O: eV/Å on disk and in memory, a read/write of every dataset
+  file is byte-identical, a legacy nm file is refused, and the q-force/OpenMM unit table.
 - `test_gradients.py` — every analytic force is checked against central finite differences.
   Any new or edited `compute_*` method must get a case here.
 - `test_stress.py` — the same for the virial, differenced against the *cell* with the atoms scaled

@@ -14,7 +14,7 @@ This is the one place it is assembled.
 **It is the same number `System` produces for a lone molecule with no reaction
 admitted**, and `tests/test_evaluate.py` holds it to that for every template of
 every dataset.  `terms` is a template's term list in the units every term is
-held in (see `io/units.py`); its exclusions are derived here if it does not
+held in, eV and Angstrom; its exclusions are derived here if it does not
 state them, exactly as `ReactionSet.load` derives them, and no reference shift
 is synthesized -- the energy is that of the terms given.
 """

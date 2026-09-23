@@ -119,7 +119,7 @@ Term sources:
       eta_O      3.7445 -> 2.8084     both scaled by 0.75
       eta_H      7.2846 -> 5.4635
       sigma_H    0.196  -> 0.0        eps_H zeroed with it
-      sigma_O    0.296  -> 0.305 nm
+      sigma_O    0.296  -> 0.305 nm   (3.05 A as the .jsonl now stores it)
 
   Nothing in the repo regenerates these.  `eta` was set against the dimer well
   and `sigma_O` against the pressure of a 997 kg/m3 box; the reasoning for both

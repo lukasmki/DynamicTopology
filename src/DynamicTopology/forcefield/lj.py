@@ -68,9 +68,9 @@ diabat's diagonal -- small, because the switch has already taken the term to
 millielectronvolts at a bond length, and built from `pair_potential` below so
 the two halves are the same function of the same numbers.
 
-Units are ASE's -- sigma in Angstrom, epsilon in eV -- like every other term.
-q-force states them in nm and kJ/mol, and `io/units.py` converts them once when
-the `.jsonl` is read.
+Units are ASE's -- sigma in Angstrom, epsilon in eV -- like every other term,
+and as the `.jsonl` stores them.  q-force states them in nm and kJ/mol, and
+`io/units.py` converts them once, when fast-forces imports its XML.
 """
 
 import networkx as nx

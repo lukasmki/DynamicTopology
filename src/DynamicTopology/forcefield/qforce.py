@@ -24,8 +24,9 @@ CLIP_BONDANGLE: float = -20.0 * units.kJ / units.mol
 class QForce:
     """Bonded force field, in ASE units throughout: Angstrom, eV, radians.
 
-    Parameters arrive in those units too -- `io/units.py` converts q-force's nm
-    and kJ/mol once, when a `.jsonl` is read -- so nothing here rescales.
+    Parameters arrive in those units too -- a `.jsonl` stores them so, and
+    `io/units.py` converts q-force's nm and kJ/mol once, when fast-forces
+    imports its XML -- so nothing here rescales.
 
     `bond_form` selects the bond functional form:
 

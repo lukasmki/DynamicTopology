@@ -539,7 +539,7 @@ class TestQForceStress:
         needed the energy factor alone -- dividing by `units.nm` as the forces
         did would have left every pressure a factor of ten small, which no
         finite-difference test written in the same wrong units could catch.
-        Everything is in ASE units now, parameters converted as they are read,
+        Everything is in ASE units now, parameters and `.jsonl` files alike,
         but the check is the same and still independent: for a pure Morse bond
         the trace of the virial must equal `r * dE/dr` in eV, computed here from
         the energy curve rather than from anything inside `QForce`.

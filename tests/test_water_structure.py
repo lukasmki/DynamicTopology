@@ -147,7 +147,7 @@ class TestHydrogenBond:
     """The water dimer well, through the full calculator.
 
     Measured at `eta_O = 2.8084`, `eta_H = 5.4635`, `sigma_H = eps_H = 0` and
-    `sigma_O = 0.305` nm, against the same scan on the parameters that preceded
+    `sigma_O = 0.305` nm (3.05 A), against the same scan on the parameters that preceded
     them:
 
         R_OO     before      after      (eV, this geometry)

@@ -171,7 +171,6 @@ class ReactionSetData:
                 atoms: Atoms | list[Atoms] = io.read(data_path)
             else:  # try to read as xyz
                 atoms: Atoms | list[Atoms] = io.read(data_path.with_suffix(".xyz"))
-            # nm and kJ/mol on disk, Angstrom and eV from here on.
             terms: list[Term] = read_jsonl(data_path.with_suffix(".jsonl"))
 
             assert isinstance(atoms, Atoms)

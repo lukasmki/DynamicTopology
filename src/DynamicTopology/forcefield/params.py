@@ -12,8 +12,7 @@ before any manifest is loaded and a bound default would pin the wrong one.
 
 Units, defaults and the measurement behind each value are tabulated in
 `forcefield/README.md`'s "Global parameters at a glance".  Every field is in
-ASE units -- Angstrom and eV -- like everything else in memory; only a `.jsonl`
-is in nm and kJ/mol (see `io/units.py`).
+ASE units -- Angstrom and eV -- like everything else, `.jsonl` files included.
 """
 
 from __future__ import annotations

@@ -35,10 +35,10 @@ the next MD step — that feedback is the "dynamic topology".
 | $S_{ij}$ | the intramolecular exclusion screen, $1 - \sum_s w_s M_s$ (§2.3.2) |
 | $C(T_i)$ | the Coulomb exclusion correction on state $i$'s diagonal (§2.3.2) |
 
-Units are ASE's throughout: **eV** and **Å**, for every force field and every
-parameter held in memory. Only a `.jsonl` is in q-force's **kJ/mol** and **nm**,
-and [io/units.py](io/units.py) converts each row once as it is read and once as
-it is written.
+Units are ASE's throughout: **eV** and **Å**, for every force field, every
+parameter held in memory and every `.jsonl` on disk. Only q-force's XML and
+OpenMM are in **kJ/mol** and **nm**, and [io/units.py](io/units.py) is the table
+fast-forces converts through at that boundary.
 Forces are $\mathbf{F} = -\partial E/\partial \mathbf{x}$ throughout, and every
 force field's `__call__` returns the 3-tuple $(E, \mathbf{F}, \mathbf{W})$.
 

@@ -1,6 +1,6 @@
 {"type": "atom", "atoms": {"p0": 0}, "kwargs": {"mu": 8.120335578918457, "eta": 3.7445240020751953, "soft_amp": 3.882110118865967, "soft_decay": 0.4358389973640442}}
 {"type": "atom", "atoms": {"p0": 1}, "kwargs": {"mu": 1.879652976989746, "eta": 7.284643173217773, "soft_amp": 2.0968151092529297, "soft_decay": 0.26886698603630066}}
-{"type": "lennardjones", "atoms": {"p0": 0}, "kwargs": {"sigma": 0.296, "eps": 0.71128}}
-{"type": "lennardjones", "atoms": {"p0": 1}, "kwargs": {"sigma": 0.196, "eps": 0.184}}
-{"type": "bond", "atoms": {"p1": 0, "p2": 1}, "kwargs": {"r0": 0.097519183, "k": 430069.307, "D": 442.86122265620844, "h": 177.71074936197473}}
+{"type": "lennardjones", "atoms": {"p0": 0}, "kwargs": {"sigma": 2.9599999999999995, "eps": 0.007371897663100847}}
+{"type": "lennardjones", "atoms": {"p0": 1}, "kwargs": {"sigma": 1.96, "eps": 0.0019070256017469293}}
+{"type": "bond", "atoms": {"p1": 0, "p2": 1}, "kwargs": {"r0": 0.9751918299999999, "k": 44.57354233557391, "D": 4.589933095795309, "h": 1.8418421127115088}}
 {"type": "reference", "atoms": {"a1": 0}, "kwargs": {"E0": 0.0}}

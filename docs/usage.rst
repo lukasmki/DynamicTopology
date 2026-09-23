@@ -2,8 +2,8 @@ Usage
 =====
 
 All quantities in memory and at the API boundary are in ASE units: positions in
-Å, energies in eV, forces in eV/Å and stress in eV/Å³. Only the ``.jsonl``
-parameter files on disk use nm and kJ/mol (see :doc:`concepts`).
+Å, energies in eV, forces in eV/Å and stress in eV/Å³. The ``.jsonl``
+parameter files on disk use the same units (see :doc:`concepts`).
 
 Loading a reaction set
 ----------------------

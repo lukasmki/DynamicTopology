@@ -35,13 +35,16 @@ charges" below.
 | where | length | energy | notes |
 | --- | --- | --- | --- |
 | every force field, every in-memory term, `ForceFieldParams` | Å | eV | ASE units throughout; nothing converts during a force call |
-| `.jsonl` on disk | nm | kJ/mol | q-force's and OpenMM's convention; `io/units.py` converts once on read and once on write |
+| `.jsonl` on disk | Å | eV | stored as held; nothing converts on read or write |
 | everything returned to ASE | Å | eV | forces eV/Å, stress eV/Å³ |
+| q-force XML, OpenMM export (fast-forces) | nm | kJ/mol | `io/units.py` converts at that boundary |
 
-The exceptions on disk are the ACKS2 `atom` block, `charge` and every EVB
-coupling, which a `.jsonl` stores in the units above (they convert by 1).
-`io/units.py:UNIT_POWERS` is the one table of what converts how, and a parameter
-missing from it is refused rather than read in whatever unit it was stored in.
+`io/units.py:UNIT_POWERS` is the one table of what converts how between ASE and
+q-force/OpenMM units, and a parameter missing from it is refused rather than
+converted by a guessed factor.  The ACKS2 `atom` block, `charge` and every EVB
+coupling convert by 1: neither q-force nor OpenMM states them.  A bond `r0`
+under 0.5 in a `.jsonl` is refused on read as a file from before the move to
+eV/Å (`io.json.LEGACY_R0`).
 
 Angles are radians.  `PHI_B` and the like are dimensionless;
 `SCREENING_LENGTH` is Å, `ccoul` is eV·Å, `gamma` is 1/Å.  A coupling's `A` is

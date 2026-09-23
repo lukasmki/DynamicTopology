@@ -278,7 +278,8 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # `tests/test_dissociation.py` tracks, and no force constant moved at all.
 # And once more when every term moved to ASE units in memory -- `QForce` and
 # `LennardJones` had worked in nm and kJ/mol and converted at the end of the
-# call; now `io/units.py` converts the parameters once, as the `.jsonl` is read.
+# call; then `io/units.py` converted the parameters once, as the `.jsonl` was
+# read (and since 2026-09-23 the `.jsonl` itself is in eV/Angstrom).
 # The same surface in different units, so nothing may move beyond the rounding
 # of `x * 0.1 * 10`, and nothing did:
 #

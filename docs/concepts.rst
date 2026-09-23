@@ -110,13 +110,23 @@ Units
      - Å
      - eV
    * - ``.jsonl`` files on disk
-     - nm
-     - kJ/mol
+     - Å
+     - eV
    * - Results returned to ASE
      - Å
      - eV (forces eV/Å, stress eV/Å³)
+   * - q-force XML and OpenMM (fast-forces import and export only)
+     - nm
+     - kJ/mol
 
-:mod:`DynamicTopology.io.units` converts each parameter once on read and once
-on write. The ACKS2 ``atom`` block, ``charge`` and the EVB couplings are stored
-in the in-memory units already. The virial is ``dE/d(strain)``, a 3×3 array in
-eV.
+A ``.jsonl`` stores every parameter exactly as it is held in memory, so reading
+and writing one converts nothing. nm and kJ/mol appear only where fast-forces
+imports q-force XML or exports to OpenMM, and both conversions go through the
+table in :mod:`DynamicTopology.io.units`. The ACKS2 ``atom`` block, ``charge``
+and the EVB couplings are the same numbers in either unit system. The virial is
+``dE/d(strain)``, a 3×3 array in eV.
+
+Files written before 2026-09-23 stored the bonded and 12-6 parameters in nm and
+kJ/mol. :func:`~DynamicTopology.io.json.read_jsonl` refuses a bond ``r0`` below
+0.5, which only such a file can have. Convert one row at a time with
+:func:`~DynamicTopology.io.units.term_from_openmm`.

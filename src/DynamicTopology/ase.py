@@ -11,6 +11,21 @@ from DynamicTopology.system import System
 
 
 class DynamicTopology(Calculator):
+    """Reactive multi-state EVB force field as an ASE calculator.
+
+    The initial bond topology is perceived from `atoms` on construction (from
+    `atoms.info["connectivity"]` when present, otherwise from distances).  Every
+    call rebuilds the diabatic basis around the current topology, takes the EVB
+    ground state and carries the dominant state's topology into the next call,
+    so bonds break and form as the dynamics runs.
+
+    `bimol_cutoff` (Angstrom) is the closest approach under which a bimolecular
+    channel is considered.  `evb` is passed to `basis.EVBBasis` (`eps`,
+    `switch_width`, `max_states`, `max_depth`).  Besides `energy`, `forces` and
+    (for a periodic cell) `stress`, each call sets `diagnostics` and
+    `topology_changed`; the live topology is `system.topology`.
+    """
+
     # `stress` is what every ASE barostat asks for, so an NPT run needs it
     # present here or it raises before taking a step.  See `tests/test_stress.py`
     # for how the virial behind it is built and checked.
@@ -89,6 +104,13 @@ class DynamicTopology(Calculator):
 
 
 class EVB(Calculator):
+    """Fixed-state EVB as an ASE calculator.
+
+    The diabatic states reachable from the initial topology are enumerated once,
+    on construction, and coupled with the empirical geometric-mean coupling of
+    `evb.EVBSystem`.  Nothing is rebuilt and the topology never changes.
+    """
+
     implemented_properties: list[str] = ["energy", "forces"]
 
     def __init__(

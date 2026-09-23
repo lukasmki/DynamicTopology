@@ -15,7 +15,7 @@ The dataset tools that used to live here moved there:
 | `scripts/fit.py`, `fit/dissociation.py`, `fit/coupling.py` | `fast-forces refit <manifest>`, `fastforces.refine`, `fastforces.coupling` |
 | `scripts/compute.py` | `fast-forces label` |
 | `scripts/convert.py`, `io/xml.py` | `fast-forces import-qforce`, `fastforces.qforce_xml` |
-| `datasets/*/make_water.py`, `fit_charges.py`, `scripts/topologize.py`, `examples/run_calc*.sh` | `examples/datasets/` (`fastforces.charges` for the ESP fit) |
+| `datasets/*/make_water.py`, `fit_charges.py`, `scripts/topologize.py`, `examples/run_calc*.sh` | removed; the ESP charge fit survives as `fastforces.charges` (`mk_charges`, `charge_terms`) |
 | `.claude/skills/new-dataset/` | `.claude/skills/new-dataset/` |
 | `tests/test_fit.py` | `tests/test_refine.py` |
 

@@ -10,6 +10,14 @@ from .types import Term
 
 
 class Reaction:
+    """A reactant and a product topology, and the TS ensemble between them.
+
+    `atoms` holds the transition-state geometries the coupling is centred on;
+    `terms` holds the coupling terms.  `get_mapping` matches the reactant
+    template onto a live topology and `apply` returns the product topology
+    under that mapping.
+    """
+
     def __init__(
         self,
         reactants: Topology,

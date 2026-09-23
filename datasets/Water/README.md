@@ -83,8 +83,7 @@ Every step is a fast-forces command, run from the fast-forces checkout
 (`../fast-forces`); this repository only loads the result.
 
 ```sh
-uv run python examples/datasets/Water/make_water.py ../DynamicTopo/datasets/Water   # geometries only
-# then, per file, with the charge/spin in the table above:
+# per file, with the charge/spin in the table above:
 uv run fast-forces label -i <f>.xyz -o <f>.xyz -c <q> -s <s> \
     -b aug-cc-pvtz --atom-cache atoms.json
 uv run fast-forces refit ../DynamicTopo/datasets/Water/Water.json --force-constants
@@ -96,13 +95,13 @@ scratch from its SMILES against the reference calculator it names.  Nothing here
 reads that block.
 
 Geometry sources, all literature/symmetry rather than optimized here (there is
-no geometry optimizer in this environment):
+no geometry optimizer in this environment); the `.xyz` files are the record, as
+the script that laid them out is gone:
 
 - `h2o` 0.9584 A / 104.45 deg; `h3o` 0.976 A / 111.8 deg C3v; `h1o` 0.964 A.
 - Reaction frames are laid out with both oxygens on the x axis and the
   transferring proton on that axis, so a frame is fully specified by the O-O
-  distance and where the proton sits along it.  See fast-forces'
-  `examples/datasets/Water/make_water.py`.
+  distance and where the proton sits along it.
 - The two hops hold their **reactant** frames at 2.75 / 2.70 A rather than at the
   2.4 A where the symmetric Zundel and H3O2- are the gas-phase global minima.
   At contact there is no barrier at all, so a reactant frame placed there is not

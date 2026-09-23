@@ -211,6 +211,14 @@ class ReactionSetData:
 
 
 class ReactionSet:
+    """The query engine over a loaded dataset.
+
+    Loads a manifest into `data` (a `ReactionSetData`), activating its
+    `global_params`, and maps the stored templates onto a live system's atom
+    indices: `get_terms` for a topology's parameters and `get_network` for the
+    reactions available to it.  Results are cached by molecule signature.
+    """
+
     def __init__(self, path: str | Path | None = None):
         self.data = ReactionSetData()
         self._reset_caches()

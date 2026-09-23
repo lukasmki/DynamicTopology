@@ -24,6 +24,14 @@ BOND_SCALE: float = 1.3
 
 
 class Topology:
+    """A bond graph over global atom indices, with optional atoms and terms.
+
+    Identity is the Weisfeiler-Lehman hash of the graph over `atomic_number`
+    (`hash`), so two topologies with the same bonding pattern share a hash
+    whatever their geometry.  `molecules` yields the connected components as
+    subgraphs that keep their global indices.
+    """
+
     def __init__(
         self,
         graph: nx.Graph,

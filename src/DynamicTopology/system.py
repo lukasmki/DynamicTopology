@@ -36,6 +36,15 @@ SCF_MAX_SWEEPS: int = 100
 
 
 class System:
+    """One reactive force call, independent of ASE.
+
+    Holds the geometry, the current topology and the reaction set.
+    `calculate` builds the EVB basis, diagonalizes each block and returns a
+    dict with `energy` (eV), `forces` (eV/A), `virial` (eV), the next
+    `topology`, the energy broken into its parts and a per-block `blocks`
+    summary.  `update` swaps in new atoms or a new topology between calls.
+    """
+
     def __init__(
         self,
         atoms: Atoms,

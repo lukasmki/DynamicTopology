@@ -15,6 +15,14 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 class ReactionNetwork:
+    """The reactions available to a topology at one geometry.
+
+    A multigraph whose nodes are molecules and whose edges are applicable
+    reactions: unimolecular channels are self-loops, bimolecular ones join two
+    molecules within the cutoff.  Built by `ReactionSet.get_network`; each
+    edge carries the `reaction` and its atom `mapping`.
+    """
+
     def __init__(self, graph: nx.MultiGraph, terms: list[Term] | None = None):
         self.graph: nx.MultiGraph = graph
         self.term_dict = {}

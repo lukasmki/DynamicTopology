@@ -48,7 +48,7 @@ class ACKS2:
         """The Coulomb constant in eV*Angstrom, from the active parameters.
 
         A property rather than a class attribute so that it tracks the dataset
-        rather than the import: `fit/dissociation.py` builds one of these at
+        rather than the import: fast-forces' `refine` builds one of these at
         module scope, before any manifest has been read.  `zbl` carries the same
         physical constant to more digits under its own field; see
         `params.ForceFieldParams.zbl_ccoul` for why the two are separate.
@@ -372,7 +372,7 @@ class ACKS2:
 
         The one-state case of `screen_matrix`, for every caller that evaluates
         one fixed bonding pattern rather than an EVB ground state: `evb.py`,
-        `fit/dissociation.py`, and `__call__` itself.  Returns None when a term
+        fast-forces' `refine`, and `__call__` itself.  Returns None when a term
         list carries no exclusions, so a dataset that predates them evaluates
         exactly the unscreened kernel it always did.
         """

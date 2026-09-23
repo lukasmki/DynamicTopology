@@ -7,7 +7,7 @@ cross unless the basis size changes.  They used to build those by placing two
 equilibrium templates a few Angstrom apart.
 
 That stopped working once the couplings were fitted, and for the reason the
-coupling fit exists: `fit.coupling.fit_width` pins the width so that `|V| <= eps`
+coupling fit exists: fast-forces' `coupling.fit_width` pins the width so that `|V| <= eps`
 at the reactant and product *minima*, because that is where the diabatic picture
 is already correct and a coupling would be double-counting.  Two molecules at
 their own equilibrium geometries therefore cannot mix, however close they are
@@ -52,7 +52,7 @@ HCOMBUSTION = Path("datasets/HCombustion/HCombustion.json").resolve()
 # **This was rxn_10, and before that rxn_16.**  It moves whenever the force
 # field is refit, because which channels reach three states is a property of
 # the fitted coupling amplitudes rather than of the geometry.  The wavenumber
-# cap added to `fit.dissociation` took rxn_10 from three states with a clean
+# cap added to fast-forces' `refine` took rxn_10 from three states with a clean
 # ramp over t = -0.06 to 0.00 down to two states everywhere on its path -- the
 # *channel* is still fitted and still feasible, its amplitude is simply no
 # longer large enough to admit a third diabat at this geometry.  Surveying all
@@ -73,7 +73,7 @@ REACTION = "rxn_13"
 # states with every channel at full strength, and far enough past the ramp that
 # a small change in the surface does not put it back inside one.
 #
-# Three until `fit.coupling.fit_twobody` gave the fission channels a real
+# Three until fast-forces' `coupling.fit_twobody` gave the fission channels a real
 # amplitude.  Their couplings had been `A = 0`, so they were dropped at the `eps`
 # gate at every geometry and could not be part of any basis; a fourth diabat here
 # is that channel becoming visible, not the gate loosening.
@@ -90,7 +90,7 @@ REACTION_PATH_TS = 0.16
 # nature.**  Rescanned four times now: once when `ZBL` acquired its taper, again
 # when `forcefield/lj.py` was switched back on and both datasets were refit
 # against it, again when the angle potential acquired its factor of 1/2 and both
-# datasets were refit against that, and again when `fit.coupling.fit_twobody`
+# datasets were refit against that, and again when fast-forces' `coupling.fit_twobody`
 # replaced the fission channels' `A = 0`.  The whole window on the current
 # surface:
 #
@@ -195,7 +195,7 @@ def with_spectator(atoms: Atoms, template: Atoms, gap: float) -> Atoms:
 # Lennard-Jones wall standing between two atoms its transition state has 0.916 A
 # apart -- to -2.28 eV, a real coupling and a much smaller one.  Then `rxn_04`
 # at 0.2, which stopped switching when the wavenumber cap was added to
-# `fit.dissociation`.  Which channels recross is a property of the fitted
+# fast-forces' `refine`.  Which channels recross is a property of the fitted
 # amplitudes, so any refit can move it, and re-running the survey above is the
 # maintenance that follows a refit.
 #

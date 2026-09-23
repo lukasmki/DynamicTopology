@@ -2,7 +2,7 @@ import numpy as np
 from typing import Callable
 
 
-def _kabsch(frozen: np.ndarray, mobile: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def kabsch(frozen: np.ndarray, mobile: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Rotation and translation superposing `mobile` onto `frozen`, batched.
 
     `frozen` is (n, 3) and `mobile` is (m, n, 3); the return is `(R, T)` with
@@ -89,7 +89,7 @@ class EVBCoupling:
         shares a reaction template; the returns carry the same leading axis.
         Every channel of one template in one force call has the same `n` and the
         same `ensemble`, which is what makes the batch worth forming -- see
-        `_kabsch`.
+        `kabsch`.
 
         `inv_cell` is the caller's cached `inv(cell)`.  The cell is fixed for a
         whole force call while this is entered once per channel, so inverting it
@@ -148,7 +148,7 @@ class EVBCoupling:
         rmsd = np.empty((nbatch, len(ensemble)))
         drmsd = np.empty((nbatch, len(ensemble), natoms, 3))
         for i in range(len(ensemble)):
-            R, T = _kabsch(ensemble[i], pos)
+            R, T = kabsch(ensemble[i], pos)
             ppos = np.einsum("mni,mji->mnj", pos, R) + T[:, None, :]
 
             distsq = np.sum(np.square(ensemble[i] - ppos), -1)
@@ -193,7 +193,7 @@ class EVBCoupling:
         0 = |V|`, and a Gaussian centred on the crossing is at its maximum `|A|`
         exactly there.  A fission channel therefore passes `stab > eps` at the
         one geometry where the topology decision is taken, by construction rather
-        than by luck -- see `fit.coupling.fit_twobody` for the two conditions
+        than by luck -- see fast-forces' `coupling.fit_twobody` for the two conditions
         that then fix `A` and `a`.
         """
         i, j = atoms[:, 0], atoms[:, 1]
@@ -231,7 +231,7 @@ class EVBCoupling:
         against one, so `ensemble` is accepted for the uniform `compute_*`
         signature and unused.  The centre is the *transition state's* triangle,
         where `g = 0` and so `V = A` exactly -- which is what keeps
-        `fit.coupling.fit_amplitude` valid for this form: a transfer does have a
+        fast-forces' `coupling.fit_amplitude` valid for this form: a transfer does have a
         saddle and a reference barrier, and that barrier is real data worth
         fitting to, unlike a fission's.
 

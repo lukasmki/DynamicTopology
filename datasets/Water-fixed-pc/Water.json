@@ -19,7 +19,7 @@
         "bond_asymptote": 1.0,
         "taper_radius": 1.5,
         "taper_width": 0.12,
-        "switch_radius": 0.22,
+        "switch_radius": 2.2,
         "core_fraction": 0.4,
         "exclusion_depth": 3,
         "exclude_coulomb": true,

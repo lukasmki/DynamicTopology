@@ -35,9 +35,10 @@ the next MD step — that feedback is the "dynamic topology".
 | $S_{ij}$ | the intramolecular exclusion screen, $1 - \sum_s w_s M_s$ (§2.3.2) |
 | $C(T_i)$ | the Coulomb exclusion correction on state $i$'s diagonal (§2.3.2) |
 
-External units are ASE's: **eV** and **Å**. `QForce` and `LennardJones` work
-internally in q-force's **kJ/mol** and **nm** and convert at the end of
-`__call__`; the per-term `compute_*` methods return *unconverted* values.
+Units are ASE's throughout: **eV** and **Å**, for every force field and every
+parameter held in memory. Only a `.jsonl` is in q-force's **kJ/mol** and **nm**,
+and [io/units.py](io/units.py) converts each row once as it is read and once as
+it is written.
 Forces are $\mathbf{F} = -\partial E/\partial \mathbf{x}$ throughout, and every
 force field's `__call__` returns the 3-tuple $(E, \mathbf{F}, \mathbf{W})$.
 
@@ -71,7 +72,7 @@ manifest omits it, and read through `params.active()` at call time:
 ```
 
 All but `accuracy` sit inside $E_{\text{bonded}} +
-E_{\text{nonbonded}}$, which `fit/dissociation.py` solves each template's depth
+E_{\text{nonbonded}}$, which fast-forces' `refine` solves each template's depth
 scale against (§5.2), so each one is part of the definition of the surface a
 dataset's `.jsonl` files were fitted to. As module constants they were a property of
 the installed source tree instead, and a checkout whose taper radius had moved
@@ -455,7 +456,7 @@ $$
 (`taper_radius` and `taper_width`, [params.py](forcefield/params.py).) The
 taper is folded in **inside** `pair_potential` rather than applied by the caller
 ([zbl.py:269](forcefield/zbl.py#L269)), so $f$ and $f'$ can never travel
-separately — `fit/dissociation.py` differentiates this function for its bond
+separately — fast-forces' `refine` differentiates this function for its bond
 curvatures and would otherwise see an inconsistent pair. The Fermi exponent is
 clipped to $\pm 500$ ([zbl.py:225](forcefield/zbl.py#L225)): the argument already
 reaches 54 at 8 Å, and unclipped a half-cell-apart pair produces `0 * inf = nan`
@@ -503,10 +504,10 @@ the O₂ bond.
 $f$ is a function of $r$ alone, multiplying a pair potential that already took no
 topology, so every structural guarantee below survives it unchanged.
 
-**It is still a refit.** `fit/dissociation.py` solves against
+**It is still a refit.** fast-forces' `refine` solves against
 $E_{\text{QForce}} + E_{\text{nonbonded}}$ with this term inside $E_{\text{nonbonded}}$,
 so changing $r_c$ or $w$ invalidates every `.jsonl` in every dataset and
-`scripts/fit.py` has to be re-run. It is not free: on HCombustion the taper lowers
+`fast-forces refit` has to be re-run. It is not free: on HCombustion the taper lowers
 the diabats at transition-state geometries — which is where close contacts are, and
 therefore where the removed tail was largest — and the channel count went from 14 of
 19 to **12 of 19**, losing `rxn_06`, `rxn_11` and `rxn_16`. Two of those three had
@@ -551,12 +552,12 @@ untouched. So it **cannot** produce a plateau, a spurious amplitude, a pivot
 dependence, or a discontinuity at $r_{\text{bimol}}$ — not "does not", cannot.
 
 The same property means it cancels exactly out of every energy *difference*,
-including the diabatic margins `fit/dissociation.py` scores channels on. It buys
+including the diabatic margins fast-forces' `refine` scores channels on. It buys
 stability and nothing at all for fittability; that work belongs to the bonded fit.
 
 It is applied to bonded pairs too, since it knows nothing about bonds. Those values
 (+2.3 eV on H₂, +11.6 on O₂, +11.1 on H₂O) are absorbed by the fitted Morse depths —
-`fit/dissociation.py` solves against $E_{\text{QForce}} + E_{\text{nonbonded}}$ — so
+fast-forces' `refine` solves against $E_{\text{QForce}} + E_{\text{nonbonded}}$ — so
 every template still reproduces its own reference atomization energy to $10^{-13}$.
 
 #### 2.2.1 The switched 12-6 (`LennardJones`, [forcefield/lj.py](forcefield/lj.py))
@@ -576,8 +577,8 @@ $$
 
 with $\sigma$ and $\varepsilon$ combined **geometrically** in both parameters (q-force's
 `A=sqrt(A1*A2); B=sqrt(B1*B2)`, *not* Lorentz–Berthelot), $r_s =$ `switch_radius`
-$= 0.22$ nm and $w =$ `switch_width` $=$ `taper_width / 10` $= 0.012$ nm — the
-same physical width, in this module's units ([params.py](forcefield/params.py)).
+$= 2.2$ Å and $w =$ `switch_width` $=$ `taper_width` $= 0.12$ Å — one sharpness
+for both switches ([params.py](forcefield/params.py)).
 
 $g$ is the same Fermi form as ZBL's $f$ run in the opposite direction, but it is
 **not $1 - f$**: the two are centred at different radii, so
@@ -644,7 +645,7 @@ alone. That surface bound the dimer at −0.112 eV when this was written and bin
 at −0.1024 eV now, the difference being the exclusion of §2.3.2 rather than anything
 in this gap. `tests/test_collapse.py` is what checks nothing squeezes through it.
 
-**It is a refit, for the same reason the taper was.** `fit/dissociation.py` solves
+**It is a refit, for the same reason the taper was.** fast-forces' `refine` solves
 against $E_{\text{QForce}} + E_{\text{nonbonded}}$ and this term is inside
 $E_{\text{nonbonded}}$, so changing $r_s$, $w$ or `core_fraction` invalidates every
 `.jsonl` in the dataset that states them. What that cost is recorded in
@@ -676,12 +677,10 @@ pair where either is zero ([exclusions.py:166](forcefield/exclusions.py#L166)), 
 the excluded and the counted branch use identical numbers.
 
 `compute_zblexclusion` ([qforce.py:382](forcefield/qforce.py#L382)) is the same
-construction for `ZBL`, and it carries the **opposite** unit trap:
-`lj.pair_potential` is unit-agnostic and can be handed q-force's nm directly, while
-`zbl.pair_potential` is not — `SCREENING_LENGTH` is in Å and `zbl_ccoul` in eV·Å, so $r$
-converts going in and the result converts coming back. Getting that wrong leaves the
-energy right and the forces wrong by a factor of ten.
-`tests/test_gradients.py::TestZBLGradients` and `tests/test_stress.py` now assert
+construction for `ZBL`. (While `QForce` worked in nm it had to convert $r$ going
+in and the result coming back, and getting that wrong left the energy right and
+the forces wrong by a factor of ten; with every term in Å there is nothing to
+convert.) `tests/test_gradients.py::TestZBLGradients` and `tests/test_stress.py` assert
 energy, forces **and** virial cancel between the two forms to $10^{-9}$.
 
 Named for the record: `reactive_exclusion_weights`, `fixed_basis_weights`,
@@ -781,7 +780,7 @@ graph is deliberately *absent* from the key: the solve does not depend on it, an
 key that pretended otherwise would throw the charges away after every reaction for
 nothing. The key still does not cover the `mu` / `eta` / `soft_amp` / `soft_decay`
 values, so the same geometry evaluated with different parameters would reuse stale
-charges; nothing in the current pipeline does that, and `fit/dissociation.py` keys
+charges; nothing in the current pipeline does that, and fast-forces' `refine` keys
 its own nonbonded cache separately.
 
 #### 2.3.1 The charge kernel, open and periodic ([forcefield/ewald.py](forcefield/ewald.py))
@@ -884,7 +883,7 @@ nearest-image cutoff of a 9 Å cell that is $e^{-15}$, so it stays a nearest-ima
 pair term at every boundary condition and `contract_pairs` is shared with it.
 
 **None of this invalidated any `.jsonl`**, unlike the three radii of §2.2: every
-dataset template carries `pbc="F F F"`, so `fit/dissociation.py` sees the unchanged
+dataset template carries `pbc="F F F"`, so fast-forces' `refine` sees the unchanged
 open-boundary kernel. The bit-identical `energy_bonded` in `test_performance.py`'s
 reference block is the evidence.
 
@@ -892,7 +891,7 @@ reference block is the evidence.
 
 **What it is for.** Without exclusions a template's gas-phase geometry is set by the
 bonded terms *and* by whatever the three whole-system nonbonded sums happen to
-contribute at bond lengths, and `fit/dissociation.py` has to absorb the difference
+contribute at bond lengths, and fast-forces' `refine` has to absorb the difference
 into the Morse depths. For H₃O⁺ that absorption failed outright: the fitted depth
 came out at 5.76 eV against a 5.21 eV tapered-ZBL step per O–H, so the isolated
 cation's true minimum sat at **1.60 Å** and the symmetric $C_{3v}$ structure was a
@@ -1107,14 +1106,12 @@ $\sum_n \partial E/\partial\mathbf{x}_n = 0$. The term carries a stress at all o
 because the Kabsch fit includes a **scale** factor $s$ — an RMSD to a fixed
 template is not scale-invariant, so uniformly inflating the cell does change it.
 
-**Unit trap.** The virial is an energy. In `QForce` and `LennardJones` it converts
-with `units.kJ / units.mol` and **no** length factor, unlike the forces, because
-$\mathbf{v}$ is already in nm and $\partial E/\partial\mathbf{v}$ in kJ/mol/nm
-([qforce.py:96](forcefield/qforce.py#L96),
-[lj.py:414](forcefield/lj.py#L414)). An extra `/ units.nm` is wrong by exactly a
-factor of 10 and surfaces only as a pressure that is silently an order of
-magnitude out; `tests/test_stress.py::TestQForceStress::test_the_unit_conversion`
-exists to catch it.
+**The virial is an energy**, in eV. While `QForce` and `LennardJones` worked in
+nm it had to be rescaled by the energy factor alone, not the forces'
+energy-over-length one -- an extra `/ units.nm` was wrong by exactly a factor of
+10 and surfaced only as a pressure silently an order of magnitude out. Nothing
+rescales now, and `tests/test_stress.py::TestQForceStress::test_the_unit_conversion`
+still pins the trace against an independent `r dE/dr`.
 
 The virial is threaded through the EVB machinery exactly as the forces are —
 `Block` stores `virials` and `coupling_virials`, `Block.hamiltonian()` returns
@@ -1161,7 +1158,7 @@ V(\mathbf{x}) \;=\; \frac{A}{M}\sum_{m=1}^{M} \exp\!\big(-a\,\rho_m^2\big),
 \rho_m = \min_{R,\mathbf{t},s}\sqrt{\frac{1}{N}\sum_{k}\big\|\mathbf{y}^{(m)}_k - (s R\,\mathbf{x}_k + \mathbf{t})\big\|^2},
 $$
 
-the minimization being the `superpose3d` Kabsch fit over rotation $R$,
+the minimization being the Kabsch fit (`coupling.kabsch`, batched) over rotation $R$,
 translation $\mathbf{t}$ and scale $s$. Its gradient:
 
 $$
@@ -1183,7 +1180,7 @@ Channel couplings are memoized per geometry on $\big(h(\text{reaction}),\ \pi\bi
 in `EVBBasis._coupling` ([basis.py:468](basis.py#L468)), which also fixes the row
 order to `sorted(mapping)` before the superposition.
 
-### Fitting $A$ and $a$ ([fit/coupling.py](fit/coupling.py))
+### Fitting $A$ and $a$ ([fast-forces `coupling.py`](../../../fast-forces/src/fastforces/coupling.py))
 
 Both parameters are fixed by the three frames every `rxn_*.xyz` already carries.
 
@@ -1216,12 +1213,12 @@ $$
 
 with $\epsilon = $ `DEFAULT_EPS` $= 10^{-3}$ eV. The reference frame is the middle
 frame of the `.xyz`, and $\rho_{\min}$ the smaller of the two endpoint RMSDs
-([fit/coupling.py:60](fit/coupling.py#L60)). When $A = 0$ the width is fitted
+([fast-forces `coupling.py`](../../../fast-forces/src/fastforces/coupling.py)). When $A = 0$ the width is fitted
 against `NOMINAL_AMPLITUDE` $= 1.0$ instead, so a decoupled channel still gets a
 finite, meaningful $a$.
 
 Each fitted term is tagged with a `provenance`
-([fit/coupling.py:166](fit/coupling.py#L166)):
+([fast-forces `coupling.py`](../../../fast-forces/src/fastforces/coupling.py)):
 
 | `provenance` | meaning |
 | --- | --- |
@@ -1384,12 +1381,12 @@ having fitted each bond locally rather than to the molecule's total atomization
 energy — a few tenths of an eV for most HCombustion templates, $+2.59$ eV for
 H$_2$O$_2$.
 
-### 5.2 The bonded fit ([fit/dissociation.py](fit/dissociation.py))
+### 5.2 The bonded fit ([fast-forces `refine.py`](../../../fast-forces/src/fastforces/refine.py))
 
-Three layers, run in that order by `scripts/fit.py`. Layers 1 and 2 are *solves*;
+Three layers, run in that order by `fast-forces refit`. Layers 1 and 2 are *solves*;
 only layer 3 is an optimization.
 
-**(1) Depths — `fit_dissociation_energies` ([fit/dissociation.py:462](fit/dissociation.py#L462)).**
+**(1) Depths — `fit_dissociation_energies` ([fast-forces `refine.py`](../../../fast-forces/src/fastforces/refine.py)).**
 A template's Morse depths are scaled by a single factor $\lambda$ so that the bonds
 themselves reproduce the atomization energy, with the shift zeroed:
 
@@ -1411,7 +1408,7 @@ what makes a small template's fitted minimum its own rather than a cancellation
 against three whole-system sums. `exclude_coulomb` and `exclusion_depth` therefore
 join the list above.
 
-**(2) Bond lengths — `fit_bond_lengths` ([fit/dissociation.py:837](fit/dissociation.py#L837)).**
+**(2) Bond lengths — `fit_bond_lengths` ([fast-forces `refine.py`](../../../fast-forces/src/fastforces/refine.py)).**
 One equation per bond type: displace $r_0$ so the *total* stretch force vanishes at
 the reference geometry,
 
@@ -1423,15 +1420,15 @@ which exists because the nonbonded terms are no longer zero at a bond length —
 Morse now has to lean into a real repulsion rather than sit at its own minimum.
 This is not a sign test on the search window: the Morse pull peaks at $D\alpha/2$
 and falls off past the inflection, so there are two roots, and the bracket runs
-from `argmin` outward. The window is $r_0 \pm$ `MAX_LENGTH_SHIFT` $= 0.03$ nm — a
-tripwire, not a working range; real shifts are 0.005–0.014 nm.
+from `argmin` outward. The window is $r_0 \pm$ `MAX_LENGTH_SHIFT` $= 0.3$ Å — a
+tripwire, not a working range; real shifts are 0.05–0.14 Å.
 
 Layers 1 and 2 are coupled (moving $r_0$ changes the energy, rescaling $D$ changes
-the force), so `fit_template` ([fit/dissociation.py:975](fit/dissociation.py#L975))
+the force), so `fit_template` ([fast-forces `refine.py`](../../../fast-forces/src/fastforces/refine.py))
 alternates them `LENGTH_DEPTH_ROUNDS` $= 4$ times. The residual force falls
 1.5e-3 → 1.2e-4 → 1.9e-5 → 1.9e-6 eV/Å.
 
-**(3) Asymptote and stiffness — `fit_force_constants` ([fit/dissociation.py:1319](fit/dissociation.py#L1319)).**
+**(3) Asymptote and stiffness — `fit_force_constants` ([fast-forces `refine.py`](../../../fast-forces/src/fastforces/refine.py)).**
 A Powell search over one or two per-bond-type variables — the asymptote height
 $h$ in eV and the log force-constant scale — with layers 1 and 2 re-solved inside
 every objective evaluation. `mode` selects which blocks are free (`"asymptote"`,
@@ -1472,13 +1469,13 @@ sits. On HCombustion plain Morse ($h = $ `bond_asymptote` everywhere) makes 14 o
 all fissions, and the fitted $h$ moves their crossings from 2.1–2.4 Å in to
 1.8–2.0 Å.
 
-`ForceConstantFit` ([fit/dissociation.py:1043](fit/dissociation.py#L1043)) reports
+`ForceConstantFit` ([fast-forces `refine.py`](../../../fast-forces/src/fastforces/refine.py)) reports
 `terms`, `variables`, `scales` ($h$ in eV, or the $k$-scale in `mode="k"`), `k_scales`, `depths`,
 `curvatures`, and `margins` against `margins_before`. `BondVariable` is keyed
 **per template**, not shared across templates — H–O in water and H–O in HO₂ are
 separate variables.
 
-**`fit.py` is not idempotent.** Re-running it over already-fitted output moves the
+**`fast-forces refit` is not idempotent** (with `--force-constants`). Re-running it over already-fitted output moves the
 channel count on its own, so refit once from the previous state, and quote a
 regression only against a baseline produced by the same pipeline over the same
 inputs.
@@ -1565,8 +1562,8 @@ assembly.
 | Charge kernel, minimum-image and Ewald, `contract` | [forcefield/ewald.py](forcefield/ewald.py) |
 | Intramolecular exclusion derivation, and why Coulomb differs | [forcefield/exclusions.py](forcefield/exclusions.py) |
 | RMSD coupling | [forcefield/coupling.py](forcefield/coupling.py) |
-| Coupling fit ($A$, $a$) | [fit/coupling.py](fit/coupling.py) |
-| Depth, bond-length and force-constant fit | [fit/dissociation.py](fit/dissociation.py) |
+| Coupling fit ($A$, $a$) | [fast-forces `coupling.py`](../../../fast-forces/src/fastforces/coupling.py) |
+| Depth, bond-length and force-constant fit | [fast-forces `refine.py`](../../../fast-forces/src/fastforces/refine.py) |
 | Network, blocks, mappings | [core/reactionset.py](core/reactionset.py), [core/network.py](core/network.py), [core/reaction.py](core/reaction.py) |
 | Gradient verification | `tests/test_gradients.py` |
 | Virial / stress verification, symmetry, sign | `tests/test_stress.py` |
@@ -1576,7 +1573,7 @@ assembly.
 | Two halves of the LJ and ZBL decompositions agree | `tests/test_reference_energies.py`, `tests/test_gradients.py` |
 | Periodic kernel against values; splitting independence, charged weight | `tests/test_ewald.py` |
 | Dimer well, monomer charges, polarizability | `tests/test_water_structure.py` |
-| Fit solves and bounds | `tests/test_fit.py` |
+| Fit solves and bounds | fast-forces `tests/test_refine.py` |
 | Network fingerprint regression | `tests/test_get_network.py` |
 | Cache correctness | `tests/test_optimizations.py` |
 | Global parameters reach the force field; collisions refuse | `tests/test_params.py` |

@@ -28,12 +28,13 @@ another.
 
 ## The charges
 
-`fit_charges.py` fits them: Merz-Kollman ESP charges at the dataset's own level of
+fast-forces' `examples/datasets/Water-fixed-pc/fit_charges.py` fits them (on
+`fastforces.charges`): Merz-Kollman ESP charges at the dataset's own level of
 theory, each at its template's geometry, with the total constrained to the formal
 charge and the equivalent hydrogens averaged.  Relative RMS error of the fitted
 potential: H2O 0.19, H3O+ 0.016, OH- 0.031.  The free atoms carry zero.
 
-    uv run python datasets/Water-fixed-pc/fit_charges.py --write
+    uv run python examples/datasets/Water-fixed-pc/fit_charges.py ../DynamicTopo/datasets/Water-fixed-pc --write   # from ../fast-forces
 
 These are **gas-phase** charges.  The water dipole comes out at 1.94 D, against
 1.85 D experimental in the gas and 2.35 D for SPC/E, which is inflated on
@@ -47,7 +48,7 @@ point charges.  `lennardjones` and every bonded term are kept.
 
 ## What changed from `Water`, and what did not
 
-Refit once with `scripts/fit.py --force-constants`, starting from `Water`'s
+Refit once with `fast-forces refit --force-constants`, starting from `Water`'s
 fitted state.  The `k` values there are q-force's own, so one pass is the valid
 use.  The run finished at 3 of 3 channels, fastest mode 3667 cm^-1, 0 of 3 bond
 types over the 4400 cap, so still dt = 0.5 fs.

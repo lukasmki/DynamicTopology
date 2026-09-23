@@ -4,7 +4,7 @@ Six of HCombustion's nineteen channels change exactly one bond in one
 direction -- `rxn_05` (H2), `rxn_06` (O2), `rxn_07` (HO), `rxn_08` (H2O),
 `rxn_09` (HO2) and `rxn_15` (H2O2).  None of
 them has a saddle, and that used to mean none of them could be coupled: the
-`fit.coupling.fit_amplitude` route inverts a reference barrier, and for a
+fast-forces' `coupling.fit_amplitude` route inverts a reference barrier, and for a
 barrierless channel its discriminant `(Hbar - E)**2 - dH**2` vanishes
 identically, so a perfect diabat gives `A = 0` and every imperfection gives no
 real root at all.  `EVBBasis` drops a channel below `eps` before building its
@@ -18,7 +18,7 @@ these tests are about:
                               genuinely cross -- at 1.80 A for H2, 1.95 for OH,
                               1.93 for H2O, where each bond's fitted asymptote
                               `h` (not the global floor) puts them.
-  `fit.coupling.fit_twobody`  fits a Gaussian in the breaking bond's *length*,
+  fast-forces' `coupling.fit_twobody`  fits a Gaussian in the breaking bond's *length*,
                               centred on that crossing, so there is a real
                               off-diagonal for the ordinary gate to admit.
 
@@ -51,7 +51,7 @@ from DynamicTopology.system import System
 
 RSET_PATH = "datasets/HCombustion/HCombustion.json"
 
-# Where each fission's diabats cross, from `fit.coupling.find_crossing` -- the
+# Where each fission's diabats cross, from fast-forces' `coupling.find_crossing` -- the
 # `r0` written into the channel's own term file.  A refit is allowed to move
 # these; they are quoted so a scan can be aimed, not as a bar.
 #
@@ -204,7 +204,7 @@ class TestFission:
 
         Its two diabats disagreed by 0.385 eV at 10 A -- the O-H Morse is deeper
         in the H2O template than in the OH one, because
-        `fit.dissociation.fit_dissociation_energies` constrains each template's
+        fast-forces' `refine.fit_dissociation_energies` constrains each template's
         bond *sum* and never an individual asymptote -- so a degeneracy criterion
         was never going to fire, at any separation.  Raising the asymptote by more
         than that disagreement subsumes it: a cross-template offset can move the

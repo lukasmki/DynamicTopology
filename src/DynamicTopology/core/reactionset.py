@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 import networkx as nx
-from ase import Atoms, io, units
+from ase import Atoms, io
 from ase.io.formats import ioformats
 
 from .reaction import Reaction
@@ -14,6 +14,7 @@ from .topology import Topology
 from .network import ReactionNetwork
 
 from .types import Term
+from ..io.json import read_jsonl
 from ..forcefield.exclusions import with_exclusions
 from ..forcefield.params import ForceFieldParams, activate
 
@@ -29,7 +30,7 @@ def _reference_term(atoms: Atoms, terms: list[Term]) -> Term | None:
 
     Diabatic states are compared by their absolute energies, so every bonding
     topology has to be measured from the same zero.  The dataset supplies that
-    zero: `scripts/compute.py` writes an atomization energy per template (eV,
+    zero: `fast-forces label` writes an atomization energy per template (eV,
     referenced to free atoms, hence exactly 0 for a free atom).  Morse bonds
     already account for -sum(D) of it at the minimum, so the part the force
     field cannot reproduce is the residual
@@ -53,10 +54,10 @@ def _reference_term(atoms: Atoms, terms: list[Term]) -> Term | None:
     except (RuntimeError, AttributeError):
         return None
 
-    sum_d = sum(  # kJ/mol
+    sum_d = sum(  # eV
         term["kwargs"]["D"] for term in terms if term["type"] == "bond"
     )
-    e0 = e_atomization / (units.kJ / units.mol) + sum_d  # kJ/mol
+    e0 = e_atomization + sum_d  # eV
 
     # Anchored on atom 0 purely so the term has an index to be remapped through
     # when the template is matched onto the live system; the energy belongs to
@@ -170,8 +171,8 @@ class ReactionSetData:
                 atoms: Atoms | list[Atoms] = io.read(data_path)
             else:  # try to read as xyz
                 atoms: Atoms | list[Atoms] = io.read(data_path.with_suffix(".xyz"))
-            with open(data_path.with_suffix(".jsonl"), "r") as fp:
-                terms: list[Term] = [json.loads(term) for term in fp.readlines()]
+            # nm and kJ/mol on disk, Angstrom and eV from here on.
+            terms: list[Term] = read_jsonl(data_path.with_suffix(".jsonl"))
 
             assert isinstance(atoms, Atoms)
             # Intramolecular nonbonded exclusions, derived here rather than
@@ -202,8 +203,7 @@ class ReactionSetData:
                     data_path.with_suffix(".xyz"), index=":"
                 )
 
-            with open(data_path.with_suffix(".jsonl"), "r") as fp:
-                terms: list[Term] = [json.loads(term) for term in fp.readlines()]
+            terms: list[Term] = read_jsonl(data_path.with_suffix(".jsonl"))
 
             data.add_reaction(Reaction.from_atoms(atoms, terms))
 
@@ -286,7 +286,7 @@ class ReactionSet:
             "neither the reactant nor the product and has no diabatic template "
             "by construction -- if this frame is a transition state, score it "
             "under an endpoint's connectivity instead (see "
-            "`fit.dissociation.diabatic_energy`). Otherwise the species is "
+            "fast-forces' `refine.diabatic_energy`). Otherwise the species is "
             "genuinely missing and belongs in the dataset manifest."
         )
 

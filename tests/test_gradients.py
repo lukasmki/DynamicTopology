@@ -16,6 +16,7 @@ from DynamicTopology.forcefield.pointcharge import PointCharge
 from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.lj import LennardJones
 from DynamicTopology.forcefield.zbl import ZBL
+from DynamicTopology.io.units import from_disk
 from DynamicTopology.forcefield import zbl as zbl_module
 
 from geometry import REACTION, REACTION_PATH_RAMP, reaction_path
@@ -42,12 +43,20 @@ def finite_difference_forces(energy_fn, pos, delta=DELTA):
 
 
 def make_term(term_type, atoms_rows, **kwargs):
-    """Build a term_dict in the format expected by QForce/ACKS2 __call__."""
+    """Build a term_dict in the format expected by QForce/ACKS2 __call__.
+
+    `kwargs` are stated as a `.jsonl` row states them -- nm and kJ/mol, the
+    units q-force emits -- and converted through `io.units.from_disk`, the same
+    path a dataset's parameters take on load.  So the literals below are
+    recognisable q-force numbers, and the conversion is exercised rather than
+    bypassed.
+    """
     return {
         term_type: {
             "atoms": np.array(atoms_rows, dtype=int),
             "kwargs": {
-                k: np.atleast_1d(np.asarray(v, dtype=float)) for k, v in kwargs.items()
+                k: from_disk(term_type, k, np.atleast_1d(np.asarray(v, dtype=float)))
+                for k, v in kwargs.items()
             },
         }
     }
@@ -120,8 +129,8 @@ class TestQForceGradients:
         { term_type: { "atoms": np.ndarray (n_terms, n_cols),
                        "kwargs": { param: np.ndarray (n_terms,) } } }
 
-    Positions are in Angstrom; QForce converts to nm internally.
-    Returned forces are in eV/Å.
+    Positions are in Angstrom, parameters in eV and Angstrom (see `make_term`),
+    and returned forces in eV/Å.
     """
 
     qf = QForce()
@@ -154,9 +163,10 @@ class TestQForceGradients:
         inflection, where the two dependences stop cancelling.
         """
         td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0], h=[h])
-        al = np.sqrt(251200.0 / (2 * (436.0 + h)))
+        al = np.sqrt(251200.0 / (2 * (436.0 + h)))  # 1/nm
         for s in (-1.0, 0.0, 0.5, 1.5, 3.0, 6.0):
-            pos = np.array([[0.0, 0.0, 0.0], [0.07772 + s / al, 0.0, 0.0]])
+            # `s` Morse lengths from r0, in nm, placed in Angstrom.
+            pos = np.array([[0.0, 0.0, 0.0], [10.0 * (0.07772 + s / al), 0.0, 0.0]])
             self._check(pos, td)
 
     def test_bond_morse_asymptote_defaults_to_global(self):
@@ -164,11 +174,14 @@ class TestQForceGradients:
         kwargs = dict(r0=[0.07772], k=[251200.0], D=[436.0])
         plain = make_term("bond", [[0, 1]], **kwargs)
         stated = make_term(
-            "bond", [[0, 1]], h=[active().bond_asymptote_kjmol], **kwargs
+            "bond",
+            [[0, 1]],
+            h=[active().bond_asymptote / (units.kJ / units.mol)],
+            **kwargs,
         )
         qf = QForce()
-        for offset in (-0.02, 0.0, 0.05, 0.2, 3.0):
-            pos = np.array([[0.0, 0.0, 0.0], [0.07772 + offset, 0.0, 0.0]])
+        for offset in (-0.2, 0.0, 0.5, 2.0, 30.0):  # Angstrom
+            pos = np.array([[0.0, 0.0, 0.0], [0.7772 + offset, 0.0, 0.0]])
             assert qf(pos, PBC, CELL, plain)[0] == pytest.approx(
                 qf(pos, PBC, CELL, stated)[0], abs=1e-12
             )
@@ -208,7 +221,7 @@ class TestQForceGradients:
         # over the free-fragment limit rather than on it -- that offset is what
         # makes a bonded diabat cross its own fragments' instead of converging to
         # them.  Harmonic has no asymptote at all, which is the point here.
-        assert e_morse <= active().bond_asymptote_kjmol * units.kJ / units.mol
+        assert e_morse <= active().bond_asymptote
 
     def test_reference(self):
         """Constant per-molecule reference shift contributes energy but no force."""
@@ -701,11 +714,11 @@ class TestZBLGradients:
         The counterpart of `TestLennardJonesGradients.test_exclusion`, and the
         one of the two that carries the physics: tapered ZBL is 5.2-5.5 eV at an
         O-H bond length where the switched 12-6 is 1e-3.  It is also the one
-        with a unit trap in it -- `zbl.pair_potential` works in eV and Angstrom
-        while `QForce` works in kJ/mol and nm -- so a wrong conversion here is a
-        force that is out by a constant factor and conservative anyway, which
-        finite differences against the same method would never catch.  These
-        run against `ZBL` itself in `test_the_two_forms_cancel`.
+        that used to carry a unit trap -- `QForce` worked in kJ/mol and nm while
+        `zbl.pair_potential` works in eV and Angstrom -- and a wrong conversion
+        there is a force out by a constant factor and conservative anyway, which
+        finite differences against the same method would never catch.  So these
+        also run against `ZBL` itself in `test_the_two_forms_cancel`.
         """
         n = len(positions)
         numbers = np.array([8.0 if i % 2 == 0 else 1.0 for i in range(n)])

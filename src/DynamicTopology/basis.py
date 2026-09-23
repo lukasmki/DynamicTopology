@@ -129,7 +129,7 @@ def _canonical(key: StateKey) -> tuple:
 def _is_placeholder(reaction: Reaction) -> bool:
     """Whether this reaction's coupling amplitude was never fitted.
 
-    Prefers the explicit `provenance` key `scripts/fit.py` writes; falls back to
+    Prefers the explicit `provenance` key `fast-forces refit` writes; falls back to
     recognising the shipped placeholder amplitude for term files predating it.
     """
     for term in reaction.terms:
@@ -494,7 +494,7 @@ class EVBBasis:
         Channels are grouped by reaction template because that is what makes the
         batch well shaped: one template fixes the fragment size and the
         transition-state ensemble, so every channel of a template superposes the
-        same number of atoms onto the same reference and `_kabsch` can take them
+        same number of atoms onto the same reference and `kabsch` can take them
         in one stack.
 
         Row k of the live geometry is compared against row k of the stored
@@ -653,7 +653,7 @@ class EVBBasis:
             # dominant cost of the closure and each one is a superposition of a
             # handful of atoms onto a template, so evaluating them one at a time
             # spends nearly all of its time in fixed per-call overhead; see
-            # `forcefield.coupling._kabsch`.
+            # `forcefield.coupling.kabsch`.
             channels = []
             for reaction, mapping in self._reactions(parent, bimol_cutoff):
                 broken, formed = reaction.edge_changes(mapping)
@@ -703,7 +703,7 @@ class EVBBasis:
                 # what made H2, OH and H2O unable to come apart at all.  The fix
                 # was a separate admission route that offered the product past a
                 # bare distance prescreen with no off-diagonal; it is gone
-                # because `fit.coupling.fit_twobody` asks the fission a question
+                # because fast-forces' `coupling.fit_twobody` asks the fission a question
                 # it can answer, fitting a Gaussian in the breaking bond's length
                 # centred on the crossing of its two diabats.  At a crossing the
                 # diabats are degenerate, so `stab = |V|`, and a Gaussian centred

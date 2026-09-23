@@ -50,7 +50,7 @@ DEFAULT_INTERVAL = 5  # steps between trajectory frames
 #     dt_max [fs]  =  33356 / (15 * nu [cm^-1])
 #
 # Check it against the fit's report, which prints the fastest mode and this
-# quotient directly -- `scripts/fit.py --force-constants` ends with a
+# quotient directly -- `fast-forces refit --force-constants` ends with a
 # "fastest mode ... -> N fs at 15 steps/period" line.  Do not carry a timestep
 # across a refit without re-reading it; a refit moves the frequencies by
 # factors of two to four and this number with them.

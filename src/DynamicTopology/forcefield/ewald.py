@@ -35,15 +35,17 @@ but it *does* interact with its own images, and that is the diagonal `K_ii`
 below -- a term with no counterpart in the open-boundary kernel, carried on the
 diagonal of the ACKS2 matrix alongside the atomic hardness.
 
-**Charge neutrality is assumed, not enforced here.**  The `k = 0` term of the
-reciprocal sum is the divergent one; regularizing it against a neutralizing
-background leaves a constant `-pi / (V kappa^2)` in every entry of `K`.  Adding
-any constant to every entry of `K` changes the energy by that constant times
-`(sum_i q_i)^2` and the ACKS2 rows by that constant times `sum_i q_i`, so with
-`sum_i q_i = 0` -- which `ACKS2.build_system` imposes as a hard constraint -- it
-drops out of the energy, the forces, the virial and the solved charges alike.
-It is therefore omitted.  A charged system would need it back, and would need a
-physical justification for what the compensating background is.
+**The `k = 0` term is dropped and its neutralizing background put back.**  The
+`k = 0` term of the reciprocal sum is the divergent one; regularizing it against
+a neutralizing background leaves a constant `-pi / (V kappa^2)` in every entry
+of `K`, carried as `background` and added to every entry.  Adding any constant
+to every entry of `K` changes the energy by that constant times
+`(sum_i q_i)^2` and the ACKS2 rows by that constant times `sum_i q_i`, so for a
+neutral contraction -- which `ACKS2.build_system` imposes as a hard constraint --
+it drops out of the energy, the forces, the virial and the solved charges alike,
+and it was once omitted on those grounds.  It is carried because a Coulomb
+exclusion contracts `K` against a *non*-neutral weight and needs the entries
+themselves, which without it drifted with `kappa`.
 
 **Only the Coulomb block is summed over images.**  ACKS2's other
 geometry-dependent block, the bond softness, decays as `exp(-r / tau)` with

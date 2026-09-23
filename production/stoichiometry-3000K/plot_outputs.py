@@ -44,13 +44,29 @@ INK_MUTED = "#52514e"
 GRID = "#e6e5e1"
 
 
-def read_log(path: Path) -> tuple[dict, list[dict]]:
-    """One run's header and frames.  A truncated last line is skipped.
+def read_log(path: Path) -> tuple[dict, list[dict], int]:
+    """One run's first header, its frames on one continuous clock, and its restarts.
 
-    A job still writing -- or killed mid-write -- leaves a partial record, and
-    every run in this sweep is currently in that state.
+    A job still writing -- or killed mid-write -- leaves a partial record, which
+    is skipped.
+
+    `nvt.py --restart` appends to the same log, and the continued segment counts
+    `step` and `time_fs` from zero again.  Each segment is therefore shifted to
+    start where the previous one stopped.  The restart is detected from the step
+    going backwards rather than from its header: a job killed mid-write leaves
+    a partial line with no newline, the appended header lands on that same line,
+    and the header is lost along with the fragment.
+
+    The restart resumes from the trajectory's last frame, and `nvt.py` writes
+    the trajectory before the log.  Normally that frame is also the log's last,
+    so the restarted segment's step 0 repeats it and is dropped.  If the log
+    line for it was cut short, step 0 is the only record of that frame, so it is
+    kept, one logging interval after the last complete frame.
     """
     header, frames = {}, []
+    restarts = 0
+    offset_step, offset_time = 0, 0.0
+    partial = False  # was a record lost since the last complete frame?
     with path.open() as handle:
         for line in handle:
             line = line.strip()
@@ -59,12 +75,31 @@ def read_log(path: Path) -> tuple[dict, list[dict]]:
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
+                partial = True
                 continue
             if record.get("record") == "header":
-                header = record
+                header = header or record
             elif record.get("record") == "frame":
+                if frames and record["step"] + offset_step <= frames[-1]["step"]:
+                    restarts += 1
+                    last = frames[-1]
+                    if partial and len(frames) > 1:
+                        # The lost frame sits one interval past the last kept one.
+                        offset_step = 2 * last["step"] - frames[-2]["step"]
+                        offset_time = 2 * last["time_fs"] - frames[-2]["time_fs"]
+                    else:
+                        offset_step, offset_time = last["step"], last["time_fs"]
+                        if record["step"] == 0:
+                            partial = False
+                            continue  # duplicate of `last`
+                record = {
+                    **record,
+                    "step": record["step"] + offset_step,
+                    "time_fs": record["time_fs"] + offset_time,
+                }
                 frames.append(record)
-    return header, frames
+                partial = False
+    return header, frames, restarts
 
 
 def ratio_key(ratio: str) -> float:
@@ -121,7 +156,7 @@ def load_runs(directory: Path) -> dict[str, list[dict]]:
     """Every run under `directory`, grouped by composition and sorted by seed."""
     groups: dict[str, list[dict]] = {}
     for log in sorted(directory.glob("*/log.jsonl")):
-        header, frames = read_log(log)
+        header, frames, restarts = read_log(log)
         if not frames:
             print(f"  (no frames yet: {log.parent.name})")
             continue
@@ -148,6 +183,7 @@ def load_runs(directory: Path) -> dict[str, list[dict]]:
                 "temperature": statistics.mean(f["temperature_K"] for f in frames),
                 "target_K": config.get("temperature", header.get("temperature_K")),
                 "steps_done": frames[-1]["step"],
+                "restarts": restarts,
                 "steps_planned": config.get("steps", header.get("steps")),
                 "channels": sorted(
                     {c for f in frames for c in f.get("placeholder_channels", [])}
@@ -388,6 +424,12 @@ def main() -> int:
             if targets == {3000.0}
             else "  <- config.json disagrees with the sweep's 3000 K name"
         )
+    )
+
+    restarted = [r["run"] for runs in groups.values() for r in runs if r["restarts"]]
+    print(
+        f"  restarted runs, stitched onto one clock: "
+        f"{', '.join(restarted) if restarted else 'none'}"
     )
 
     capped = sum(r["capped"] for runs in groups.values() for r in runs)

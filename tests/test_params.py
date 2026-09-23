@@ -63,7 +63,7 @@ def _isolate_active():
     load in the session raise.  **In**, because the reverse is also true -- any
     earlier test module that loaded a dataset has left that dataset's parameters
     active and attributed, and the tests below activate their own; run after
-    `tests/test_fit.py` they would collide with HCombustion rather than with
+    `tests/test_dissociation.py` they would collide with HCombustion rather than with
     each other, and pass or fail depending on collection order.
     """
     before = active()
@@ -88,7 +88,7 @@ class TestTheDefaults:
         assert DEFAULTS.bond_asymptote == 1.0
         assert DEFAULTS.taper_radius == 1.5
         assert DEFAULTS.taper_width == 0.12
-        assert DEFAULTS.switch_radius == 0.22
+        assert DEFAULTS.switch_radius == 2.2
         assert DEFAULTS.core_fraction == 0.4
         assert DEFAULTS.exclusion_depth == 3
         assert DEFAULTS.exclude_coulomb is True
@@ -98,29 +98,16 @@ class TestTheDefaults:
         assert DEFAULTS.zbl_ccoul == 14.399645
         assert DEFAULTS.electrostatics == "acks2"
 
-    def test_the_asymptote_converts_to_qforce_units(self):
-        """1 eV, read in kJ/mol, is 96.485 -- not 1.
-
-        `QForce` and `fit/dissociation.py` add this straight onto a fitted depth
-        in kJ/mol.  Getting the conversion wrong is a factor of 96.5 on a
-        quantity the README documents as 1 eV, which is why it is a property
-        here rather than a multiplication at five call sites.
-        """
-        assert DEFAULTS.bond_asymptote_kjmol == pytest.approx(96.4853329, abs=1e-6)
-        assert ForceFieldParams(bond_asymptote=2.0).bond_asymptote_kjmol == (
-            pytest.approx(2.0 * DEFAULTS.bond_asymptote_kjmol)
-        )
-
     def test_the_switch_width_follows_the_taper_width(self):
-        """The same physical width in two modules' units, so one number sets both.
+        """One sharpness for both switches, so one number sets both.
 
-        0.12 A is 0.012 nm; the factor of ten is the unit conversion and not a
-        second decision.  A dataset that sharpens ZBL's taper and forgets the
-        12-6's switch would otherwise get two switches of different sharpness
-        without asking for them.
+        A dataset that sharpens ZBL's taper and forgets the 12-6's switch would
+        otherwise get two switches of different sharpness without asking for
+        them.  (It was `taper_width / 10` while the 12-6 was evaluated in nm --
+        the same width in the other unit.)
         """
-        assert DEFAULTS.switch_width == pytest.approx(0.012)
-        assert ForceFieldParams(taper_width=0.3).switch_width == pytest.approx(0.03)
+        assert DEFAULTS.switch_width == pytest.approx(0.12)
+        assert ForceFieldParams(taper_width=0.3).switch_width == pytest.approx(0.3)
         # Stated explicitly, the derivation is out of the way.
         explicit = ForceFieldParams(taper_width=0.3, switch_width=0.005)
         assert explicit.switch_width == pytest.approx(0.005)
@@ -134,7 +121,7 @@ class TestTheDefaults:
         """
         params = ForceFieldParams(taper_radius=1.7, taper_width=0.2)
         assert ForceFieldParams.from_dict(params.to_dict()) == params
-        assert params.to_dict()["switch_width"] == pytest.approx(0.02)
+        assert params.to_dict()["switch_width"] == pytest.approx(0.2)
 
 
 class TestTheManifest:
@@ -148,7 +135,7 @@ class TestTheManifest:
     def test_both_datasets_pin_the_values_their_jsonl_was_fitted_at(self):
         """The two manifests must agree, or the suite cannot load both.
 
-        Not a style rule: `fit/dissociation.py` solved every `.jsonl` in both
+        Not a style rule: the fit (fast-forces' `refine`) solved every `.jsonl` in both
         datasets against `E_bonded + E_nonbonded`, and every constant below sits
         inside that sum.  Two datasets disagreeing about one of them is two
         different force fields.
@@ -248,7 +235,7 @@ class TestActivation:
         default exists to prevent, arriving through the override path.
         """
         with use(taper_width=0.5) as params:
-            assert params.switch_width == pytest.approx(0.05)
+            assert params.switch_width == pytest.approx(0.5)
         # Stated together, the caller gets what it asked for.
         with use(taper_width=0.5, switch_width=0.001) as params:
             assert params.switch_width == pytest.approx(0.001)
@@ -305,15 +292,15 @@ class TestTheParametersReachTheForceField:
     def test_the_switch_radius_reaches_the_12_6(self):
         """Moving the switch out turns the 12-6 off where it was on.
 
-        2.4 A (0.24 nm) is outside the default switch and inside a 0.4 nm one,
-        and it is one of the contacts the term exists to supply -- 0.220 eV of
-        wall by the table in `params.ForceFieldParams.switch_radius`.
+        2.4 A is outside the default switch and inside a 4 A one, and it is one
+        of the contacts the term exists to supply -- 0.220 eV of wall by the
+        table in `params.ForceFieldParams.switch_radius`.
         """
-        r = np.array([0.24])
-        sigma = np.array([0.3])
+        r = np.array([2.4])
+        sigma = np.array([3.0])
         eps = np.array([0.5])
         on = lj_module.pair_potential(r, sigma, eps)[0][0]
-        with use(switch_radius=0.4):
+        with use(switch_radius=4.0):
             off = lj_module.pair_potential(r, sigma, eps)[0][0]
         assert abs(on) > 1e-3
         assert abs(off) < abs(on) / 100.0
@@ -325,8 +312,8 @@ class TestTheParametersReachTheForceField:
         moves the hand-over out, so a separation that was on the `r**-12` branch
         is now on the tangent and reads lower.
         """
-        r = np.array([0.15])
-        sigma = np.array([0.3])
+        r = np.array([1.5])
+        sigma = np.array([3.0])
         eps = np.array([0.5])
         with use(switch_radius=0.0, core_fraction=0.4):
             default = lj_module.pair_potential(r, sigma, eps)[0][0]
@@ -337,17 +324,16 @@ class TestTheParametersReachTheForceField:
     def test_the_bond_asymptote_reaches_the_morse(self):
         """The dissociated limit of a stretched bond is the asymptote itself.
 
-        In q-force's kJ/mol, which is the unit trap: a site reading the eV field
-        directly would land 96.5 times low and this asserts the number, not just
-        that it moved.
+        Asserts the number, not just that it moved: a site reading the asymptote
+        in the wrong unit would land 96.5 times off.
         """
         term_dict = {
             "bond": {
                 "atoms": np.array([[0, 1]]),
                 "kwargs": {
-                    "D": np.array([436.0]),
-                    "r0": np.array([0.07772]),
-                    "k": np.array([251200.0]),
+                    "D": np.array([4.52]),
+                    "r0": np.array([0.7772]),
+                    "k": np.array([26.035]),
                 },
             }
         }
@@ -363,10 +349,10 @@ class TestTheParametersReachTheForceField:
             "bond": {
                 "atoms": np.array([[0, 1]]),
                 "kwargs": {
-                    "D": np.array([436.0]),
-                    "r0": np.array([0.07772]),
-                    "k": np.array([251200.0]),
-                    "h": np.array([2.5 * DEFAULTS.bond_asymptote_kjmol]),
+                    "D": np.array([4.52]),
+                    "r0": np.array([0.7772]),
+                    "k": np.array([26.035]),
+                    "h": np.array([2.5 * DEFAULTS.bond_asymptote]),
                 },
             }
         }
@@ -403,14 +389,14 @@ class TestTheParametersReachTheForceField:
         """`System`, `EVBSystem` and the fitter all resolve the term per call.
 
         A template carrying both parameter sets scores differently under each,
-        through `fit.dissociation.nonbonded_energy` -- the sum every `.jsonl` is
-        solved against, so a site that ignored the switch would fit a dataset
-        to the wrong electrostatics.
+        through `forcefield.evaluate` -- the single-topology sum fast-forces fits
+        every `.jsonl` against, so a site that ignored the switch would fit a
+        dataset to the wrong electrostatics.
         """
         from ase import Atoms
 
-        from DynamicTopology.fit.dissociation import nonbonded_energy
         from DynamicTopology.forcefield.electrostatics import Electrostatics
+        from DynamicTopology.forcefield.evaluate import evaluate_term_dict
         from DynamicTopology.forcefield.pointcharge import PointCharge
 
         term_dict = {
@@ -435,10 +421,10 @@ class TestTheParametersReachTheForceField:
         atoms = Atoms("OH", positions=[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], cell=CELL)
         electrostatics = Electrostatics()
         assert isinstance(electrostatics.get(), ACKS2)
-        equilibrated = nonbonded_energy(atoms, term_dict)
+        equilibrated = evaluate_term_dict(atoms, term_dict).energy
         with use(electrostatics="pointcharge"):
             assert isinstance(electrostatics.get(), PointCharge)
-            fixed = nonbonded_energy(atoms, term_dict)
+            fixed = evaluate_term_dict(atoms, term_dict).energy
         # ZBL and the 12-6 are common to both, so the whole difference is the
         # electrostatics: an ion pair 2 A apart, -14.4 * erf(4) / 2 = -7.2 eV,
         # against ACKS2's fractional charges.

@@ -46,7 +46,7 @@ discontinuity at the bimolecular cutoff -- not "does not", cannot.  Each of the
 four previous failures lived in the degree of freedom this removes.
 
 The same property means it cancels exactly out of every energy *difference*,
-including the diabatic margins `fit/dissociation.py` scores channels on.  It
+including the diabatic margins fast-forces' `refine` scores channels on.  It
 buys stability and it buys nothing at all for fittability; that work belongs to
 the bonded fit.
 
@@ -63,7 +63,7 @@ against the 12-6 it replaces:
     O-H   0.600  the observed fusion    2.6e5 eV  20.9 eV
 
 It is applied to bonded pairs too, since it knows nothing about bonds.  Those
-values are absorbed by the fitted Morse depths -- `fit/dissociation.py` solves
+values are absorbed by the fitted Morse depths -- fast-forces' `refine` solves
 against `E_QForce + E_nonbonded`, and this term is part of `E_nonbonded` -- so a
 template still reproduces its own reference atomization energy.  O2 is the
 stress case: +11.6 eV and +36.6 eV/A at its own bond length.
@@ -111,15 +111,15 @@ fraction `f(r)`:
 
 The first three are the ones absorbed into the fitted Morse depths, and they are
 nearly untouched -- which is why this change is a refit rather than a rebuild.
-**It is still a refit.**  `fit/dissociation.py` solves against
+**It is still a refit.**  fast-forces' `refine` solves against
 `E_QForce + E_nonbonded` with this term inside `E_nonbonded`, so every `.jsonl`
 in every dataset was fitted against the untapered form and has to be regenerated
-by `scripts/fit.py` after any change to the two constants below.
+by `fast-forces refit` after any change to the two constants below.
 
 **And the refit is not free, though the bill lands on HCombustion rather than on
 water.**  A transition state is where close intermolecular contacts are, and so
 where the removed tail was largest, which means the taper lowers the diabats at
-exactly the geometries `fit.coupling` inverts the secular equation at.
+exactly the geometries fast-forces' `coupling` inverts the secular equation at.
 HCombustion went from 14 of 19 fittable channels to **12** -- rxn_06, rxn_11 and
 rxn_16 are now decoupled, and two of those three had margins under 0.1 eV before
 it.  `--frequency-weight` at 200x the default buys none of them back, so this is
@@ -248,7 +248,7 @@ def pair_potential(
     du_dr = k * (dphi_dx / (a * r) - phi / r**2)
 
     # Product rule, and it has to be applied here rather than in `__call__`:
-    # everything downstream -- the forces, the virial, `fit/dissociation.py`'s
+    # everything downstream -- the forces, the virial, fast-forces' `refine`'s
     # curvatures -- differentiates whatever this function returns, so the
     # switch and its derivative have to travel together or the analytic
     # gradients silently stop matching the energy.

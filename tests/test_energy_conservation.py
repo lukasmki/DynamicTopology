@@ -647,7 +647,7 @@ class TestDissociationConservation:
     speed contributes error that falls off like `dt` rather than `dt**2`.  The
     dissociation case was therefore exempted from `assert_converges_with_timestep`
     -- at ratios 1.89 and 3.33 against a tolerance of 3.5 -- with the note that a
-    fitted coupling would smooth it.  `fit.coupling.fit_twobody` is that coupling,
+    fitted coupling would smooth it.  fast-forces' `coupling.fit_twobody` is that coupling,
     and it did:
 
         recombination, 0.003 eV inward     drift ratios 4.02, 4.01

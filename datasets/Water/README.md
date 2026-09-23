@@ -22,7 +22,7 @@ were fitted at -- the two taper radii and widths, `core_fraction`,
 `exclusion_depth`, `exclude_coulomb`, `bond_asymptote` and `gamma`.  They are the
 repository defaults, written out rather than left implicit so that a later change
 to a default cannot invalidate these `.jsonl` files without a diff saying so.
-Changing one means re-running `scripts/fit.py --force-constants` here; see
+Changing one means re-running `fast-forces refit --force-constants` here; see
 `forcefield/README.md` for the table and the units.
 
 All three are **atom transfers**, so all three carry a `threebody` coupling: a
@@ -36,7 +36,7 @@ that preceded it -- they come from inverting each channel's reference barrier an
 that arithmetic is untouched -- and the widths are not comparable between the two,
 `a` having changed units of meaning from RMSD-squared to this `g`.
 
-**None of the three is a bond fission**, so none uses `fit.coupling.fit_twobody`:
+**None of the three is a bond fission**, so none uses fast-forces' `coupling.fit_twobody`:
 each breaks one bond and forms another, with a real saddle and a real reference
 barrier between two real diabats.  `h2o-autoionization` could not use a
 crossing-centred fit even in principle -- its two diabats never cross along the
@@ -57,7 +57,7 @@ merged with a radical-chemistry set that needs the neutral OH.
 It is also why there is no O-H homolysis channel.  `h` and `o` are carried only
 so an atom that ends up isolated during MD still has a template.
 
-This is also why `fit.coupling.fit_twobody` is not used anywhere in this set even
+This is also why fast-forces' `coupling.fit_twobody` is not used anywhere in this set even
 though it exists for exactly that kind of channel.  A homolysis here would have to
 be written `H2O -> OH- + H`, which does not conserve electrons (10 -> 10 + 1) and
 would break the bookkeeping the next section depends on.  Adding one needs the
@@ -79,13 +79,21 @@ electron affinity that sets the autoionization energy is badly underconverged.
 
 ## Provenance
 
+Every step is a fast-forces command, run from the fast-forces checkout
+(`../fast-forces`); this repository only loads the result.
+
 ```sh
-uv run python datasets/Water/make_water.py           # geometries only
+uv run python examples/datasets/Water/make_water.py ../DynamicTopo/datasets/Water   # geometries only
 # then, per file, with the charge/spin in the table above:
-uv run python scripts/compute.py -i <f>.xyz -o <f>.xyz -c <q> -s <s> \
+uv run fast-forces label -i <f>.xyz -o <f>.xyz -c <q> -s <s> \
     -b aug-cc-pvtz --atom-cache atoms.json
-uv run python scripts/fit.py -r datasets/Water/Water.json --force-constants
+uv run fast-forces refit ../DynamicTopo/datasets/Water/Water.json --force-constants
 ```
+
+The manifest's `fit_config` block is fast-forces' too: `fast-forces
+../DynamicTopo/datasets/Water/Water.json` would instead fit every template from
+scratch from its SMILES against the reference calculator it names.  Nothing here
+reads that block.
 
 Geometry sources, all literature/symmetry rather than optimized here (there is
 no geometry optimizer in this environment):
@@ -93,7 +101,8 @@ no geometry optimizer in this environment):
 - `h2o` 0.9584 A / 104.45 deg; `h3o` 0.976 A / 111.8 deg C3v; `h1o` 0.964 A.
 - Reaction frames are laid out with both oxygens on the x axis and the
   transferring proton on that axis, so a frame is fully specified by the O-O
-  distance and where the proton sits along it.  See `make_water.py`.
+  distance and where the proton sits along it.  See fast-forces'
+  `examples/datasets/Water/make_water.py`.
 - The two hops hold their **reactant** frames at 2.75 / 2.70 A rather than at the
   2.4 A where the symmetric Zundel and H3O2- are the gas-phase global minima.
   At contact there is no barrier at all, so a reactant frame placed there is not
@@ -121,7 +130,7 @@ Term sources:
   hold.
 
   **`sigma_O` needs no refit and the other three do.**  `eta` and `sigma_H` are
-  inside the `E_nonbonded` that `fit/dissociation.py` solves against, so they
+  inside the `E_nonbonded` that fast-forces' `refine` solves against, so they
   invalidate every Morse `D` and `r0` here.  `sigma_O` does not: with `sigma_H`
   zero and one oxygen per template, the intramolecular 12-6 is identically zero
   on every molecule in this dataset, so `sigma_O` is invisible to the fit target
@@ -129,7 +138,7 @@ Term sources:
   it would not hold for a template with two oxygens.
 - `h`, `o`: byte-identical to HCombustion `mol_08` / `mol_07`.
 - `h1o`, `h2o`: HCombustion `mol_03` / `mol_04` q-force terms, re-referenced to
-  this dataset's energies by `fit.py --force-constants`.
+  this dataset's energies by `fast-forces refit --force-constants`.
 - `h3o`: **by analogy to `h2o`**, and the weakest link in the set.  Angle and
   cross-term force constants are H2O's; `theta0` carries H2O's +2.73 deg q-force
   offset onto H3O+'s 111.8; the Morse `k` is H2O's and `r0` is solved against
@@ -323,13 +332,13 @@ coordinates; on `threebody` it multiplies `g`, a sum of three squared side-lengt
 deviations of one triangle.  The fitted values happen to fall by 5-14x, but the
 metrics differ, and a wider-looking `a` on a narrower metric can be a tighter
 coupling.  What *is* comparable is the amplitude, and it is unchanged to every
-digit: `fit.coupling.fit_threebody` reuses `fit_amplitude` verbatim, because the
+digit: fast-forces' `coupling.fit_threebody` reuses `fit_amplitude` verbatim, because the
 transition state is still where `V = A`.
 
 To reproduce the RMSD-width fit for comparison:
 
 ```sh
-uv run python scripts/fit.py -r datasets/Water/Water.json --rmsd-width
+uv run fast-forces refit ../DynamicTopo/datasets/Water/Water.json --rmsd-width
 ```
 
 ## Note on the degenerate channels

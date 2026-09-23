@@ -11,7 +11,7 @@ atomization energy of -9.8735: 25% overbound, through 104 passing tests.
 
 So this file compares against the dataset instead of against the code.  The
 reference energies live on the `.xyz` frames themselves (written by
-`scripts/compute.py`), which makes the comparison free and leaves no room to
+`fast-forces label`), which makes the comparison free and leaves no room to
 disagree about what the target is.
 
 Two failure modes are deliberately kept apart, because they have nothing to do
@@ -35,7 +35,8 @@ from ase import Atoms, io, units
 
 from DynamicTopology.ase import DynamicTopology
 from DynamicTopology.core import ReactionSet, Topology
-from DynamicTopology.forcefield.lj import LennardJones, with_exclusions
+from DynamicTopology.forcefield.exclusions import with_exclusions
+from DynamicTopology.forcefield.lj import LennardJones
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.io.json import read_jsonl
 
@@ -83,6 +84,49 @@ def evaluate(atoms: Atoms, reaction_set: ReactionSet) -> tuple[float, dict]:
     """Total energy and diagnostics through the public calculator path."""
     atoms.calc = DynamicTopology(atoms, reaction_set)
     return atoms.get_potential_energy(), atoms.calc.diagnostics
+
+
+def _bond_curvatures(frame, terms) -> list[float]:
+    """Total `d2E/dr2` along each bond type, in eV/A**2, in first-seen order.
+
+    Measured on the assembled force field -- `forcefield.evaluate`, so the
+    nonbonded terms and their exclusions are in it -- by displacing each bond's
+    second atom along the bond and differencing the force on it, averaged over
+    the bonds of a type (identical `(r0, k)`).  The step is small because a
+    Morse bond at its `r0` straddles the one-sided asymptote's join, whose third
+    derivative jumps.  This is the number a stretching mode's timestep follows.
+    """
+    from DynamicTopology.forcefield.evaluate import evaluate
+
+    step = 1e-4
+    order: list[tuple[float, float]] = []
+    totals: dict[tuple[float, float], list[float]] = {}
+    for term in terms:
+        if term["type"] != "bond":
+            continue
+        key = (term["kwargs"]["r0"], term["kwargs"]["k"])
+        if key not in totals:
+            order.append(key)
+            totals[key] = []
+        i, j = term["atoms"].values()
+        unit = frame.positions[j] - frame.positions[i]
+        unit = unit / np.linalg.norm(unit)
+
+        def pull(delta, j=j, unit=unit):
+            moved = frame.copy()
+            moved.calc = None
+            moved.positions[j] = moved.positions[j] + delta * unit
+            return float(np.dot(evaluate(moved, terms).forces[j], unit))
+
+        totals[key].append(-(pull(step) - pull(-step)) / (2 * step))
+    return [float(np.mean(totals[key])) for key in order]
+
+
+def _wavenumber(curvature: float, mass_a: float, mass_b: float) -> float:
+    """Harmonic wavenumber (cm^-1) of a curvature in eV/A**2 between two masses (amu)."""
+    stiffness = curvature * units._e / 1e-20  # J/m**2
+    reduced = mass_a * mass_b / (mass_a + mass_b) * units._amu
+    return float(np.sqrt(stiffness / reduced) / (2 * np.pi * units._c * 100.0))
 
 
 class TestTemplateEnergies:
@@ -171,12 +215,12 @@ class TestTheLennardJones:
     for an exclusion it had lost; with nothing excluded there is nothing to
     lose.
 
-    So the decomposition identity below is no longer what the calculator relies
-    on -- `ReactionSet.load` derives no exclusions and `with_exclusions` builds
-    them only here.  It is kept because it is the sharpest available check that
-    `LennardJones.__call__` and `QForce.compute_exclusion` still evaluate the
-    same function of the same numbers, switch included, and because a dataset
-    shipping explicit `exclusion` terms would still be honoured.
+    The decomposition identity below is what the calculator relies on for the
+    intramolecular correction: `ReactionSet.load` derives per-template
+    `exclusion` terms (`forcefield/exclusions.py`) and `QForce.compute_exclusion`
+    evaluates them on each diabat's diagonal.  It is the sharpest available
+    check that `LennardJones.__call__` and that method still evaluate the same
+    function of the same numbers, switch included.
     """
 
     # What `lj.switch` has to hold the term under at a bond length.  Not a
@@ -287,7 +331,7 @@ class TestTemplateGeometries:
         H2O2      O-O   1.4383  1.4919  +0.0536  1.4237  -0.0147
         H2O2      O-H   0.9652  1.2083  +0.2432  0.9203  -0.0449
 
-    `fit.dissociation.fit_bond_lengths` is the missing condition and these are
+    fast-forces' `refine.fit_bond_lengths` is the missing condition and these are
     the tests that hold it: one equation per bond type, the total force along it
     vanishing at the reference geometry, solved rather than fitted.  Every bond
     now relaxes to within 0.009 A of its reference and H2 to within 0.0001.
@@ -493,7 +537,7 @@ class TestTemplateFrequencies:
     # **Raised to 4700 for `qforce.BOND_ASYMPTOTE`, and this one is a real cost
     # rather than a re-baseline.**  The asymptote deepens the well the exponential
     # climbs, from `D` to `D + BOND_ASYMPTOTE`, which leaves the curvature at `r0`
-    # exactly `k` -- but `fit.dissociation.fit_bond_lengths` displaces `r0` off the
+    # exactly `k` -- but fast-forces' `refine.fit_bond_lengths` displaces `r0` off the
     # bond so the Morse can lean against the repulsion, and away from `r0` a
     # shallower `a` puts the curve's second derivative closer to `k`.  H2 pays
     # most, because the class above measures its repulsion alone at 4276 against
@@ -531,9 +575,6 @@ class TestTemplateFrequencies:
         """
         from ase.data import atomic_masses, atomic_numbers
 
-        from DynamicTopology.fit.dissociation import bond_curvatures, total_wavenumber
-        from DynamicTopology.forcefield.exclusions import with_exclusions
-
         worst = (0.0, "")
         for stem in _entries("molecules"):
             frame = io.read(stem.with_suffix(".xyz"))
@@ -559,9 +600,9 @@ class TestTemplateFrequencies:
                 seen.add(key)
                 i, j = term["atoms"].values()
                 pairs.append((frame[i].symbol, frame[j].symbol))
-            for (a, b), curvature in zip(pairs, bond_curvatures(frame, terms)):
+            for (a, b), curvature in zip(pairs, _bond_curvatures(frame, terms)):
                 mass = [atomic_masses[atomic_numbers[e]] for e in (a, b)]
-                value = total_wavenumber(curvature, *mass)
+                value = _wavenumber(curvature, *mass)
                 if value > worst[0]:
                     worst = (value, f"{stem.name} {a}-{b}")
 

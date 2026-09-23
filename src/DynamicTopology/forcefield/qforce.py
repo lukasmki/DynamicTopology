@@ -5,23 +5,27 @@ from typing import Callable
 from DynamicTopology.forcefield.params import active
 
 # `BOND_ASYMPTOTE` is now a field of `params.ForceFieldParams`,
-# `bond_asymptote`.  It changes what `fit/dissociation.py` solves against, so it
+# `bond_asymptote`.  It changes what fast-forces' `refine` solves against, so it
 # belongs to the dataset fitted at it and not to whichever source tree is
 # installed: a checkout whose asymptote had moved evaluated every template up to
 # 73 meV high and said nothing.  The diabatic argument for lifting the
 # dissociated limit off zero moved there with the numbers.
 #
-# `bond_asymptote` is stated in eV, as the README table and every measurement
-# quoted there are.  This class works in kJ/mol, so it reads
-# `params.bond_asymptote_kjmol`; mixing the two up is a factor of 96.5 on a
-# quantity that is supposed to be 1 eV.  A bond's own `h` overrides it and is
-# stored in kJ/mol like `D`.
+# `bond_asymptote` is in eV, like every parameter this class reads.  A bond's
+# own `h` overrides it.
+
+# Floors on the two cross terms that are products of two displacements and so
+# unbounded below.  q-force states them as -10 and -20 kJ/mol; they are the same
+# energies here, in eV.
+CLIP_BONDBOND: float = -10.0 * units.kJ / units.mol
+CLIP_BONDANGLE: float = -20.0 * units.kJ / units.mol
 
 
 class QForce:
-    """Bonded force field.  Works internally in nm and kJ/mol, converts to ASE
-    units (eV, Angstrom) at the end of `__call__`; the per-term `compute_*`
-    methods return unconverted values.
+    """Bonded force field, in ASE units throughout: Angstrom, eV, radians.
+
+    Parameters arrive in those units too -- `io/units.py` converts q-force's nm
+    and kJ/mol once, when a `.jsonl` is read -- so nothing here rescales.
 
     `bond_form` selects the bond functional form:
 
@@ -54,9 +58,6 @@ class QForce:
             F = vecs @ np.linalg.inv(cell)
             vecs = vecs - (pbc * np.floor(F + 0.5)) @ cell
 
-        # qforce units
-        vecs /= 10  # angstrom to nm
-
         # compute terms
         e = 0.0
         f = np.zeros_like(pos)
@@ -69,14 +70,6 @@ class QForce:
             e += de
             f += df
             w += dw
-        e *= units.kJ / units.mol
-        f *= units.kJ / units.mol / units.nm
-        # The virial is an energy, not a force: `v` is already in nm and `dE/dv`
-        # in kJ/mol/nm, so their product carries no length and converts with the
-        # energy factor alone.  Dividing by `units.nm` here as the forces do
-        # would be wrong by a factor of 10 and would show up only as a pressure
-        # that is silently an order of magnitude out.
-        w *= units.kJ / units.mol
         return e, f, w
 
     def _accumulate_forces(self, f, atoms_col, grad):
@@ -102,8 +95,7 @@ class QForce:
         onto the atom the vector points *to*.  Passing the same arrays here costs
         one outer product per vector and needs no new derivatives.
 
-        The result is in q-force's own units (kJ/mol, since `v` is in nm and
-        `dE/dv` in kJ/mol/nm); `__call__` converts it.
+        The result is an energy, in eV: `v` is in Angstrom and `dE/dv` in eV/A.
         """
         w = np.zeros((3, 3))
         for v, dE_dv in pairs:
@@ -124,8 +116,8 @@ class QForce:
         The `-D` offset puts the minimum at `-D`, so a topology's energy carries
         the depth of the bonds it contains and breaking a bond costs `+D` rather
         than nothing.  The *dissociated* limit is `h` above zero, not at it, and
-        the well the exponential climbs is `D + h` deep.  `h` is in kJ/mol like
-        `D`; omitted, it is `bond_asymptote` for every bond.
+        the well the exponential climbs is `D + h` deep.  `h` is in eV like `D`;
+        omitted, it is `bond_asymptote` for every bond.
 
         **Why `h` is per bond.**  Plain Morse is exact at the minimum and at
         dissociation and has nothing left over in between: `D` is pinned by the
@@ -136,7 +128,7 @@ class QForce:
         the whole stretched branch while the curvature at `dr = 0` stays
         `2 Dw a**2 = k` -- no fitted frequency moves -- and the curve stays a
         Morse, monotone out to its limit whatever `h` is.  That is what
-        `fit.dissociation.fit_force_constants` fits.  It replaced a
+        fast-forces' `refine.fit_force_constants` fits.  It replaced a
         Hulburt-Hirschfelder shape term `c s**3 exp(-b s)`, which did the same
         job with two parameters per bond, needed a monotonicity bound
         `c <= c_max(b)` to keep the curve from turning over, and fitted ~40x
@@ -159,12 +151,12 @@ class QForce:
             # Resolved here rather than in the signature so that a dataset
             # loaded after import gets its own asymptote rather than the one
             # that was current when this module was first imported.
-            h = active().bond_asymptote_kjmol
+            h = active().bond_asymptote
         v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3)  vec from atom0->atom1
         r = np.sqrt(np.sum(v * v, -1))  # (n,)
         dr = r - r0
         Dw = np.where(dr > 0.0, D + h, D)  # (n,)
-        al = np.sqrt(k / (2 * Dw))  # (n,)  1/nm
+        al = np.sqrt(k / (2 * Dw))  # (n,)  1/A
         exp_term = np.exp(-al * dr)  # (n,)
         e = Dw * (1 - exp_term) ** 2 - D
         # dE/dr  =  2*Dw*(1 - exp)*al*exp
@@ -218,12 +210,10 @@ class QForce:
     def compute_exclusion(self, vecs, atoms, sigma, eps):
         """Cancels the global Lennard-Jones term between near neighbours.
 
-        **Dormant.**  The repulsion is `forcefield/zbl.py`, which has no
-        exclusions, and `ReactionSet.load` no longer derives `exclusion` terms --
-        so nothing in the calculator reaches this method.  It is kept because
-        `lj.with_exclusions` still builds those terms on demand, for the tests
-        that check the Lennard-Jones decomposition still holds, and because a
-        dataset shipping explicit `exclusion` terms would still be honoured.
+        `ReactionSet.load` derives these terms for every template through
+        `forcefield/exclusions.py`, one per pair within `exclusion_depth` bonds
+        whose combined sigma and epsilon are nonzero, so this method is on
+        every diabat's diagonal.
 
         `forcefield/lj.py` sums 12-6 over *every* pair in the system, including
         pairs that are bonded to each other, because that sum is the same for
@@ -246,9 +236,8 @@ class QForce:
 
         v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3)  vec from atom0->atom1
         r = np.sqrt(np.sum(v * v, -1))  # (n,)
-        # In q-force's nm, like everything else in this class.  `pair_potential`
-        # is unit-agnostic, so this half of the cancellation is the same function
-        # of the same numbers as the other half.
+        # The same function of the same numbers as the other half of the
+        # cancellation, `LennardJones.__call__`.
         u, du_dr = pair_potential(r, sigma, eps)
         e_tot = -np.sum(u)
 
@@ -277,28 +266,15 @@ class QForce:
         bond.  H3O+ is where that cancellation failed -- fitted depth 5.76 eV
         against a 5.21 eV step, leaving the isolated cation's true minimum at
         1.60 A.  See `forcefield/exclusions.py`.
-
-        **Unit trap, and it is the opposite of `compute_exclusion`'s.**
-        `lj.pair_potential` is unit-agnostic, so that method can hand it q-force's
-        nm directly.  `zbl.pair_potential` is *not*: `SCREENING_LENGTH` is in
-        Angstrom and `params.zbl_ccoul` in eV*Angstrom, so `r` has to be converted going in
-        and the result converted coming back, into the kJ/mol and kJ/mol/nm that
-        `__call__` expects to scale at the end.  Getting this wrong by the factor
-        of ten would leave the energy right and the forces wrong.
         """
         from DynamicTopology.forcefield.zbl import pair_potential
 
-        kjmol = units.kJ / units.mol  # eV per kJ/mol
+        v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3), atom0 -> atom1
+        r = np.sqrt(np.sum(v * v, -1))  # (n,)
+        u, du_dr = pair_potential(r, z1, z2)  # eV, eV/Angstrom
 
-        v = vecs[atoms[:, 1], atoms[:, 0]]  # (n, 3) in nm, atom0 -> atom1
-        r = np.sqrt(np.sum(v * v, -1))  # (n,) in nm
-        u, du_dr = pair_potential(r * 10.0, z1, z2)  # eV, eV/Angstrom
-
-        # e = -u, converted from eV to kJ/mol.
-        e_tot = -float(np.sum(u)) / kjmol
-        # de/dr in kJ/mol/nm: minus the eV/Angstrom derivative, times 10
-        # Angstrom per nm, divided by the energy conversion.
-        de_dr = -du_dr * 10.0 / kjmol
+        e_tot = -float(np.sum(u))
+        de_dr = -du_dr
         dv = (de_dr / r)[:, None] * v  # (n, 3)
 
         n_atoms = vecs.shape[0]
@@ -347,11 +323,11 @@ class QForce:
         r1 = np.sqrt(np.sum(v1 * v1, -1))  # (n,)
         r2 = np.sqrt(np.sum(v2 * v2, -1))
         raw = k * (r1 - r1_0) * (r2 - r2_0)
-        e = np.clip(raw, -10, None)
+        e = np.clip(raw, CLIP_BONDBOND, None)
         e_tot = np.sum(e)
 
         # gradient only where not clipped
-        mask = (raw > -10).astype(float)[:, None]
+        mask = (raw > CLIP_BONDBOND).astype(float)[:, None]
         # dE/d(r1) = k*(r2-r2_0),  dE/d(r2) = k*(r1-r1_0)
         dE_dr1 = (k * (r2 - r2_0))[:, None] * mask  # (n,1)
         dE_dr2 = (k * (r1 - r1_0))[:, None] * mask
@@ -385,10 +361,10 @@ class QForce:
         dr = rc - r0
 
         raw = k * dr * dcos
-        e = np.clip(raw, -20, None)
+        e = np.clip(raw, CLIP_BONDANGLE, None)
         e_tot = np.sum(e)
 
-        mask = (raw > -20).astype(float)[:, None]
+        mask = (raw > CLIP_BONDANGLE).astype(float)[:, None]
 
         # dE/d(cos) = k * dr
         dE_dcos = (k * dr)[:, None] * mask

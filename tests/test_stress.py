@@ -533,17 +533,16 @@ class TestQForceStress:
         self._check(POS_4, td)
 
     def test_the_unit_conversion(self):
-        """The virial converts with the energy factor and no length factor.
+        """The virial is an energy, in eV, and carries no length factor.
 
-        `__call__` works in nm and multiplies the forces by
-        `units.kJ/units.mol/units.nm`.  The virial is `v (x) dE/dv` with `v`
-        already in nm, so it is an energy and takes `units.kJ/units.mol` alone.
-        Dividing by `units.nm` as well -- the natural copy-paste error -- would
-        leave every pressure a factor of ten small, which no finite-difference
-        test written in the same wrong units could catch.  This pins it against
-        an independent quantity: for a pure Morse bond the trace of the virial
-        must equal `r * dE/dr` in eV, computed here from the ASE-unit energy
-        curve rather than from anything inside `QForce`.
+        `QForce` used to work in nm and convert on the way out, and the virial
+        needed the energy factor alone -- dividing by `units.nm` as the forces
+        did would have left every pressure a factor of ten small, which no
+        finite-difference test written in the same wrong units could catch.
+        Everything is in ASE units now, parameters converted as they are read,
+        but the check is the same and still independent: for a pure Morse bond
+        the trace of the virial must equal `r * dE/dr` in eV, computed here from
+        the energy curve rather than from anything inside `QForce`.
         """
         td = make_term("bond", [[0, 1]], r0=[0.07772], k=[251200.0], D=[436.0])
         r = 0.11  # nm, well up the repulsive wall so dE/dr is large

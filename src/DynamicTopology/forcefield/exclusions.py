@@ -16,7 +16,7 @@ dormant because `ReactionSet.load` stopped deriving the terms.
 
 **Why the exclusions are wanted.**  Without them a template's gas-phase geometry
 is set by the bonded terms *and* by whatever the three nonbonded sums happen to
-contribute at bond lengths, and `fit/dissociation.py` has to absorb the
+contribute at bond lengths, and fast-forces' `refine` has to absorb the
 difference into the Morse depths.  For H3O+ that absorption failed outright: the
 fitted depth came out at 5.76 eV against a 5.21 eV tapered-ZBL step per O-H, so
 the true minimum of the isolated cation sat at 1.60 A and the symmetric C3v
@@ -99,7 +99,7 @@ from __future__ import annotations
 import networkx as nx
 import numpy as np
 
-from DynamicTopology.forcefield.lj import _near_pairs
+from DynamicTopology.forcefield.lj import near_pairs
 from DynamicTopology.forcefield.params import ForceFieldParams, resolve
 
 # `EXCLUDE_COULOMB` is now `params.ForceFieldParams.exclude_coulomb`, and the
@@ -132,8 +132,14 @@ def exclusion_terms(
     numbers: np.ndarray | None = None,
     depth: int | None = None,
     params: ForceFieldParams | None = None,
+    graph: nx.Graph | None = None,
 ) -> list[dict]:
     """Exclusion terms for every pair within `depth` bonds, for all three sums.
+
+    The pairs come from `graph` when it is given and from the `bond` terms
+    otherwise.  A fitter wants the first: it needs the exclusions of a topology
+    whose bond *parameters* are what it is solving for, so there are no bond
+    terms yet to read the graph off.
 
     `depth` defaults to the active `exclusion_depth` and `params` to the active
     set, both resolved in the body: this module is imported long before any
@@ -158,9 +164,10 @@ def exclusion_terms(
         for term in terms
         if term["type"] == "lennardjones"
     }
-    graph = bond_graph(terms)
+    if graph is None:
+        graph = bond_graph(terms)
     out: list[dict] = []
-    for i, j in sorted(_near_pairs(graph, depth)):
+    for i, j in sorted(near_pairs(graph, depth)):
         atoms = {"p1": i, "p2": j}
 
         if i in lj_params and j in lj_params:
@@ -201,9 +208,10 @@ def with_exclusions(
     """`terms` plus its exclusions, unless it already states them.
 
     Anything that evaluates a term list against a reference energy has to go
-    through here, for the reason `lj.with_exclusions` gives: a raw `.jsonl`
-    carries nonbonded *parameters* but no exclusions, so scoring one directly
-    charges it the whole-system sums with nothing cancelling them.
+    through here: a raw `.jsonl` carries nonbonded *parameters* but no
+    exclusions, so scoring one directly charges it the whole-system sums with
+    nothing cancelling them -- H2 came out at +842 eV against a reference of
+    -4.67 the one time it was tried.  `evaluate.term_dict` does this for you.
     """
     if any(term["type"].endswith("exclusion") for term in terms):
         return list(terms)

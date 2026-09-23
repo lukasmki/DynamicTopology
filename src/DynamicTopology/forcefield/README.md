@@ -34,10 +34,14 @@ charges" below.
 
 | where | length | energy | notes |
 | --- | --- | --- | --- |
-| `qforce.py` internals, `lj.pair_potential` | nm | kJ/mol | converted to eV / Å at the end of `QForce.__call__` |
-| `zbl.py`, `acks2.py` | Å | eV | ZBL constants and `ccoul` are stated in these units |
-| `coupling.py` | Å | eV | ASE units throughout; nothing to convert |
+| every force field, every in-memory term, `ForceFieldParams` | Å | eV | ASE units throughout; nothing converts during a force call |
+| `.jsonl` on disk | nm | kJ/mol | q-force's and OpenMM's convention; `io/units.py` converts once on read and once on write |
 | everything returned to ASE | Å | eV | forces eV/Å, stress eV/Å³ |
+
+The exceptions on disk are the ACKS2 `atom` block, `charge` and every EVB
+coupling, which a `.jsonl` stores in the units above (they convert by 1).
+`io/units.py:UNIT_POWERS` is the one table of what converts how, and a parameter
+missing from it is refused rather than read in whatever unit it was stored in.
 
 Angles are radians.  `PHI_B` and the like are dimensionless;
 `SCREENING_LENGTH` is Å, `ccoul` is eV·Å, `gamma` is 1/Å.  A coupling's `A` is
@@ -101,14 +105,14 @@ a  = sqrt( k / 2 Dw )              Dw = D + h   if dr > 0
 E  = Dw [ 1 - exp(-a dr) ]^2  -  D
 ```
 
-Parameters `D, r0, k, h`, with `h` optional (kJ/mol, like `D`) and defaulting to
+Parameters `D, r0, k, h`, with `h` optional (eV, like `D`) and defaulting to
 `bond_asymptote`.  The `-D` offset puts the minimum at `-D`; the dissociated
 limit is `h` above zero, so the well the exponential climbs is `D + h` deep while
 the minimum stays at `-D`.  The join at `dr = 0` is C2 (the curvature there is
 `2 Dw a^2 = k` whatever `Dw` is), so no fitted frequency sees the branch or `h`.
 At fixed `k`, raising `h` lifts every stretched geometry monotonically towards
 the harmonic `k dr^2 / 2`, and the curve stays a Morse, so it cannot turn over.
-`fit.dissociation.fit_force_constants` fits `h` per bond type, bounded below by
+fast-forces' `refine.fit_force_constants` fits `h` per bond type, bounded below by
 `bond_asymptote`; HCombustion's fitted values run from 1.0 (the floor) to 6.6 eV
 (O2).
 
@@ -136,11 +140,12 @@ E = 0.5 * k * (cos θ - cos θ0)^2
 
 | type | energy | parameters | atoms |
 | --- | --- | --- | --- |
-| `bondbond` | `max( k dr1 dr2 , -10 )` | `r1_0, r2_0, k` | 4 (two bonds) |
-| `bondangle` | `max( k dr dc , -20 )` | `theta0, r0, k` | 5 (angle + bond) |
+| `bondbond` | `max( k dr1 dr2 , -10 kJ/mol )` | `r1_0, r2_0, k` | 4 (two bonds) |
+| `bondangle` | `max( k dr dc , -20 kJ/mol )` | `theta0, r0, k` | 5 (angle + bond) |
 | `angleangle` | `k dc1 dc2` | `theta1_0, theta2_0, k` | 6 (two angles) |
 
-The two lower clips are floors on the energy, in kJ/mol, applied to the raw
+The two lower clips are floors on the energy -- q-force's -10 and -20 kJ/mol,
+held in eV as `qforce.CLIP_BONDBOND` / `CLIP_BONDANGLE` -- applied to the raw
 product; the gradient is zeroed where the clip is active.
 
 ### Dihedrals
@@ -219,8 +224,8 @@ continuation bounds what a compressed bond can contribute (≈5700 eV rather tha
 numerically exact.
 
 ```
-switch_radius = 0.22 nm (2.2 Å)     core_fraction = 0.4
-switch_width  = taper_width / 10    exclusion_depth = 3
+switch_radius = 2.2 Å               core_fraction = 0.4
+switch_width  = taper_width         exclusion_depth = 3
 ```
 
 `switch_radius` is deliberately **not** `taper_radius`: the two are not
@@ -430,7 +435,7 @@ reaction channel, dispatched by term type exactly as `QForce` is, in ASE units
 (Å, eV) throughout.
 
 **There are three forms, and a channel's own connectivity change picks which.**
-`scripts/fit.py` routes on the bond-graph difference between the first and last
+`fast-forces refit` routes on the bond-graph difference between the first and last
 frame of the channel's `.xyz` — `_fission` first, then `_transfer`, then the RMSD
 fallback:
 
@@ -456,7 +461,7 @@ The three sides are a **complete** description of the triangle and a
 non-redundant one, so this is the transfer's full geometry, not a projection of
 it.  `rmsd`'s `ρ_m` is the optimally superposed RMSD to the m-th frame of the
 channel's stored transition-state ensemble — Diamond's quaternion form of the
-rotational superposition (`_kabsch`), with unit weights and no rescaling, batched
+rotational superposition (`kabsch`), with unit weights and no rescaling, batched
 over the channels of one template.  `twobody` and `threebody` need no ensemble at
 all: they are *centred* on a geometry rather than measured against one, and they
 accept the argument only for the uniform `compute_*` signature.
@@ -558,8 +563,9 @@ needed.  A coupling is the one term written over absolute positions rather than
 separations, and it gets away with it because its forces sum to zero; see its
 section above.
 
-**Unit trap:** the virial is an energy.  It converts with `units.kJ / units.mol`
-and *no* length factor, unlike the forces.
+The virial is an energy, in eV.  (It used to be a unit trap: while `QForce`
+worked in nm it had to be rescaled by the energy factor alone, not the forces'
+energy-over-length one.  Nothing rescales now.)
 
 Adding a new functional form means adding one `compute_<type>` method returning
 that triple — or that pair, for a coupling — plus a case in
@@ -582,8 +588,8 @@ are what a manifest that omits a key gets.
 | `bond_asymptote` | 1.0 | eV | `qforce`, `fit` | every `.jsonl` in the dataset |
 | `taper_radius` | 1.5 | Å | `zbl` | every `.jsonl` in the dataset |
 | `taper_width` | 0.12 | Å | `zbl`, and `switch_width` by default | every `.jsonl` in the dataset |
-| `switch_radius` | 0.22 | nm | `lj` | every `.jsonl` in the dataset |
-| `switch_width` | `taper_width / 10` | nm | `lj` | every `.jsonl` in the dataset |
+| `switch_radius` | 2.2 | Å | `lj` | every `.jsonl` in the dataset |
+| `switch_width` | `taper_width` | Å | `lj` | every `.jsonl` in the dataset |
 | `core_fraction` | 0.4 | — | `lj` | every `.jsonl` in the dataset |
 | `exclusion_depth` | 3 | bonds | `exclusions` | every `.jsonl` in the dataset |
 | `exclude_coulomb` | `true` | — | `exclusions` | every `.jsonl` in the dataset |
@@ -593,15 +599,14 @@ are what a manifest that omits a key gets.
 | `ccoul` | 14.4 | eV·Å | `acks2`, `pointcharge` | every `.jsonl` in the dataset |
 | `zbl_ccoul` | 14.399645 | eV·Å | `zbl` | every `.jsonl` in the dataset |
 
-`switch_width` is the same physical width as `taper_width` stated in the other
-module's unit — 0.12 Å is 0.012 nm — so setting the taper width sets both unless
-`switch_width` is given explicitly.  `ccoul` and `zbl_ccoul` are the same
+`switch_width` defaults to `taper_width`, so setting the taper width sets both
+unless `switch_width` is given explicitly.  `ccoul` and `zbl_ccoul` are the same
 physical constant to different precision; they are two fields because collapsing
 them would change one of the two terms for every dataset already fitted.
 
-Units are the code's, not the manifest author's convenience: `taper_radius` is
-in Å and `switch_radius` in nm because that is what `zbl` and `lj` respectively
-work in.
+Every field is in ASE units, Å and eV, as the force field works in them.
+(`switch_radius` was stated in nm while `lj` evaluated in nm; manifests fitted
+before the switch to ASE units carry `0.22` and now state `2.2`.)
 
 ### Measurements behind the defaults
 
@@ -646,7 +651,7 @@ to integrate: its peak contribution to `du/dr` is 2.4 eV/Å at the O-H bond
 length, still far under the 17.8 eV/Å the unmodified term already carries
 there.
 
-**`switch_radius` (0.22 nm) is deliberately not `taper_radius`.** The tidy
+**`switch_radius` (2.2 Å) is deliberately not `taper_radius`.** The tidy
 design, `g = 1 - f` at ZBL's own radius, does not survive contact with
 q-force's parameters: a Fermi switch decays by one factor of `e` per width
 while 12-6 grows as `r**-12`, and at `rc = 1.5 Å` the switch is down to 1.1e-2
@@ -687,7 +692,7 @@ truncation error itself. At 1e-8 it lands around 1e-6 eV, comfortably under
 ### Why they live in the manifest
 
 Everything in the table but `accuracy` sits inside
-`E_bonded + E_nonbonded`, which `fit/dissociation.py` solves each template's
+`E_bonded + E_nonbonded`, which fast-forces' `refine` solves each template's
 depth scale against.  As module constants they were a property of the installed
 **source tree**: a checkout whose `zbl.TAPER_RADIUS` had moved evaluated every
 dataset at the new radius and reported energies that no longer matched the fit,
@@ -713,7 +718,7 @@ surface — `bond_asymptote`, `taper_radius`, `taper_width`, `switch_radius`,
 change to one of *those* defaults cannot silently invalidate the `.jsonl` files
 already on disk.  `switch_width` follows from the pinned `taper_width`, which leaves `ccoul` and `zbl_ccoul` as the
 two that are still taken from the defaults and would move a fitted surface if
-they changed.  Changing a pinned value still requires re-running `scripts/fit.py
+they changed.  Changing a pinned value still requires re-running `fast-forces refit
 --force-constants` for that dataset.
 
 **Two datasets fitted at different parameters cannot share one process.**

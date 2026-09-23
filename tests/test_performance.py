@@ -45,7 +45,7 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # (energy, energy_bonded, energy_nonbonded) in eV, and the number of blocks.
 #
 # Regenerated deliberately when the bond parameters were refitted against a
-# corrected energy zero (`fit.dissociation` -- the depths had been solved so that
+# corrected energy zero (fast-forces' `refine` -- the depths had been solved so that
 # `E_QForce = E_atomization` while the calculator reports `E_QForce + E_ACKS2`,
 # double-counting the nonbonded term) and gained the Morse shape parameter `c`.
 # The bonded parameters themselves moved, so the surface is *supposed* to move
@@ -83,7 +83,7 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # moving ten times as much is the term doing its job -- d250 is the box that
 # used to interpenetrate.
 #
-# Regenerated once more when `fit.dissociation.fit_bond_lengths` was added --
+# Regenerated once more when fast-forces' `refine.fit_bond_lengths` was added --
 # the condition that each template be at *rest* at its reference geometry, not
 # merely at the right energy there.  That moved `energy_bonded` by -0.10 eV
 # (d30) and -0.19 eV (d250), and moved the ACKS2 energies and the block counts
@@ -174,7 +174,7 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 #
 # **No refit, and that is the point of the `energy_bonded` row.**  Unlike the
 # ZBL taper and the 12-6 switch above -- both of which invalidated every
-# `.jsonl` in both datasets, because `fit/dissociation.py` solves against
+# `.jsonl` in both datasets, because fast-forces' `refine` solves against
 # `E_QForce + E_nonbonded` -- every dataset template carries `pbc="F F F"`, so
 # the fit sees the open-boundary kernel, which is unchanged to the last bit.
 # `energy_bonded` being *bit-identical* on both boxes is the evidence: a term
@@ -203,7 +203,7 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # to 1e-13.  What is left here is only what the box's geometries deviate from
 # those templates, and an H2/O2 mixture carries few angles to begin with.  A
 # box energy that barely moves is not evidence that the surface barely moved;
-# `TestTemplateFrequencies` and the channel counts in `scripts/fit.py` are.
+# `TestTemplateFrequencies` and the channel counts in `fast-forces refit` are.
 # And again when `qforce.BOND_ASYMPTOTE` lifted the dissociated limit of the
 # Morse off zero (so a bonded diabat crosses its own fragments' diabat instead of
 # converging to it) and both datasets were refit against it.  **The same mirror
@@ -217,14 +217,14 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 #     blocks                 identical          identical
 #
 # **Three meV per atom, against a surface that now breaks bonds at all.**  The
-# atomization condition is why: `fit.dissociation` re-solves each template's
+# atomization condition is why: fast-forces' `refine` re-solves each template's
 # depth scale against its own reference energy, so the minima are pinned exactly
 # where they were -- at most a 0.48% rescale -- and what is left here is only how
 # far this box's geometries sit off those minima.  The change that matters is at
 # *stretched* geometries, which an equilibrium-ish box barely samples, so as with
 # the angle refit a box energy that barely moves is not evidence that the surface
 # barely moved.  `TestTemplateFrequencies`, `tests/test_dissociation.py` and the
-# channel counts in `scripts/fit.py` are; the fastest stretch moved 4399 ->
+# channel counts in `fast-forces refit` are; the fastest stretch moved 4399 ->
 # 4639 cm^-1 and three channels that could not react now do.
 # And again for `forcefield/exclusions.py` and the refit that had to follow it.
 # **This is the first entry where both rows move, and they move for two
@@ -258,7 +258,7 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # fittable at any force constant), no fission channel's coupling is
 # cutoff-limited any more, and every stretch lands within 7% of q-force's own
 # frequency instead of at the `--max-k-scale` floor.  See
-# `fit.dissociation.nonbonded_curvatures`, which had been charging the
+# fast-forces' `refine.nonbonded_curvatures`, which had been charging the
 # objective's wavenumber cap an intramolecular repulsion the calculator does not
 # apply.
 # And again when the Morse shape term `c s**3 exp(-b s)` was removed in favour of
@@ -276,15 +276,25 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # near-equilibrium box sees almost none of either.  The change is at stretched
 # geometries: the fission crossings moved in from 2.1-2.4 A to 1.8-2.0, which
 # `tests/test_dissociation.py` tracks, and no force constant moved at all.
+# And once more when every term moved to ASE units in memory -- `QForce` and
+# `LennardJones` had worked in nm and kJ/mol and converted at the end of the
+# call; now `io/units.py` converts the parameters once, as the `.jsonl` is read.
+# The same surface in different units, so nothing may move beyond the rounding
+# of `x * 0.1 * 10`, and nothing did:
+#
+#     d30  (dilute)   total +3.98e-13 eV   bonded +4.55e-13 eV
+#     d250 (dense)    total -5.68e-14 eV   bonded  identical
+#     energy_nonbonded       identical            identical
+#     blocks                 identical            identical
 REFERENCE = {
     "tests/data/mix-n100-d30.xyz": (
-        -508.2623098702167,
-        -1201.005313007866,
+        -508.2623098702163,
+        -1201.0053130078657,
         -0.0771285657403261,
         87,
     ),
     "tests/data/mix-n100-d250.xyz": (
-        -506.20378917911364,
+        -506.2037891791137,
         -1201.099487212327,
         -2.1383859668755543,
         28,

@@ -2,6 +2,26 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Scope: inference only
+
+**DynamicTopology is the inference package**: the force field, the reactive EVB machinery and the
+MD scripts that run on a dataset. **All fitting lives in fast-forces** (`../fast-forces`), which
+depends on this package and fits *through* its force field — `forcefield.evaluate` is the entry
+point it scores templates with, so a template is fitted on exactly the sum it is simulated with.
+The dataset tools that used to live here moved there:
+
+| was (here) | now (fast-forces) |
+| --- | --- |
+| `scripts/fit.py`, `fit/dissociation.py`, `fit/coupling.py` | `fast-forces refit <manifest>`, `fastforces.refine`, `fastforces.coupling` |
+| `scripts/compute.py` | `fast-forces label` |
+| `scripts/convert.py`, `io/xml.py` | `fast-forces import-qforce`, `fastforces.qforce_xml` |
+| `datasets/*/make_water.py`, `fit_charges.py`, `scripts/topologize.py`, `examples/run_calc*.sh` | `examples/datasets/` (`fastforces.charges` for the ESP fit) |
+| `.claude/skills/new-dataset/` | `.claude/skills/new-dataset/` |
+| `tests/test_fit.py` | `tests/test_refine.py` |
+
+`datasets/` stays here: it is what the simulations load and what these tests pin. fast-forces writes
+into it. Anything that produces or refines a parameter belongs in fast-forces, not here.
+
 ## Environment
 
 Managed with `uv` (Python >= 3.13, build backend `uv_build`, package root `src/DynamicTopology`).
@@ -21,12 +41,10 @@ Run scripts with `uv run python scripts/<name>.py`:
 - `singlepoint.py -i <xyz>` — single-point energies through the ASE calculator
 - `nvt.py -i <xyz> [-o out.xyz]` — Langevin MD with reactive topology updates
 - `mixture.py -n 100 -d 30 -x 1:1` — pack an H2/O2 box via `molify.pack`
-- `convert.py -i <dir|xml> -o <dir>` — OpenMM-style XML force field → `.jsonl` terms
-- `topologize.py`, `plot.py` — re-perceive bonds / plot MD trajectories
+- `npt.py`, `analyze.py`, `plot.py` — Berendsen NPT / aggregate sweep logs / plot MD trajectories
 
 Note: `pyproject.toml` declares a `dt` console script pointing at `DynamicTopology:main`, but
-`src/DynamicTopology/__init__.py` is empty — the entry point is not wired up. `forcefield/acks2.py`
-imports `scipy`, which is also not declared in `pyproject.toml` (it arrives transitively).
+`src/DynamicTopology/__init__.py` is empty — the entry point is not wired up.
 
 A separate, older copy of this project lives at `../DynamicTopology` (flat `_molecules.py` /
 `_reactionset.py` layout). It is **not** this repo — verify the working directory is
@@ -47,7 +65,7 @@ diagonalized state also decides the topology carried into the next step.
    are self-loops; bimolecular ones are added only when the minimum interatomic distance (with
    PBC) is under the cutoff.
 2. For each network edge, `forcefield/coupling.py:EVBCoupling` computes an off-diagonal coupling
-   from the RMSD to the reaction's stored TS geometry ensemble (`superpose3d` alignment); results
+   from the reaction's stored TS geometry ensemble (a batched Kabsch alignment for the RMSD form); results
    are stashed back onto the edge dict as `coupling_energy` / `coupling_forces`.
 3. `ReactionNetwork.states()` splits into connected subnetworks and enumerates diabatic states
    per subnetwork: state 0 is the current topology, each subsequent state is `Reaction.apply()`
@@ -112,7 +130,7 @@ set is piecewise constant in the cell and a strain does not move a whole degener
 cutoff. Cost is +24 ms on a 200-atom box against a 200-450 ms force call.
 
 **This did not invalidate any `.jsonl`**, unlike the three radii below: every dataset template
-carries `pbc="F F F"`, so `fit/dissociation.py` sees the unchanged open-boundary kernel. The
+carries `pbc="F F F"`, so the fitter (fast-forces' `refine`) sees the unchanged open-boundary kernel. The
 bit-identical `energy_bonded` in `test_performance.py`'s reference block is the evidence.
 
 **The repulsion is two terms with a hand-over between them,** and the pair is the thing to
@@ -121,15 +139,16 @@ understand before touching either:
 | | form | Fermi switch | carries |
 | --- | --- | --- | --- |
 | `zbl.py:ZBL` | screened nuclear, no free parameters | off above `taper_radius = 1.5` Å, `taper_width = 0.12` Å | bond lengths and closer |
-| `lj.py:LennardJones` | 12-6, q-force's σ and ε | on above `switch_radius = 0.22` nm, same width | intermolecular contact and dispersion |
+| `lj.py:LennardJones` | 12-6, q-force's σ and ε | on above `switch_radius = 2.2` Å, same width | intermolecular contact and dispersion |
 
 Bare ZBL is fitted for keV nuclear stopping, and reaching it into the 1.5–3 Å range put +0.72 eV on
 a water dimer's hydrogen bond and +251 kbar in a water box; the taper keeps >90% of it at every bond
 length, so the wall stays where the Morse depths absorb it. Bare 12-6 is the opposite problem — 500
 to 1400 eV at a bond length, which is why it had been retired — and its switch takes it to 0.03–0.35
-eV there. **That is what lets it carry no exclusions**, hence be identical on every diabatic state,
-hence be addable outside the Hamiltonian; the four historical failure modes in `lj.py`'s docstring
-all descend from exclusions it no longer has.
+eV there. **That is what lets its whole-system sum carry no exclusions**, hence be identical on
+every diabatic state, hence be addable outside the Hamiltonian; the four historical failure modes
+in `lj.py`'s docstring all descend from exclusions that sum no longer has. (Its small intramolecular
+correction is an ordinary per-state `exclusion` term, as the ZBL one is — step 6 above.)
 
 The two radii are deliberately *not* equal, so there is a gap from ~1.6 to ~2.0 Å where both are
 small and `ACKS2` carries the hydrogen bond alone. Making them complementary is the obvious-looking
@@ -147,14 +166,21 @@ names the fields that differ. `params.use(...)` is the explicit override. `force
 tabulates the full set with units and defaults.
 
 **Changing a pinned value still invalidates that dataset's `.jsonl` files** —
-`fit/dissociation.py` solves against `E_QForce + E_nonbonded` and all three nonbonded terms are
-inside it, so `scripts/fit.py --force-constants` has to be re-run for that dataset. Both datasets
-here pin their values explicitly, so a change to a *default* no longer invalidates anything
-silently. Note `fit.py` is **not idempotent**: re-running it over already-fitted output moves the
+fast-forces' `refine` solves against `E_QForce + E_nonbonded` and all three nonbonded terms are
+inside it, so `fast-forces refit <manifest> --force-constants` has to be re-run for that dataset.
+Both datasets here pin their values explicitly, so a change to a *default* no longer invalidates
+anything silently. Note the refit is **not idempotent** with `--force-constants` (a coupling-only
+refit is): re-running it over already-fitted output moves the
 channel count on its own, so refit once from the previous state rather than iterating, and quote a
 regression only against a baseline produced by the *same* pipeline over the *same* input files. The
 cheapest way to get one is to disable the new physics (`switch_radius` at 1e6 makes the 12-6
 identically zero) and re-run.
+
+`forcefield/evaluate.py:evaluate(atoms, terms)` is the energy, forces and virial of **one**
+topology, summed exactly as `System` sums a diabat (bonded + exclusions through `QForce`, the active
+electrostatics, ZBL, 12-6), with the parts broken out. It is the entry point for anything that
+scores a template on its own — a fitter, a report — and `tests/test_evaluate.py` holds it to
+`System` on every template of every dataset to 1e-10.
 
 `evb.py:EVBSystem` (exposed as `ase.py:EVB`) is the simpler alternative: a fixed list of states
 with an empirical geometric-mean coupling `H_ij = sqrt((1+h)*H_ii*H_jj)`, no network rebuild and
@@ -180,7 +206,7 @@ no topology update.
 - `ReactionSet` — the cached query engine over one `ReactionSetData` (held as `.data`), mapping
   it onto a live system's atom indices. `get_terms()` looks up a molecule's parameter template
   and remaps indices into the live system, caching on the molecule signature; four caches hang
-  off it and `load()` resets them all. `set_template_terms()` is how the fitter installs a
+  off it and `load()` resets them all. `set_template_terms()` is how the fitter (fast-forces' `refine.install_templates`) installs a
   refit without writing files — it clears the term cache, which is the half that is easy to
   forget.
 
@@ -198,22 +224,28 @@ Force field classes dispatch by convention: `__call__` iterates `term_dict` and 
 functional form means adding a `compute_*` method that returns `(energy, forces, virial)` —
 nothing else needs to change.
 
-`QForce` works internally in nm and kJ/mol and converts to ASE units (eV, Å) at the end of
-`__call__`; the per-term `compute_*` methods return the *unconverted* values.
+**Units: eV and Å everywhere in memory; nm and kJ/mol only on disk.** Every force field, every
+`Term`, every `term_dict` and `ForceFieldParams` is in ASE units. A `.jsonl` stores the bonded and
+12-6 parameters as q-force emits them (nm, kJ/mol), and `io/units.py` converts each row once on
+read (`io.json.read_jsonl`, which `ReactionSetData.from_manifest` uses) and once on write; the
+ACKS2 `atom` block, `charge` and the couplings are stored as used. `UNIT_POWERS` there is the one
+table of what converts how, and a parameter missing from it raises. Converted values are written
+to 15 significant digits so that a refit does not churn the last digit of untouched parameters.
+Hand-built test terms go through `test_gradients.make_term`, which states its literals in q-force
+units and converts them through the same path.
 
 The `virial` is `dE/d(strain)`, a 3x3 — every energy here is a function of minimum-image
 displacement vectors only, so a homogeneous strain maps `v -> (I + e) v` and
 `W_ab = sum v_a (dE/dv)_b`. `QForce._virial` builds it from the same per-pair gradient the forces
-are scattered from, so no new derivative is needed. **Unit trap:** the virial is an energy, so it
-converts with `units.kJ / units.mol` and *no* length factor, unlike the forces. `System.calculate`
+are scattered from, so no new derivative is needed. The virial is an energy, in eV. `System.calculate`
 contracts the per-state virials with the ground-state eigenvector exactly as it does the forces,
 and `ase.py` divides by the cell volume to publish `stress`, which is what the ASE barostats need.
 
 ### I/O and datasets
 
-`io/xml.py` parses OpenMM-style `<Forces>` XML (as emitted by q-force) into terms; `io/json.py`
-reads/writes the canonical JSONL term format (one term per line). `io/h5.py` is empty; there is
-no `.h5` route and no `ReactionSet.save()` — a manifest is the only thing a set loads from.
+`io/json.py` reads/writes the canonical JSONL term format (one term per line), converting through
+`io/units.py`. There is no `.h5` route and no `ReactionSet.save()` — a manifest is the only thing a
+set loads from. (q-force XML import is fitting-side: `fast-forces import-qforce`.)
 
 A dataset is a manifest JSON (`datasets/HCombustion/HCombustion.json`) listing molecule and
 reaction entries by *extensionless* path; loading pairs each `<path>.xyz` (geometry; reactions
@@ -226,6 +258,10 @@ note above and `forcefield/README.md`.
 
 ### Tests
 
+- `test_evaluate.py` — `forcefield.evaluate` against `System` on every lone template, open and
+  periodic.
+- `test_paramio.py` — the `.jsonl` I/O and its unit conversion: nm/kJ/mol on disk, eV/Å in memory,
+  and a read/write of every dataset file changes no value stored at ≤15 digits.
 - `test_gradients.py` — every analytic force is checked against central finite differences.
   Any new or edited `compute_*` method must get a case here.
 - `test_stress.py` — the same for the virial, differenced against the *cell* with the atoms scaled

@@ -26,13 +26,18 @@ and therefore take the same value on every state.
 
 | quantity | unit |
 | --- | --- |
-| length | Å (`switch_radius`, `switch_width` and the bonded parameters below are stated in nm) |
-| energy | eV (bonded parameters are stated in kJ/mol) |
+| length | Å |
+| energy | eV |
 | angle | radians |
 | force | eV/Å |
 | stress | eV/Å³ |
 
-Dimensionless: `shape_decay`, `b`, `c`, `core_fraction`, `n`, `accuracy`.
+Dimensionless: `core_fraction`, `n`, `accuracy`.
+
+These are the units every parameter is held and evaluated in.  A `.jsonl` stores
+the bonded and 12-6 parameters as q-force and OpenMM state them, in nm and
+kJ/mol, and `io/units.py` converts them once on read and once on write; the
+ACKS2 block, `charge` and the couplings are stored in the units above.
 `SCREENING_LENGTH` is Å; `ccoul` is eV·Å; `gamma` is 1/Å.  A coupling amplitude
 `A` is eV and its width `a` is 1/Å²; `r0`, `ra0`, `rb0` are Å and `t0` radians.
 
@@ -64,29 +69,28 @@ dc  = cos θ - cos θ0
 
 Angles enter only through their cosines, never as angles.
 
-### 1.1 Bond — Morse with a one-sided shape term
+### 1.1 Bond — Morse with a one-sided asymptote
 
 ```
-Dw = D + bond_asymptote     if dr > 0
+Dw = D + h                  if dr > 0
 Dw = D                      if dr <= 0
 
 a  = sqrt( k / (2 Dw) )
-s  = a * max(dr, 0)
 
-E  = Dw [ 1 - exp(-a dr) ]^2  -  D  +  Dw * c * s^3 * exp(-b s)
+E  = Dw [ 1 - exp(-a dr) ]^2  -  D
 ```
 
 Parameters: `D` (well depth), `r0` (equilibrium length), `k` (force constant),
-`c` (shape amplitude), `b` (shape decay).
+`h` (asymptote height, optional; defaults to the global `bond_asymptote`).
 
 - The `-D` offset places the minimum at `-D`, so the dissociated limit sits at
-  `bond_asymptote` above zero while the minimum is unchanged.
+  `h` above zero while the minimum is unchanged.
 - The branch at `dr = 0` is C2: the curvature there is `2 Dw a^2 = k` for either
-  value of `Dw`, so no fitted frequency sees the join.
-- The shape term is `O(s^3)`, leaving `D`, `r0` and the curvature at `dr = 0`
-  untouched by `c`; it is identically zero on the compressed branch.
-- `c` is bounded by a monotonicity limit `c <= c_max(b)`, tabulated in §7.2.
-- Where `b` is absent from a parameter set it takes the global `shape_decay`.
+  value of `Dw`, so no fitted frequency sees the join or `h`.
+- At fixed `k`, raising `h` lifts the whole stretched branch monotonically
+  towards the harmonic `k dr^2 / 2` and the curve stays a Morse, so no bound on
+  `h` is needed to keep a dissociation channel downhill.  `bond_asymptote` is
+  its lower bound in a fit.
 
 ### 1.2 Bond — harmonic (non-reactive alternative)
 
@@ -104,8 +108,8 @@ E = 0.5 * k * (cos θ - cos θ0)^2
 
 | term | energy | parameters | atoms |
 | --- | --- | --- | --- |
-| bond–bond | `max( k dr1 dr2 , -10 )` | `r1_0, r2_0, k` | 4 (two bonds) |
-| bond–angle | `max( k dr dc , -20 )` | `theta0, r0, k` | 5 (angle + bond) |
+| bond–bond | `max( k dr1 dr2 , -10 kJ/mol )` | `r1_0, r2_0, k` | 4 (two bonds) |
+| bond–angle | `max( k dr dc , -20 kJ/mol )` | `theta0, r0, k` | 5 (angle + bond) |
 | angle–angle | `k dc1 dc2` | `theta1_0, theta2_0, k` | 6 (two angles) |
 
 The two lower clips are floors on the energy in kJ/mol, applied to the raw
@@ -198,8 +202,8 @@ is the C1 tangent at the core radius; it bounds what a strongly compressed pair
 can contribute (≈5700 eV rather than ≈1e21 eV at 0.024 Å).
 
 ```
-switch_radius = 0.22 nm (2.2 Å)     core_fraction = 0.4
-switch_width  = taper_width / 10
+switch_radius = 2.2 Å               core_fraction = 0.4
+switch_width  = taper_width
 ```
 
 `switch_radius` is deliberately **not** equal to `taper_radius`.  The two
@@ -453,22 +457,26 @@ single coordinate to be a function of.
 
 | term | parameters | units |
 | --- | --- | --- |
-| bond (Morse) | `D, r0, k, c, b` | kJ/mol, nm, kJ/mol/nm², —, — |
-| angle | `theta0, k` | rad, kJ/mol |
-| bond–bond | `r1_0, r2_0, k` | nm, nm, kJ/mol/nm² |
-| bond–angle | `theta0, r0, k` | rad, nm, kJ/mol/nm |
-| angle–angle | `theta1_0, theta2_0, k` | rad, rad, kJ/mol |
-| periodic dihedral | `phi0, n, k` | rad, —, kJ/mol |
-| dihedral–bond | `+ r0` | nm |
+| bond (Morse) | `D, r0, k, h` | eV, Å, eV/Å², eV |
+| angle | `theta0, k` | rad, eV |
+| bond–bond | `r1_0, r2_0, k` | Å, Å, eV/Å² |
+| bond–angle | `theta0, r0, k` | rad, Å, eV/Å |
+| angle–angle | `theta1_0, theta2_0, k` | rad, rad, eV |
+| periodic dihedral | `phi0, n, k` | rad, —, eV |
+| dihedral–bond | `+ r0` | Å |
 | dihedral–angle | `+ theta0` | rad |
 | dihedral–angle–angle | `+ theta0_1, theta0_2` | rad |
-| reference | `E0` | kJ/mol |
+| reference | `E0` | eV |
 | electrostatics, per atom | `mu, eta, soft_amp, soft_decay` | see §4.2 |
-| 12-6, per atom | `sigma, eps` | nm, kJ/mol |
+| point charge, per atom | `q` | e |
+| 12-6, per atom | `sigma, eps` | Å, eV |
 | ZBL | none (atomic numbers only) | — |
 | two-body coupling | `A, a, r0` | eV, 1/Å², Å |
 | three-body coupling | `A, a, ra0, rb0, t0` | eV, 1/Å², Å, Å, rad |
 | RMSD coupling | `A, a` + TS ensemble | eV, 1/Å² |
+
+As held in memory; on disk every Å above is nm and every eV kJ/mol, except for
+the ACKS2, charge and coupling rows (`io/units.py`).
 
 Exclusion terms carry no independent parameters: they reuse the 12-6 pair
 parameters, the atomic numbers, and the charge kernel respectively.
@@ -481,26 +489,26 @@ below apply where a dataset does not state a value.
 
 | parameter | default | unit | enters |
 | --- | --- | --- | --- |
-| `bond_asymptote` | 1.0 | eV | Morse (§1.1) |
-| `shape_decay` | 4.0 | — | Morse `b` fallback (§1.1) |
+| `bond_asymptote` | 1.0 | eV | Morse `h` fallback and lower bound (§1.1) |
 | `taper_radius` | 1.5 | Å | ZBL switch (§2) |
 | `taper_width` | 0.12 | Å | ZBL switch (§2); sets `switch_width` by default |
-| `switch_radius` | 0.22 | nm | 12-6 switch (§3) |
-| `switch_width` | `taper_width / 10` | nm | 12-6 switch (§3) |
+| `switch_radius` | 2.2 | Å | 12-6 switch (§3) |
+| `switch_width` | `taper_width` | Å | 12-6 switch (§3) |
 | `core_fraction` | 0.4 | — | 12-6 core continuation (§3) |
 | `exclusion_depth` | 3 | bonds | exclusions (§5) |
 | `exclude_coulomb` | true | — | exclusions (§5.2) |
 | `gamma` | 2.0 | 1/Å | charge kernel (§4.1) |
 | `accuracy` | 1e-8 | — | Ewald splitting and cutoff (§4.1) |
+| `electrostatics` | `"acks2"` | — | ACKS2 or fixed point charges (§4) |
 | `ccoul` | 14.4 | eV·Å | electrostatic energy (§4.3) |
 | `zbl_ccoul` | 14.399645 | eV·Å | ZBL (§2) |
 
-`switch_width` is the same physical width as `taper_width` expressed in the other
-length unit — 0.12 Å is 0.012 nm.  `ccoul` and `zbl_ccoul` are the same physical
+`switch_width` defaults to `taper_width`, one sharpness for both switches.
+`ccoul` and `zbl_ccoul` are the same physical
 constant to different precision; they are separate fields so that unifying them
 cannot silently move one of the two terms for an already-fitted parameter set.
 
-Everything in the table except `accuracy` and `shape_decay` enters
+Everything in the table except `accuracy` enters
 `E_bonded + E_nonbonded`, which the bond depths are fitted against.  Changing any
 of them invalidates the fitted parameters of a dataset.
 
@@ -529,24 +537,12 @@ channel is available where the forward one hands over:
 | 0.75 | 2.53 Å | 3.15 Å | 4.05 Å |
 | 1.00 | 2.38 Å | 2.93 Å | 3.74 Å |
 
-**`shape_decay` = 4.0 (fallback only; `b` is fitted per bond type).** Refitting
-the whole pipeline at each fixed `b`:
-
-| b | c_max | metathesis channels | dissociation rms | fastest mode | stable dt |
-| --- | --- | --- | --- | --- | --- |
-| 2.0 | 1.31 | 12/13 | 0.700 eV | 4517 cm⁻¹ | 0.492 fs |
-| 2.5 | 3.84 | 13/13 | 0.783 | 4402 | 0.505 |
-| 3.0 | 7.80 | 13/13 | 1.098 | 4352 | 0.511 |
-| 4.0 | 19.33 | 13/13 | 1.710 | 4400 | 0.505 |
-| 5.0 | 34.50 | 13/13 | 2.660 | 4402 | 0.505 |
-| 6.0 | 52.20 | 12/13 | 3.181 | 4432 | 0.502 |
-
-The timestep is flat across the range — the curvature cap absorbs whatever `b`
-does — so `b` costs nothing dynamically, and 4.0 is simply the worst reachable
-value for the dissociation curves; hence it is fitted rather than fixed.
-`c_max(b)` is the monotonicity limit on the shape amplitude, and it is why small
-`b` is not free either: at `b = 2.0` it is 1.31 and binds on five of eight bond
-types.
+**Per-bond `h` replaced a two-parameter shape term.**  A Hulburt-Hirschfelder
+term `Dw c s^3 exp(-b s)` did the same job -- lifting the stretched branch that
+plain Morse leaves too deep -- with two parameters per bond, a monotonicity bound
+`c <= c_max(b)`, and a fit about 40x slower to the same 19 of 19 HCombustion
+channels.  `h` fits there with every force constant where q-force put it
+(fastest mode 3748 cm⁻¹, H2), and `h` ranges 1.0-6.6 eV, O2 highest.
 
 **`taper_radius` = 1.5 Å, bounded from both sides.** From below, the repulsive
 wall must stay ahead of the electrostatic contact funnel at every separation: at
@@ -561,12 +557,12 @@ against a −0.218 eV reference at 2.91 Å.  1.5 Å places the minimum at the co
 enough to integrate: its peak contribution to `du/dr` is 2.4 eV/Å at the O–H bond
 length, well under the 17.8 eV/Å the unmodified term already carries there.
 
-**`switch_radius` = 0.22 nm, deliberately not `taper_radius`.** The tidy design
+**`switch_radius` = 2.2 Å, deliberately not `taper_radius`.** The tidy design
 `g = 1 - f` at the ZBL radius fails against real 12-6 parameters: a Fermi switch
 decays by one factor of `e` per width while 12-6 grows as `r^-12`, so at 1.5 Å
 the switch is down to 1.1e-2 where the bare 12-6 is up at 953 eV — a product of
 +10.3 eV per O–H bond, or +20.6 eV on a single water molecule.  Bare 12-6 versus
-what survives at 2.2 Å with a 0.012 nm width:
+what survives at 2.2 Å with a 0.12 Å width:
 
 | pair | bare | switched |
 | --- | --- | --- |

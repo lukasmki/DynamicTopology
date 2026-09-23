@@ -212,7 +212,7 @@ class TestHydrogenBond:
     def test_the_curve_is_a_single_well(self, reaction_set):
         """No step, no second minimum -- and no EVB channel opening mid-curve.
 
-        Two waters at their own equilibrium geometries cannot mix: `fit.coupling`
+        Two waters at their own equilibrium geometries cannot mix: fast-forces' `coupling`
         pins each width so the coupling is off at the reactant minimum.  If this
         ever reports more than one state the curve above stops being a pure
         nonbonded measurement and the brackets there mean something else.

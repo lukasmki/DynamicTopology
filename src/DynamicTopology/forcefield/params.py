@@ -2,16 +2,18 @@
 
 Every field here used to be a module constant (`zbl.TAPER_RADIUS`,
 `qforce.BOND_ASYMPTOTE`, `ewald.GAMMA`, ...).  Each sits inside
-`E_bonded + E_nonbonded`, which `fit/dissociation.py` solves every template
+`E_bonded + E_nonbonded`, which fast-forces' `refine` solves every template
 against, so a module constant made the fitted surface a property of whichever
 source tree happened to be installed.  A manifest now states these under
 `global_params`, `ReactionSet.load` activates them before it reads a template,
 and everything downstream reads them back through `active()` at call time --
-never bound into a default argument, since `fit/dissociation.py` imports
+never bound into a default argument, since fast-forces' `refine` imports
 before any manifest is loaded and a bound default would pin the wrong one.
 
 Units, defaults and the measurement behind each value are tabulated in
-`forcefield/README.md`'s "Global parameters at a glance".
+`forcefield/README.md`'s "Global parameters at a glance".  Every field is in
+ASE units -- Angstrom and eV -- like everything else in memory; only a `.jsonl`
+is in nm and kJ/mol (see `io/units.py`).
 """
 
 from __future__ import annotations
@@ -19,8 +21,6 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass, fields, replace
 from typing import Any, Iterator
-
-from ase import units
 
 
 # The values `ForceFieldParams.electrostatics` accepts.
@@ -42,7 +42,7 @@ class ForceFieldParams:
     # How far above the free-fragment limit a broken bond's diabat sits, in eV.
     # Splits the Morse asymptote from its depth so a bonded diabat crosses its
     # own fragments' diabat instead of converging to it -- without this,
-    # `fit.coupling.fit_amplitude`'s discriminant vanishes at dissociation and
+    # fast-forces' `coupling.fit_amplitude`'s discriminant vanishes at dissociation and
     # there is nothing for an EVB off-diagonal to interpolate between.
     # Changing it invalidates every `.jsonl` in the dataset that states it.
     # It is also the default and the lower bound for each bond's own fitted
@@ -64,18 +64,18 @@ class ForceFieldParams:
 
     # --- the switched 12-6 (`lj`) ------------------------------------------
 
-    # Where the 12-6 switches *on*, in nm.  Deliberately **not** `taper_radius`
+    # Where the 12-6 switches *on*, in Angstrom.  Deliberately **not** `taper_radius`
     # -- a Fermi switch and `r**-12` disagree by orders of magnitude at a bond
     # length, so the two forms are not complementary and leave a gap between
     # them that `ACKS2` alone carries.  See `forcefield/lj.py` and
     # `forcefield/README.md` for the measurement.
-    switch_radius: float = 0.22
+    switch_radius: float = 2.2
 
-    # How sharply the 12-6 switches on, in nm.  `None` derives it from
-    # `taper_width`, which is the *same physical width* stated in the other
-    # module's unit: 0.12 A is 0.012 nm, so the factor of ten is the unit
-    # conversion and not a second decision.  Stating it explicitly decouples the
-    # two switches' sharpness, which nothing has yet needed.
+    # How sharply the 12-6 switches on, in Angstrom.  `None` takes
+    # `taper_width`: the two switches share one sharpness, which is a single
+    # decision rather than two.  (It used to be `taper_width / 10`, which was the
+    # same width in the nm the 12-6 was then evaluated in.)  Stating it
+    # explicitly decouples the two, which nothing has yet needed.
     switch_width: float | None = None
 
     # Where 12-6 stops being evaluated as `r**-12` and continues as its own
@@ -142,7 +142,7 @@ class ForceFieldParams:
             # Resolved once, here, so that every reader sees a float and no call
             # site has to know about the derivation.  `object.__setattr__`
             # because the dataclass is frozen; this is the documented way.
-            object.__setattr__(self, "switch_width", self.taper_width / 10.0)
+            object.__setattr__(self, "switch_width", self.taper_width)
         if self.exclusion_depth < 0:
             raise ValueError(
                 f"exclusion_depth must be >= 0, got {self.exclusion_depth}"
@@ -163,17 +163,6 @@ class ForceFieldParams:
         for name in ("taper_width", "switch_width", "gamma", "accuracy"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be > 0, got {getattr(self, name)}")
-
-    @property
-    def bond_asymptote_kjmol(self) -> float:
-        """`bond_asymptote` in q-force's kJ/mol, which is where it is used.
-
-        `QForce` and `fit/dissociation.py` both work in kJ/mol internally and
-        add this straight onto a fitted depth `D`, so the conversion has to
-        happen once, here, rather than at each of the five call sites.  The
-        field itself is in eV, matching the manifest and `forcefield/README.md`.
-        """
-        return self.bond_asymptote * units.mol / units.kJ
 
     @classmethod
     def from_dict(cls, mapping: Any, source: str | None = None) -> "ForceFieldParams":
@@ -223,7 +212,7 @@ DEFAULTS = ForceFieldParams()
 # The parameters every force field reads, and the manifest that put them there.
 # Process-global, because the alternative is threading one object through
 # `zbl.taper`, `lj.switch`, `exclusions.exclusion_terms`, twenty functions in
-# `fit/dissociation.py` and the module-level force field singletons the fitter
+# fast-forces' `refine` and the module-level force field singletons the fitter
 # builds at import time -- and any call site that forgot to pass it would
 # silently evaluate at the defaults, which is the same silent invalidation as
 # before with more places to hide.  One source of truth, read at call time.

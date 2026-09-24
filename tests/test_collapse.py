@@ -495,12 +495,15 @@ class TestTheReactiveWall:
 class TestTheNonbondedTermsCancelFromEveryGap:
     """The structural claim the whole design rests on, pinned as a number.
 
-    `ACKS2` and `ZBL` are functions of the geometry and the elements alone.
-    Neither consults the topology, so both are the *same number* on every
+    The whole-system sums -- `ZBL`, the 12-6, and `ACKS2`'s charges and
+    unscreened Coulomb energy -- are functions of the geometry and the elements
+    alone.  None consults the topology, so each is the *same number* on every
     diabatic state of a block: they add a common constant to every EVB diagonal,
     `np.linalg.eigh` shifts the eigenvalue by exactly that and leaves the
     eigenvectors untouched, and they cancel exactly out of every energy
-    difference in the model.
+    difference in the model.  What does differ between states is the
+    intramolecular exclusion, and it differs *on the diagonal*, where a state
+    dependence belongs; see `forcefield/exclusions.py`.
 
     That is why the previous four attempts at this term are impossible to repeat
     rather than merely fixed.  Each of them -- the union rule, the lost-exclusion
@@ -510,12 +513,21 @@ class TestTheNonbondedTermsCancelFromEveryGap:
     close non-bonded contacts came back with EVB amplitudes of -72 to -108 eV.
     """
 
-    def test_a_broken_bond_changes_nothing_nonbonded(self, reaction_set):
-        """Same geometry, different topology, identical nonbonded energy.
+    def test_a_broken_bond_moves_only_the_exclusion(self, reaction_set):
+        """Same geometry, different topology: identical sums, different screen.
 
         The H2 diabat that has broken its bond is the state that used to be
         charged 727 eV of Lennard-Jones wall for a pair sitting at the bond
         length -- the artefact that forced a correction to exist at all.
+
+        **This used to assert `energy_nonbonded` itself was equal, and since
+        `forcefield/exclusions.py` it cannot be.**  That number is the Coulomb
+        energy *under the exclusion screen*, and the screen is the bond graph by
+        construction -- here the broken state stops excluding H-H and the two
+        read -0.1012 and -0.0094 eV.  What the design still rests on is the part
+        underneath: the charges and the unscreened sum depend on the geometry
+        alone, and the two topologies differ by exactly their diagonal
+        corrections and nothing else.  That is asserted instead, to rounding.
         """
         atoms, intact = head_on_diatomics(2.0)
 
@@ -525,15 +537,40 @@ class TestTheNonbondedTermsCancelFromEveryGap:
         broken._molecules = None
         broken.set_atoms(atoms)
 
-        a = System(atoms, intact, reaction_set).calculate()
-        b = System(atoms, broken, reaction_set).calculate()
+        runs = []
+        for topology in (intact, broken):
+            system = System(atoms, topology, reaction_set)
+            result = system.calculate()
+            acks2 = system.nonbonded_ff
+            correction = sum(
+                float(c @ w)
+                for c, w in zip(acks2.block_corrections, acks2.block_weights)
+            )
+            runs.append((result, acks2.Q.copy(), acks2.compute()[0], correction))
+        (a, q_a, bare_a, corr_a), (b, q_b, bare_b, corr_b) = runs
 
         assert a["energy_zbl"] == b["energy_zbl"], (
             "the repulsion differs between two topologies over the same "
             "geometry; it has acquired a state dependence and every failure "
             "mode this design removes is back"
         )
-        assert a["energy_nonbonded"] == pytest.approx(b["energy_nonbonded"], abs=1e-10)
+        assert a["energy_lj"] == b["energy_lj"], (
+            "the 12-6 whole-system sum differs between two topologies; it has "
+            "acquired exclusions of its own"
+        )
+        np.testing.assert_allclose(q_a, q_b, rtol=0, atol=1e-12)
+        assert bare_a == pytest.approx(bare_b, abs=1e-12), (
+            "the unscreened Coulomb sum depends on the topology, so the charges "
+            "are no longer the geometry's alone -- the pivot dependence "
+            "`exclusions.py` measured at 0.88 eV is back"
+        )
+        for result, bare, correction in ((a, bare_a, corr_a), (b, bare_b, corr_b)):
+            assert result["energy_nonbonded"] == pytest.approx(
+                bare + correction, abs=1e-12
+            ), "the screened energy is not the unscreened sum plus the exclusions"
+        # Anti-vacuity: the H-H exclusion has to be worth something here, or the
+        # two topologies would agree for want of anything to disagree about.
+        assert abs(corr_a - corr_b) > 0.05
 
     def test_the_wall_is_not_vacuously_equal(self, reaction_set):
         """Anti-vacuity: the term has to be large here, not merely equal."""

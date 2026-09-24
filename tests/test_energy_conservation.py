@@ -141,7 +141,8 @@ CONVERGENCE_TOL = 3.5
 #     case                     0.25 fs    0.125 fs   0.0625 fs   ratios
 #     H2O+O2 (EVB)             1.01e-3     2.53e-4     6.4e-5    4.0, 4.0
 #     O2+O2  (Dyn)             4.52e-5     1.12e-5     2.8e-6    4.0, 4.0
-#     gate crossing (Dyn)      8.64e-3     2.15e-3    5.37e-4    4.02, 4.00
+#
+# The gate crossing used to be a row here too; it has its own `GATE_LADDER`.
 #
 # The 200-atom production box is *not* at that edge at 0.5 fs -- it converges
 # 4.21 and 4.04 -- because its drift is spread over many soft modes rather than
@@ -149,6 +150,27 @@ CONVERGENCE_TOL = 3.5
 # asymmetry is why the production step is measured on the production box and
 # asserted through the frequencies, not through this ladder.
 LADDER = (0.25, 0.125, 0.0625)
+
+# The gate crossing's own ladder, five times finer, because the thing it
+# measures is five times faster than anything else here.  The admission ramp is
+# one `eps` wide in `stab` -- 1 to 2 meV -- and this 1000 K trajectory sweeps
+# `stab` at ~16 meV/fs, so a state leaves the basis in 0.06-0.09 fs: at 0.031 fs
+# `min_switch` reads 1.0, 0.74, 0.14, 0 on consecutive steps.  `LADDER` puts
+# every rung above that, where the integrator steps *over* the ramp and the
+# energy error it leaves depends on where the steps happen to fall rather than
+# on dt.  Scaled by dt**2 that error is +0.05, -0.37 and -0.07 at 0.125, 0.0625
+# and 0.031 fs -- no trend at all -- and it read 4.02 and 4.00 on `LADDER` for a
+# while only because the steps landed well.  The soft-core 12-6 moved the
+# trajectory by nothing more than the TS diagonals it touches, and the ratios
+# fell to 4.00 and 3.30.  Here, where every rung resolves the ramp:
+#
+#     start t    0.05 fs    0.025 fs   0.0125 fs   ratios
+#     0.14       1.47e-3    3.68e-4    9.20e-5     4.00, 4.00
+#     0.13       1.52e-3    3.80e-4    9.51e-5     4.00, 4.00
+#
+# Two starts rather than one so that this is not the same luck again, and the
+# second crosses four gates to the first's two.
+GATE_LADDER = (0.05, 0.025, 0.0125)
 
 
 @pytest.fixture(scope="module")
@@ -402,12 +424,12 @@ class TestDynamicTopologyEnergyConservation:
 
         The one that separates "continuous potential, finite timestep" from
         "smaller discontinuity": a step in the energy does not shrink with dt,
-        however small it is.  Measured ratios 4.02 and 4.00 at `LADDER`, on a run
-        whose basis does change size.
+        however small it is.  Measured ratios 4.00 and 4.00 at `GATE_LADDER`, on
+        a run whose basis does change size; see there for why not `LADDER`.
         """
         atoms = reaction_path(REACTION, GATE_START, CELL)
         drifts = []
-        for dt in LADDER:
+        for dt in GATE_LADDER:
             total, _, changed, basis_changes = run_nve(
                 atoms,
                 DynamicTopology,

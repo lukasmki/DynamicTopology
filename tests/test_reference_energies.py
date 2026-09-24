@@ -164,16 +164,33 @@ class TestTemplateEnergies:
         If the heteronuclear templates ever join them -- a charge parameter lost
         in a refactor, say -- every assertion above would start passing for a
         reason that has nothing to do with the fit being right.
+
+        **The reported `energy_nonbonded` is now zero on every one of them, and
+        that is correct.**  It is the Coulomb energy under the intramolecular
+        exclusion screen (`forcefield/exclusions.py`), and a template of at most
+        four atoms has every pair within `exclusion_depth = 3` bonds, so the
+        screen removes all of it.  The energy the test above can still get wrong
+        is the *unscreened* sum -- -1.18 eV on HO, -2.50 on H2O -- which is what
+        would land on top of the bonded term if the screen failed.  So that is
+        what has to be nonzero, and the screen is what has to take it to zero.
         """
         for stem in _entries("molecules"):
             if stem.name not in HETERONUCLEAR:
                 continue
             frame = io.read(stem.with_suffix(".xyz"))
-            _, diagnostics = evaluate(isolate(frame, False), reaction_set)
-            assert abs(diagnostics["energy_nonbonded"]) > 0.1, (
+            atoms = isolate(frame, False)
+            _, diagnostics = evaluate(atoms, reaction_set)
+            unscreened, _, _ = atoms.calc.system.nonbonded_ff.compute()
+            assert abs(unscreened) > 0.1, (
                 f"{stem.name} ({frame.get_chemical_formula()}) carries a "
-                "negligible nonbonded energy, so it can no longer detect the "
+                "negligible Coulomb energy, so it can no longer detect the "
                 "bonded and nonbonded terms disagreeing about the energy zero"
+            )
+            assert diagnostics["energy_nonbonded"] == pytest.approx(0.0, abs=1e-10), (
+                f"{stem.name} ({frame.get_chemical_formula()}) reports "
+                f"{diagnostics['energy_nonbonded']:+.4f} eV of screened Coulomb "
+                f"against {unscreened:+.4f} unscreened; every pair in it is "
+                "excluded, so the screen is not removing what it should"
             )
 
     def test_the_repulsion_is_not_zero_on_any_template(self, reaction_set):

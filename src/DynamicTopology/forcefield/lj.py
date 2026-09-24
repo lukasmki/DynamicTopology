@@ -31,8 +31,9 @@ with EVB amplitudes of -72 to -108 eV.
 
 Every one of those four descends from the same root: **a pair at a bond length
 being charged hundreds of eV, and the charge depending on the topology.**
-`lj.switch` removes the root rather than the symptoms.  The term is now 0.031 eV
-at an O-H bond and 0.35 eV at O2's, three to four orders of magnitude down, and
+`lj.switch` removes the root rather than the symptoms, and `pair_potential`'s
+soft core bounds what is left.  The term is now 0.0024 eV at an O-H bond and
+0.035 eV at O2's, four to five orders of magnitude down, and
 at that size there is no penalty worth stripping -- so the **whole-system sum
 carries no exclusions**.  That is the property that matters, and it is
 structural rather than a tuning: with nothing excluded, this sum is the same
@@ -79,10 +80,10 @@ import numpy as np
 from DynamicTopology.forcefield.params import ForceFieldParams, active, resolve
 
 
-# `EXCLUSION_DEPTH`, `CORE_FRACTION`, `SWITCH_RADIUS` and `SWITCH_WIDTH` are now
-# fields of `params.ForceFieldParams` -- `exclusion_depth`, `core_fraction`,
-# `switch_radius` and `switch_width` -- read through `params.resolve()` at
-# call time; see that module for why.
+# `EXCLUSION_DEPTH`, `SWITCH_RADIUS` and `SWITCH_WIDTH` are now fields of
+# `params.ForceFieldParams` -- `exclusion_depth`, `switch_radius` and
+# `switch_width` -- read through `params.resolve()` at call time, as is the
+# soft-core constant `soft_core`; see that module for why.
 
 
 def switch(
@@ -118,7 +119,7 @@ def pair_potential(
     eps: np.ndarray,
     params: ForceFieldParams | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Switched 12-6 and its radial derivative, `(u, du/dr)`.
+    """Switched soft-core 12-6 and its radial derivative, `(u, du/dr)`.
 
     This is the potential the force field evaluates, not the textbook 12-6: it
     is multiplied by `switch`, so it is off inside `switch_radius` and on
@@ -133,36 +134,46 @@ def pair_potential(
     they must not, because the near-neighbour half of the sum is cancelled by
     `exclusion` terms built from this same form.
 
-    **Below `core_fraction * sigma` the potential continues along its own
-    tangent instead of as `r**-12`, and this is not cosmetic.**  The
-    decomposition `E = sum_all_pairs - sum_near_pairs` evaluates every *bonded*
-    pair in both sums, at a separation where 12-6 is enormous.  At equilibrium
-    that is merely ugly -- 843 eV cancelling to zero on an H2 template, with
-    thirteen digits to spare.  On a hot trajectory it is fatal: an H2 bond
-    compressed to 0.3 A puts 1e8 eV into both sums, 0.2 A puts in 1e10, and
-    0.024 A puts in 1e21.  Measured on the 3000 K probe, the two sums reached
-    1e21 by step 143 and their difference -- the physical energy, of order 1e2
-    -- came back quantized to 2**22 eV.  The forces went with it and the box
-    heated to 1e16 K.
+    **The 12-6 is soft-cored, and this is not cosmetic.**  With
+    `s = c + (r/sigma)**6` and `c = soft_core`,
 
-    Linear continuation bounds what a compressed bond can contribute (about 4500
-    eV at 0.3 A rather than 8e7, and 5700 eV at 0.024 A rather than 1e21) while
-    staying C1, so the cancellation keeps its precision and the gradient stays
-    the gradient.  Because both halves come through here, the switch cancels
-    exactly on any pair that is excluded, which is every pair it can reach.
+        u = 4 eps [ s**-2 - s**-1 ]
+
+    which is the textbook 12-6 at `c = 0` and, for `c > 0`, finite everywhere:
+    `u(0) = 4 eps (1/c**2 - 1/c)`, 39600 eps at the default 0.01.  The
+    decomposition `E = sum_all_pairs - sum_near_pairs` evaluates every *bonded*
+    pair in both sums, at a separation where bare 12-6 is enormous.  At
+    equilibrium that is merely ugly -- 843 eV cancelling to zero on an H2
+    template, with thirteen digits to spare.  On a hot trajectory it is fatal:
+    an H2 bond compressed to 0.3 A puts 1e8 eV into both sums, 0.2 A puts in
+    1e10, and 0.024 A puts in 1e21.  Measured on the 3000 K probe, the two sums
+    reached 1e21 by step 143 and their difference -- the physical energy, of
+    order 1e2 -- came back quantized to 2**22 eV.  The forces went with it and
+    the box heated to 1e16 K.
+
+    The soft core bounds what a compressed bond can contribute -- under 300 eV
+    for the heaviest pair the datasets carry, at any separation -- while being
+    smooth rather than merely C1, so the cancellation keeps its precision and
+    the gradient stays the gradient.  Where the term does physical work it is
+    barely touched: the minimum is still at `s = 2`, so the well depth is
+    exactly `eps` and only its position moves, inward by `(1 - c/2)**(1/6)`,
+    0.08%; the zero crossing, at `s = 1`, moves inward by 0.17%.  Because both halves come through here, the
+    switch cancels exactly on any pair that is excluded, which is every pair it
+    can reach.
+
+    A pair with `sigma = 0` has no 12-6 at all, as it had under the bare form,
+    and is masked rather than divided by.
     """
     ff = resolve(params)
-    core = ff.core_fraction * sigma
-    # Evaluate the true form at max(r, core) -- so the branch below never sees
-    # the divergence at all -- then extrapolate back along the tangent.
-    r_eval = np.maximum(r, core)
-    sr6 = (sigma / r_eval) ** 6
-    sr12 = sr6 * sr6
-    u = 4.0 * eps * (sr12 - sr6)
-    du_dr = -(24.0 * eps / r_eval) * (2.0 * sr12 - sr6)
-    # `du_dr` needs no branch: evaluated at `core` it is already the tangent's
-    # constant slope, which is exactly the derivative of the linear piece.
-    u = np.where(r < core, u + du_dr * (r - core), u)
+    has_lj = sigma != 0.0
+    x6 = (r / np.where(has_lj, sigma, 1.0)) ** 6
+    inv_s = 1.0 / (ff.soft_core + x6)
+    inv_s2 = inv_s * inv_s
+    u = np.where(has_lj, 4.0 * eps * (inv_s2 - inv_s), 0.0)
+    # ds/dr = 6 x6 / r; the r is kept out of the denominator so a pair at
+    # exact contact, which the soft core now makes finite, stays finite.
+    ds_dr = 6.0 * r**5 / np.where(has_lj, sigma, 1.0) ** 6
+    du_dr = np.where(has_lj, 4.0 * eps * (inv_s2 - 2.0 * inv_s2 * inv_s) * ds_dr, 0.0)
 
     # Product rule, applied here rather than in `__call__` for the reason
     # `zbl.pair_potential` gives: the forces, the virial and
@@ -170,11 +181,11 @@ def pair_potential(
     # function returns, so the switch and its derivative have to travel
     # together.
     #
-    # The linear continuation above is what makes this well defined at small
-    # `r`.  `g` goes to zero there while an unclamped `r**-12` goes to 1e21, and
-    # `0 * 1e21` is not zero in floating point -- it is 1e21 times a denormal
-    # and then whatever the compiler feels like.  Bounded at ~5700 eV, the
-    # product is a clean underflow to zero.
+    # The soft core above is what makes this well defined at small `r`.  `g`
+    # goes to zero there while a bare `r**-12` goes to 1e21, and `0 * 1e21` is
+    # not zero in floating point -- it is 1e21 times a denormal and then
+    # whatever the compiler feels like.  Bounded by `4 eps / c**2`, the product
+    # is a clean underflow to zero.
     g, dg_dr = switch(r, ff)
     return g * u, g * du_dr + dg_dr * u
 

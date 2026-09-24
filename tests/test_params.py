@@ -89,7 +89,7 @@ class TestTheDefaults:
         assert DEFAULTS.taper_radius == 1.5
         assert DEFAULTS.taper_width == 0.12
         assert DEFAULTS.switch_radius == 2.2
-        assert DEFAULTS.core_fraction == 0.4
+        assert DEFAULTS.soft_core == 0.01
         assert DEFAULTS.exclusion_depth == 3
         assert DEFAULTS.exclude_coulomb is True
         assert DEFAULTS.gamma == 2.0
@@ -305,21 +305,26 @@ class TestTheParametersReachTheForceField:
         assert abs(on) > 1e-3
         assert abs(off) < abs(on) / 100.0
 
-    def test_the_core_fraction_reaches_the_12_6(self):
-        """Where `r**-12` hands over to its own tangent.
+    def test_the_soft_core_reaches_the_12_6(self):
+        """The cap `4 eps (1/c**2 - 1/c)` the soft core puts on the 12-6.
 
-        Inside the default core the potential is linear; raising the fraction
-        moves the hand-over out, so a separation that was on the `r**-12` branch
-        is now on the tangent and reads lower.
+        Asserts the number at contact, where `c` is the whole answer: a call
+        site reading a stale default would give the other one.
         """
-        r = np.array([1.5])
+        r = np.array([0.0])
         sigma = np.array([3.0])
         eps = np.array([0.5])
-        with use(switch_radius=0.0, core_fraction=0.4):
+        with use(switch_radius=-100.0, soft_core=0.01):
             default = lj_module.pair_potential(r, sigma, eps)[0][0]
-        with use(switch_radius=0.0, core_fraction=0.9):
+        with use(switch_radius=-100.0, soft_core=0.1):
             wide = lj_module.pair_potential(r, sigma, eps)[0][0]
-        assert wide != pytest.approx(default)
+        assert default == pytest.approx(2.0 * (1e4 - 1e2))
+        assert wide == pytest.approx(2.0 * (1e2 - 1e1))
+
+    def test_a_negative_soft_core_is_refused(self):
+        """`c < 0` puts a pole at `r = (-c)**(1/6) sigma`."""
+        with pytest.raises(ValueError, match="soft_core"):
+            ForceFieldParams(soft_core=-0.01)
 
     def test_the_bond_asymptote_reaches_the_morse(self):
         """The dissociated limit of a stretched bond is the asymptote itself.

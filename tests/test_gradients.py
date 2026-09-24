@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from ase import units
 
-from DynamicTopology.forcefield.params import active
+from DynamicTopology.forcefield.params import active, use
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.acks2 import ACKS2
 from DynamicTopology.forcefield.pointcharge import PointCharge
@@ -17,6 +17,7 @@ from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.lj import LennardJones
 from DynamicTopology.forcefield.zbl import ZBL
 from DynamicTopology.io.units import from_openmm
+from DynamicTopology.forcefield import lj as lj_module
 from DynamicTopology.forcefield import zbl as zbl_module
 
 from geometry import REACTION, REACTION_PATH_RAMP, reaction_path
@@ -928,6 +929,65 @@ class TestLennardJonesGradients:
             global_forces, -exclusion_forces, atol=1e-9, rtol=1e-9
         )
 
+    @pytest.mark.parametrize(
+        "r",
+        [0.0, 0.05, 0.3, 0.777, 1.21, 1.8, 2.4, 3.3, 5.0],
+        ids=["contact", "core", "crushed", "hh_bond", "oo_bond", "wall", "contact_oo",
+             "well", "tail"],
+    )
+    def test_pair_potential(self, r):
+        """`du/dr` of the soft-core form against central differences.
+
+        With the switch pushed to zero radius, so that the bare soft-core 12-6
+        is what is differenced -- through the switch it is ~1e-5 eV at every
+        radius under 1.5 A and a wrong `ds/dr` would pass unseen.  `contact` is
+        `r = 0` exactly, which the soft core makes finite; its derivative is 0.
+        """
+        sigma = np.array([np.sqrt(self.SIGMA[0] * self.SIGMA[1]) * 10.0])
+        eps = np.array([np.sqrt(self.EPS[0] * self.EPS[1]) / 96.48533212331])
+        h = 1e-6
+        with use(switch_radius=-100.0):
+            u, analytic = lj_module.pair_potential(np.array([r]), sigma, eps)
+            if r == 0.0:
+                # Not exactly 0: the switch's clipped tail leaves `dg/dr` at
+                # ~1e-217, times the finite core.
+                assert np.isfinite(u[0]) and abs(analytic[0]) < 1e-12
+                return
+            numeric = (
+                lj_module.pair_potential(np.array([r + h]), sigma, eps)[0]
+                - lj_module.pair_potential(np.array([r - h]), sigma, eps)[0]
+            ) / (2 * h)
+        # `abs` is the difference's roundoff: `u` is ~150 eV in the core, so a
+        # 1e-6 A step resolves the slope only to ~1e-8 eV/A there.
+        assert analytic == pytest.approx(numeric, rel=1e-6, abs=1e-7)
+
+    def test_the_soft_core_is_the_12_6_at_zero_and_bounded_otherwise(self):
+        """`c = 0` is the textbook form; `c > 0` caps it at `4 eps (1/c**2 - 1/c)`."""
+        r = np.array([0.0, 1.0, 2.0, 2.0 ** (1 / 6) * 3.0, 4.0])
+        sigma = np.full(r.shape, 3.0)
+        eps = np.full(r.shape, 0.5)
+        with use(switch_radius=-100.0, soft_core=0.0):
+            bare = lj_module.pair_potential(r[1:], sigma[1:], eps[1:])[0]
+        sr6 = (sigma[1:] / r[1:]) ** 6
+        np.testing.assert_allclose(bare, 4.0 * eps[1:] * (sr6 * sr6 - sr6), rtol=1e-12)
+
+        with use(switch_radius=-100.0, soft_core=0.01):
+            u = lj_module.pair_potential(r, sigma, eps)[0]
+        assert u[0] == pytest.approx(4.0 * 0.5 * (1e4 - 1e2), rel=1e-12)
+        assert np.all(u <= u[0])
+        # The minimum stays at s = 2, so the well is exactly eps deep -- only
+        # its position moves, inward by (1 - c/2)**(1/6).
+        r_min = (2.0 - 0.01) ** (1 / 6) * 3.0
+        with use(switch_radius=-100.0, soft_core=0.01):
+            u_min = lj_module.pair_potential(np.array([r_min]), sigma[:1], eps[:1])[0]
+        assert u_min[0] == pytest.approx(-0.5, rel=1e-12)
+
+    def test_a_zero_sigma_has_no_12_6(self):
+        """The datasets carry `sigma = 0` atoms; that pair must read 0, not nan."""
+        r = np.array([0.0, 0.5, 2.5])
+        u, du_dr = lj_module.pair_potential(r, np.zeros(3), np.full(3, 0.5))
+        assert np.all(u == 0.0) and np.all(du_dr == 0.0)
+
     @pytest.mark.parametrize("separation", [0.744, 0.3, 0.2, 0.024])
     def test_a_compressed_bond_stays_within_precision(self, separation):
         """The decomposition must survive a bond being crushed.
@@ -942,9 +1002,9 @@ class TestLennardJonesGradients:
         1e16 K.  The potential energy alone looked fine the whole way down,
         which is why this is asserted on the magnitude rather than on the total.
 
-        `pair_potential`'s linear continuation is what bounds it.  Both halves
-        go through that function, so the cancellation stays exact as well --
-        which is the other half of the assertion, and the half that broke when
+        `pair_potential`'s soft core is what bounds it.  Both halves go through
+        that function, so the cancellation stays exact as well -- which is the
+        other half of the assertion, and the half that broke when
         `compute_exclusion` still open-coded the form.
         """
         pos = np.array([[0.0, 0.0, 0.0], [separation, 0.0, 0.0]])
@@ -959,7 +1019,7 @@ class TestLennardJonesGradients:
             make_term("exclusion", [[0, 1]], sigma=[sigma], eps=[eps]),
         )
 
-        # Bounded: unlinearized 12-6 reaches 8e7 eV at 0.3 A and 1e21 at 0.024.
+        # Bounded: bare 12-6 reaches 8e7 eV at 0.3 A and 1e21 at 0.024.
         assert abs(total) < 1e5, (
             f"a bond at {separation} A contributes {total:.3e} eV to the "
             "whole-system sum; the difference of two such numbers has no "

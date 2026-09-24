@@ -212,22 +212,21 @@ ones, `σ_ij = sqrt(σ_i σ_j)`, `ε_ij = sqrt(ε_i ε_j)`.
 
 ```
 g(r)  = 1 - 1 / ( 1 + exp( (r - switch_radius) / switch_width ) )
-r_e   = max( r, core_fraction * σ )
+s(r)  = soft_core + (r/σ)^6
 
-u_126 = 4 ε [ (σ/r_e)^12 - (σ/r_e)^6 ]          plus, for r < core_fraction σ,
-        + du/dr|_{r_e} * (r - core_fraction σ)   the C1 tangent continuation
+u_126 = 4 ε [ s^-2 - s^-1 ]                     the soft-core 12-6; bare at soft_core = 0
 
 u(r)  = g(r) * u_126(r)
 ```
 
 `g` is `zbl.taper` reflected — same width, turning the term **on** above
-`switch_radius`, with `dg/dr = g (1 - g) / switch_width`.  The linear core
-continuation bounds what a compressed bond can contribute (≈5700 eV rather than
-1e21 eV at 0.024 Å), which is what keeps the exclusion subtraction below
-numerically exact.
+`switch_radius`, with `dg/dr = g (1 - g) / switch_width`.  The soft core
+bounds what a compressed bond can contribute — `4 ε (1/c² - 1/c)` at contact,
+292 eV for the O–O pair rather than 1e21 eV at 0.024 Å — which is what keeps the
+exclusion subtraction below numerically exact.
 
 ```
-switch_radius = 2.2 Å               core_fraction = 0.4
+switch_radius = 2.2 Å               soft_core = 0.01
 switch_width  = taper_width         exclusion_depth = 3
 ```
 
@@ -593,7 +592,7 @@ are what a manifest that omits a key gets.
 | `taper_width` | 0.12 | Å | `zbl`, and `switch_width` by default | every `.jsonl` in the dataset |
 | `switch_radius` | 2.2 | Å | `lj` | every `.jsonl` in the dataset |
 | `switch_width` | `taper_width` | Å | `lj` | every `.jsonl` in the dataset |
-| `core_fraction` | 0.4 | — | `lj` | every `.jsonl` in the dataset |
+| `soft_core` | 0.01 | — | `lj` | every `.jsonl` in the dataset |
 | `exclusion_depth` | 3 | bonds | `exclusions` | every `.jsonl` in the dataset |
 | `exclude_coulomb` | `true` | — | `exclusions` | every `.jsonl` in the dataset |
 | `gamma` | 2.0 | 1/Å | `ewald` | every `.jsonl` in the dataset |
@@ -663,26 +662,36 @@ and what survives at 2.2 Å / 0.12 Å:
 
 | pair | bare | switched |
 | --- | --- | --- |
-| O–H bond, 0.958 Å | 953 eV | 0.031 eV |
-| H–H bond, 0.741 Å | 892 eV | 0.004 eV |
-| O–O bond, 1.208 Å | 1375 eV | 0.353 eV |
+| O–H bond, 0.958 Å | 953 eV | 0.0024 eV |
+| H–H bond, 0.741 Å | 892 eV | 0.0002 eV |
+| O–O bond, 1.208 Å | 1375 eV | 0.035 eV |
 | water's 1-3 H···H, 1.51 Å | 0.138 eV | 0.0004 eV |
-| the H-bond O···H, 1.94 Å | 0.146 eV | 0.015 eV |
-| O···O contact, 2.6 Å | 0.076 eV | 0.073 eV |
-| O···O contact, 2.4 Å | 0.262 eV | 0.220 eV |
+| the H-bond O···H, 1.94 Å | 0.146 eV | 0.014 eV |
+| O···O contact, 2.6 Å | 0.076 eV | 0.069 eV |
+| O···O contact, 2.4 Å | 0.262 eV | 0.202 eV |
 
-The last two rows are the wall this term exists to supply, retained at 97%
-and 84%. The gap from ~1.6 to ~2.0 Å is deliberate: neither term acts there
+The switched column is the soft-cored form (`soft_core = 0.01`) the force field
+evaluates; with the bare 12-6 it read 0.031, 0.004 and 0.353 eV at the three
+bond lengths and 0.073 and 0.220 eV at the two contacts.  The last two rows are
+the wall this term exists to supply, retained at 91% and 77% (97% and 84% of
+that by the switch, the rest by the soft core, which softens the wall inside
+sigma by 6-8% there). The gap from ~1.6 to ~2.0 Å is deliberate: neither term acts there
 (`zbl.taper` is down to 0.076 at 1.8 Å and 12-6 isn't yet up), and `ACKS2`
 alone already binds the water dimer at −0.112 eV through it —
 `tests/test_collapse.py` checks that an intermolecular approach stays uphill
 through the gap.
 
-**`core_fraction` (0.4).** 0.4·σ is 0.78 Å for an H–H pair and 1.18 Å for
-O–O — inside the Morse core of a real bond and far inside any intermolecular
-contact — so the linear-tangent continuation never engages on a pair whose
-repulsion is doing physical work; the wall there is already 451 eV (H-H) and
-1750 eV (O-O).
+**`soft_core` (0.01).** `u = 4 ε [s^-2 - s^-1]` with `s = c + (r/σ)^6` is
+finite at contact, `4 ε (1/c² - 1/c) = 39600 ε`: 76 eV for H–H, 149 eV for
+O–H and 292 eV for O–O, where the linear-tangent core it replaced (`core_fraction
+= 0.4`) reached 5900, 11600 and 22800 eV.  The minimum stays at `s = 2`, so the
+well depth is exactly ε at any `c` and its position moves in by 0.08%; the zero
+crossing moves in by 0.17%, and beyond σ the potential differs from the bare
+12-6 by at most 4cε = 0.04 ε, at r = σ.  What it does change is the wall inside σ, which it lowers by
+`~2c/(r/σ)^6` in relative terms: 7% for O–O at 2.5 Å, 12% at 2.2 Å.  Unlike the
+linear core, which never engaged above 0.4σ, this reaches the intermolecular
+contact the term exists for, so it is a real change to the water wall, not
+only a numerical guard.
 
 **`accuracy` (1e-8).** Loosening it is cheap in reciprocal vector count
 (`(-log accuracy)^3`) but expensive in the *stress*: `kappa` is derived from
@@ -717,7 +726,7 @@ claims a radius the force field never saw.
 
 Both datasets in this repository pin the eight parameters that enter the fitted
 surface — `bond_asymptote`, `taper_radius`, `taper_width`, `switch_radius`,
-`core_fraction`, `exclusion_depth`, `exclude_coulomb`, `gamma` — so a future
+`soft_core`, `exclusion_depth`, `exclude_coulomb`, `gamma` — so a future
 change to one of *those* defaults cannot silently invalidate the `.jsonl` files
 already on disk.  `switch_width` follows from the pinned `taper_width`, which leaves `ccoul` and `zbl_ccoul` as the
 two that are still taken from the defaults and would move a fitted surface if

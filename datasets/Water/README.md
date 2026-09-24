@@ -18,7 +18,7 @@ at wB97X-V/aug-cc-pVTZ.
 | 3 | `reactions/h2o-autoionization`| H2O + H2O <-> H3O+ + OH-           | 6 | -4.111 | 46.8 |
 
 The manifest's `global_params` block pins the force field constants these terms
-were fitted at -- the two taper radii and widths, `core_fraction`,
+were fitted at -- the two taper radii and widths, `soft_core`,
 `exclusion_depth`, `exclude_coulomb`, `bond_asymptote` and `gamma`.  They are the
 repository defaults, written out rather than left implicit so that a later change
 to a default cannot invalidate these `.jsonl` files without a diff saying so.

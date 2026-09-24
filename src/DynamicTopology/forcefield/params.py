@@ -77,11 +77,12 @@ class ForceFieldParams:
     # explicitly decouples the two, which nothing has yet needed.
     switch_width: float | None = None
 
-    # Where 12-6 stops being evaluated as `r**-12` and continues as its own
-    # tangent, as a fraction of sigma.  Dimensionless.  See `lj.pair_potential`
-    # for what the continuation is for; it never engages on a pair whose
-    # repulsion is doing physical work (see `forcefield/README.md`).
-    core_fraction: float = 0.4
+    # The 12-6's soft-core constant `c`, in `4 eps [s**-2 - s**-1]` with
+    # `s = c + (r/sigma)**6`.  Dimensionless.  `c = 0` is the bare 12-6; any
+    # `c > 0` makes it finite at contact, `4 eps (1/c**2 - 1/c)`.  See
+    # `lj.pair_potential` for what the bound is for; the well depth is `eps`
+    # whatever `c` is (see `forcefield/README.md`).
+    soft_core: float = 0.01
 
     # --- the intramolecular exclusions (`exclusions`) ----------------------
 
@@ -162,6 +163,9 @@ class ForceFieldParams:
         for name in ("taper_width", "switch_width", "gamma", "accuracy"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be > 0, got {getattr(self, name)}")
+        if self.soft_core < 0.0:
+            # A negative `c` puts a pole at `r = (-c)**(1/6) sigma`.
+            raise ValueError(f"soft_core must be >= 0, got {self.soft_core}")
 
     @classmethod
     def from_dict(cls, mapping: Any, source: str | None = None) -> "ForceFieldParams":

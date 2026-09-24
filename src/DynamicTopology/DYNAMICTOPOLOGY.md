@@ -586,38 +586,44 @@ $g(r) + f(10r) \ne 1$. Calling them complementary is the mistake the next paragr
 is about. Like ZBL's, the exponent is clipped at $\pm 500$
 ([lj.py:178](forcefield/lj.py#L178)).
 
-**A linear core below $0.4\sigma$** ([params.py](forcefield/params.py),
-[lj.py:222](forcefield/lj.py#L222)). Below `core_fraction` $\times\ \sigma$ the
-potential is continued by its own tangent,
+**A soft core** ([params.py](forcefield/params.py),
+[lj.py](forcefield/lj.py)). The 12-6 is evaluated as
 
 $$
-u(r) = u(r_\text{core}) + u'(r_\text{core})\,(r - r_\text{core}),
-\qquad r_\text{core} = 0.4\,\sigma ,
+u(r) = 4\varepsilon\left[s^{-2} - s^{-1}\right],
+\qquad s = c + (r/\sigma)^6 ,
 $$
 
-which is 0.78 Å for H–H and 1.18 Å for O–O, where the bare wall is already 451 and
-1750 eV. This is not cosmetic: without it the $\sum_\text{all} - \sum_\text{near}$
+with $c =$ `soft_core` $= 0.01$: the bare 12-6 at $c = 0$, and for $c > 0$ finite at
+contact, $u(0) = 4\varepsilon(1/c^2 - 1/c)$ — 76, 149 and 292 eV for H–H, O–H and
+O–O. The minimum stays at $s = 2$, so the well depth is exactly $\varepsilon$; beyond
+$\sigma$ it differs from the bare 12-6 by at most $4c\varepsilon$, and inside it the wall is lowered
+by $\sim 2c/(r/\sigma)^6$ — 7% for O–O at 2.5 Å, 12% at 2.2 Å. This is not cosmetic: without it the $\sum_\text{all} - \sum_\text{near}$
 decomposition below evaluates $r^{-12}$ on both sides at compressed geometries and
 loses the difference to floating point — H₂ at 0.3 Å puts $10^8$ eV in each sum, at
 0.2 Å $10^{10}$, at 0.024 Å $10^{21}$, and a 3000 K probe reached $10^{21}$ by step
 143 with the physical difference coming back quantized to $2^{22}$ eV and the box
-at $10^{16}$ K. With the continuation the same geometries read ~4500 eV and
-~5700 eV. It also lets $g\,u$ underflow cleanly instead of forming $0 \times 10^{21}$.
+at $10^{16}$ K. With the soft core no pair can exceed $4\varepsilon/c^2$. It also lets
+$g\,u$ underflow cleanly instead of forming $0 \times 10^{21}$. (It replaced a linear
+tangent continuation below $0.4\sigma$, `core_fraction`, which bounded the same
+geometries at ~4500 and ~5700 eV and never engaged above 0.78 Å for H–H.)
 
 **The switch is what makes the term usable, and its radius is the whole argument.**
 Bare, this is the 500–1400 eV column in the table above. Switched at 2.2 Å:
 
 | | bare | switched | what it is |
 | --- | --- | --- | --- |
-| O–H, 0.958 Å | 953 eV | **0.031 eV** | the O–H bond |
-| H–H, 0.741 Å | 892 eV | **0.005 eV** | the H₂ bond |
-| O–O, 1.208 Å | 1375 eV | **0.353 eV** | the O₂ bond, the worst case |
+| O–H, 0.958 Å | 953 eV | **0.0024 eV** | the O–H bond |
+| H–H, 0.741 Å | 892 eV | **0.0002 eV** | the H₂ bond |
+| O–O, 1.208 Å | 1375 eV | **0.035 eV** | the O₂ bond, the worst case |
 | H⋯H, 1.51 Å | 0.138 eV | 0.0004 eV | water's 1-3 pair |
-| O⋯H, 1.94 Å | 0.146 eV | 0.015 eV | the hydrogen-bond contact |
-| O⋯O, 2.4 Å | 0.262 eV | 0.220 eV | **the wall**, 84% retained |
-| O⋯O, 2.6 Å | 0.076 eV | 0.073 eV | **the wall**, 97% retained |
+| O⋯H, 1.94 Å | 0.146 eV | 0.014 eV | the hydrogen-bond contact |
+| O⋯O, 2.4 Å | 0.262 eV | 0.202 eV | **the wall**, 77% retained |
+| O⋯O, 2.6 Å | 0.076 eV | 0.069 eV | **the wall**, 91% retained |
 
-Three to four orders of magnitude at a bond length, and essentially untouched where
+The switched column includes the soft core; the switch alone gives 0.031, 0.005 and
+0.353 eV at the three bonds and retains 84% and 97% of the wall. Four to five orders
+of magnitude at a bond length, and essentially untouched where
 the term does its work. That is what lets the **whole-system sum** carry no
 exclusions at all: it is therefore the same number on every diabatic state, and is
 added once outside the Hamiltonian exactly as `ZBL` and `ACKS2` are — where it
@@ -647,7 +653,7 @@ in this gap. `tests/test_collapse.py` is what checks nothing squeezes through it
 
 **It is a refit, for the same reason the taper was.** fast-forces' `refine` solves
 against $E_{\text{QForce}} + E_{\text{nonbonded}}$ and this term is inside
-$E_{\text{nonbonded}}$, so changing $r_s$, $w$ or `core_fraction` invalidates every
+$E_{\text{nonbonded}}$, so changing $r_s$, $w$ or `soft_core` invalidates every
 `.jsonl` in the dataset that states them. What that cost is recorded in
 [production/density-300K/README.md](../../production/density-300K/README.md).
 
@@ -929,7 +935,7 @@ path a bond does.
 
 **The 12-6's correction is small now, and that is exactly why this is safe where the
 four historical attempts were not.** A diabatic state that has broken a bond pays
-its `exclusion` at the bond length: 0.005–0.35 eV in §2.2.1's switched column, not
+its `exclusion` at the bond length: 0.0002–0.035 eV in §2.2.1's switched column, not
 the 500–1400 eV of the bare form. A diagonal that moves by a third of an eV between
 states is a chemical decision; one that moves by 900 eV is the failure mode
 `lj.py`'s docstring enumerates. The switch is what made the same decomposition
@@ -1397,7 +1403,7 @@ $$
 by `brentq` over `SCALE_BRACKET` $= (0.05, 20.0)$. Note $E_{\text{FF}}$ here is
 **bonded plus nonbonded** — `bonded_energy` includes ACKS2, ZBL and the switched
 12-6 (memoized in `_NONBONDED_CACHE`), which is why every change to
-`taper_radius`, `taper_width`, `switch_radius` or `core_fraction` forces a refit.
+`taper_radius`, `taper_width`, `switch_radius` or `soft_core` forces a refit.
 
 **The exclusions are inside that target too, and adding them was a refit of both
 datasets.** The fit path reaches ACKS2 through `ACKS2.__call__`, which screens by

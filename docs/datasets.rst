@@ -51,7 +51,7 @@ The manifest
            "taper_radius": 1.5,
            "taper_width": 0.12,
            "switch_radius": 2.2,
-           "core_fraction": 0.4,
+           "soft_core": 0.01,
            "exclusion_depth": 3,
            "exclude_coulomb": true,
            "gamma": 2.0

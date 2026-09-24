@@ -32,7 +32,7 @@ and therefore take the same value on every state.
 | force | eV/Å |
 | stress | eV/Å³ |
 
-Dimensionless: `core_fraction`, `n`, `accuracy`.
+Dimensionless: `soft_core`, `n`, `accuracy`.
 
 These are the units every parameter is held, evaluated and stored in: a
 `.jsonl` carries them as they are.  q-force and OpenMM state the bonded and 12-6
@@ -188,21 +188,24 @@ ones: `σ_ij = sqrt(σ_i σ_j)`, `ε_ij = sqrt(ε_i ε_j)`.
 g(r)  = 1 - 1 / ( 1 + exp( (r - switch_radius) / switch_width ) )
 dg/dr = g (1 - g) / switch_width
 
-r_e   = max( r, core_fraction * σ )
+s(r)  = soft_core + (r/σ)^6
+ds/dr = 6 r^5 / σ^6
 
-u_126(r) = 4 ε [ (σ/r_e)^12 - (σ/r_e)^6 ]
-           + du/dr|_{r_e} * (r - core_fraction σ)      for r < core_fraction σ
+u_126(r) = 4 ε [ s^-2 - s^-1 ]
+du_126/dr = 4 ε [ s^-2 - 2 s^-3 ] ds/dr
 
 u(r)  = g(r) * u_126(r)
 ```
 
 `g` is the reflection of the ZBL taper at the same width: it turns the term
-**on** above `switch_radius`.  The linear continuation below `core_fraction σ`
-is the C1 tangent at the core radius; it bounds what a strongly compressed pair
-can contribute (≈5700 eV rather than ≈1e21 eV at 0.024 Å).
+**on** above `switch_radius`.  The soft core makes `u_126` finite at contact,
+`4 ε (1/c² - 1/c)` with `c = soft_core`; it bounds what a strongly compressed
+pair can contribute (≤292 eV for any pair the datasets carry, rather than
+≈1e21 eV at 0.024 Å).  At `soft_core = 0` it is the bare 12-6.  A pair with
+`σ = 0` contributes nothing.
 
 ```
-switch_radius = 2.2 Å               core_fraction = 0.4
+switch_radius = 2.2 Å               soft_core = 0.01
 switch_width  = taper_width
 ```
 
@@ -495,7 +498,7 @@ below apply where a dataset does not state a value.
 | `taper_width` | 0.12 | Å | ZBL switch (§2); sets `switch_width` by default |
 | `switch_radius` | 2.2 | Å | 12-6 switch (§3) |
 | `switch_width` | `taper_width` | Å | 12-6 switch (§3) |
-| `core_fraction` | 0.4 | — | 12-6 core continuation (§3) |
+| `soft_core` | 0.01 | — | 12-6 soft core (§3) |
 | `exclusion_depth` | 3 | bonds | exclusions (§5) |
 | `exclude_coulomb` | true | — | exclusions (§5.2) |
 | `gamma` | 2.0 | 1/Å | charge kernel (§4.1) |
@@ -567,16 +570,19 @@ what survives at 2.2 Å with a 0.12 Å width:
 
 | pair | bare | switched |
 | --- | --- | --- |
-| O–H bond, 0.958 Å | 953 eV | 0.031 eV |
-| H–H bond, 0.741 Å | 892 eV | 0.004 eV |
-| O–O bond, 1.208 Å | 1375 eV | 0.353 eV |
+| O–H bond, 0.958 Å | 953 eV | 0.0024 eV |
+| H–H bond, 0.741 Å | 892 eV | 0.0002 eV |
+| O–O bond, 1.208 Å | 1375 eV | 0.035 eV |
 | water 1-3 H···H, 1.51 Å | 0.138 eV | 0.0004 eV |
-| hydrogen-bond O···H, 1.94 Å | 0.146 eV | 0.015 eV |
-| O···O contact, 2.6 Å | 0.076 eV | 0.073 eV |
-| O···O contact, 2.4 Å | 0.262 eV | 0.220 eV |
+| hydrogen-bond O···H, 1.94 Å | 0.146 eV | 0.014 eV |
+| O···O contact, 2.6 Å | 0.076 eV | 0.069 eV |
+| O···O contact, 2.4 Å | 0.262 eV | 0.202 eV |
 
+The switched column includes the soft core (`soft_core` = 0.01); the switch
+alone, on the bare 12-6, gives 0.031, 0.004 and 0.353 eV at the bond lengths.
 The last two rows are the intermolecular wall this term exists to supply,
-retained at 97% and 84%.  Suppressing the term at bond lengths to 0.03–0.35 eV is
+retained at 91% and 77% (97% and 84% by the switch alone).  Suppressing the
+term at bond lengths to 0.0002–0.035 eV is
 what allows it to carry no exclusions at all, hence to take the same value on
 every state, hence to sit outside the Hamiltonian.  The resulting gap from ~1.6
 to ~2.0 Å, where neither repulsive term acts (the ZBL taper is down to 0.076 at
@@ -584,10 +590,14 @@ to ~2.0 Å, where neither repulsive term acts (the ZBL taper is down to 0.076 at
 water dimer at −0.112 eV through it, and an intermolecular approach remains
 uphill across the gap.
 
-**`core_fraction` = 0.4.** `0.4 σ` is 0.78 Å for an H–H pair and 1.18 Å for O–O —
-inside the Morse core of a real bond and far inside any intermolecular contact —
-so the linear continuation never engages on a pair whose repulsion is doing
-physical work; the wall at those radii is already 451 eV (H–H) and 1750 eV (O–O).
+**`soft_core` = 0.01.** Finite at contact, `39600 ε`: 76 eV (H–H), 149 eV (O–H),
+292 eV (O–O).  The minimum stays at `s = 2`, so the well depth is exactly `ε` and
+its position moves in by 0.08%; the zero crossing moves in by 0.17%, and beyond
+`σ` the potential differs from the bare 12-6 by at most `4 c ε` = 0.04 `ε`.  Inside `σ` it lowers the
+wall by `~2c/(r/σ)^6` in relative terms — 7% for O–O at 2.5 Å, 12% at 2.2 Å —
+so unlike the linear core it replaced (`core_fraction` = 0.4, which never
+engaged above 0.78 Å for H–H or 1.18 Å for O–O), it reaches the intermolecular
+contact.
 
 **`accuracy` = 1e-8.** Loosening it is cheap in reciprocal-vector count, which
 scales as `(-log accuracy)^3`, but expensive in the *stress*: `kappa` is derived

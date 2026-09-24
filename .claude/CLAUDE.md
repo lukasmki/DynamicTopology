@@ -144,8 +144,8 @@ understand before touching either:
 Bare ZBL is fitted for keV nuclear stopping, and reaching it into the 1.5–3 Å range put +0.72 eV on
 a water dimer's hydrogen bond and +251 kbar in a water box; the taper keeps >90% of it at every bond
 length, so the wall stays where the Morse depths absorb it. Bare 12-6 is the opposite problem — 500
-to 1400 eV at a bond length, which is why it had been retired — and its switch takes it to 0.03–0.35
-eV there. **That is what lets its whole-system sum carry no exclusions**, hence be identical on
+to 1400 eV at a bond length, which is why it had been retired — and its switch plus a soft core
+(`u = 4ε[s⁻² − s⁻¹]`, `s = soft_core + (r/σ)⁶`, finite at contact) take it to 0.0002–0.035 eV there. **That is what lets its whole-system sum carry no exclusions**, hence be identical on
 every diabatic state, hence be addable outside the Hamiltonian; the four historical failure modes
 in `lj.py`'s docstring all descend from exclusions that sum no longer has. (Its small intramolecular
 correction is an ordinary per-state `exclusion` term, as the ZBL one is — step 6 above.)

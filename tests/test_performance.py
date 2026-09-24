@@ -287,16 +287,35 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 #     d250 (dense)    total -5.68e-14 eV   bonded  identical
 #     energy_nonbonded       identical            identical
 #     blocks                 identical            identical
+# And again when the 12-6's linear-tangent core (`core_fraction`) was replaced by
+# a soft core, `u = 4 eps [s**-2 - s**-1]` with `s = soft_core + (r/sigma)**6`,
+# `soft_core = 0.01` -- **before** any refit, on the parameters fitted against
+# the old form, so this entry is the kernel alone:
+#
+#     d30  (dilute)   -508.26231 -> -508.26301 eV     -7.03e-04 eV
+#     d250 (dense)    -506.20379 -> -506.73955 eV     -5.36e-01 eV
+#     energy_bonded   +16.5649 (d30)   +16.5663 (d250)
+#     energy_nonbonded       identical            identical
+#     blocks                 identical            identical
+#
+# `energy_bonded` moves by the same +16.57 eV on both boxes because it holds the
+# 12-6 `exclusion` terms, and the soft core lowers what every bonded pair is
+# charged in both halves of that cancellation; the whole-system sum moves by the
+# same amount the other way, so none of it reaches the total.  What does is the
+# wall inside sigma, which the soft core lowers by `~2c/(r/sigma)**6` -- 7% for
+# O-O at 2.5 A -- and which only the dense box's contacts reach: a thousand
+# times the dilute box's move.  Measured against the old kernel monkeypatched
+# back in, which reproduces the previous block below to the last bit.
 REFERENCE = {
     "tests/data/mix-n100-d30.xyz": (
-        -508.2623098702163,
-        -1201.0053130078657,
+        -508.26301235315725,
+        -1184.4404370873278,
         -0.0771285657403261,
         87,
     ),
     "tests/data/mix-n100-d250.xyz": (
-        -506.2037891791137,
-        -1201.099487212327,
+        -506.73955049240084,
+        -1184.5331484980647,
         -2.1383859668755543,
         28,
     ),

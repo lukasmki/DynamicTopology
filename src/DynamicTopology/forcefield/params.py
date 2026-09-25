@@ -92,23 +92,22 @@ class ForceFieldParams:
     # GROMACS's `nrexcl = 3`, and q-force's own convention.
     exclusion_depth: int = 3
 
-    # Whether to emit `coulombexclusion` terms; see `forcefield/exclusions.py`
-    # for how they're applied.  Off drops the Coulomb exclusion and keeps the
-    # other two -- a dataset the pipeline still evaluates consistently but
-    # cannot fit, since ACKS2 then scores H3O+ as a neutral H3O with nothing to
-    # cancel the intramolecular ZBL it excludes.
+    # Whether to emit `coulombexclusion` terms; see `forcefield/exclusions.py`.
+    # Only `PointCharge` reads them: fragment ACKS2 keeps a molecule's own
+    # electrostatics off its bonded terms by subtracting the molecule's isolated
+    # minimum instead, so this flag does not change an ACKS2 energy.
     exclude_coulomb: bool = True
 
     # --- the electrostatics -------------------------------------------------
 
     # Which electrostatic term the dataset was fitted with: `"acks2"`, charge
-    # equilibration solved once per force call and identical on every diabatic
-    # state, or `"pointcharge"`, fixed charges carried by each template's
-    # `charge` terms and therefore different on every state that moves a proton.
-    # The second is what localizes the +1 on a hydronium and the -1 on a
-    # hydroxide, which ACKS2's single sum-zero constraint cannot; see
-    # `forcefield/pointcharge.py`.  Changing it invalidates every `.jsonl` in the
-    # dataset, since the fit solves against whichever term this names.
+    # equilibration solved per diabatic state from each template's reference
+    # charges `q0` (`forcefield/acks2.py`), or `"pointcharge"`, fixed charges
+    # carried by each template's `charge` terms (`forcefield/pointcharge.py`).
+    # Both localize the +1 on a hydronium and move it with the proton; ACKS2
+    # also polarizes each molecule, and point charges are its zero-softness
+    # limit.  Changing it invalidates every `.jsonl` in the dataset, since the
+    # fit solves against whichever term this names.
     electrostatics: str = "acks2"
 
     # --- the charge kernel (`ewald`, `acks2`, `pointcharge`) -----------------

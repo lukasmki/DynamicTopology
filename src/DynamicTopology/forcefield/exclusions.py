@@ -24,74 +24,28 @@ structure was a *saddle*.  With the intramolecular nonbonded removed, the
 gas-phase minimum of a small template is the q-force potential's own minimum and
 nothing has to cancel anything.
 
-**Why Coulomb takes a different route.**  `exclusion` and `zblexclusion` are
-additive pair corrections, so `QForce` evaluates them per diabatic state
-alongside the bonded terms and nothing about the architecture changes.  Coulomb
-is not additive.  ACKS2's charges come from a linear solve whose matrix
-*contains* the kernel, so the exclusion cannot simply be subtracted from the
-energy and left out of the equilibration.
+**Coulomb is the exception, and under ACKS2 it needs no exclusion at all.**
+`exclusion` and `zblexclusion` are additive pair corrections, so `QForce`
+evaluates them per diabatic state alongside the bonded terms.  Coulomb is not
+additive under charge equilibration -- the charges come from a solve whose
+matrix *contains* the kernel -- and the route this module used to lay out for it
+(charges from the unmasked kernel, the exclusion applied afterwards as a screen
+on the energy) left an energy that was not the one the charges minimize.  That
+cost 0.07 eV of the water dimer's hydrogen bond and let ACKS2's intermolecular
+charge transfer go unopposed at an H2 + O2 contact.
 
-The obvious repair is to mask the kernel inside the solve.  It is consistent --
-a screened kernel is simply another kernel in the sense `forcefield/ewald.py`
-means, with energy, forces and virial all derived from it -- and it is wrong
-here for a reason that has nothing to do with consistency: it makes the charges
-a function of the bond graph.  `System.calculate` evaluates ACKS2 once, outside
-the EVB Hamiltonian, precisely because it is the same number for every diabatic
-state; topology-dependent charges evaluated once anyway make the total energy
-depend on which state happens to be the pivot, measured at **0.88 eV** on
-`tests/test_evb_invariants.py`.  Solving them per state instead would be
-correct and would multiply the most expensive thing in a force call by the basis
-size.
+Fragment ACKS2 (`forcefield/acks2.py`) solves the charges per diabatic state and
+reports each state's minimum *relative to its molecules' isolated minima*.  That
+reference is the molecule's own gas-phase electrostatics, so subtracting it
+keeps them off the bonded terms exactly -- the property the exclusion was for --
+while the kernel inside the solve stays whole.  ACKS2 therefore ignores
+`coulombexclusion` terms.
 
-**What is done instead.**  The charges are solved once from the *unmasked*
-kernel, and the exclusion is applied afterwards, in two places that are the same
-quantity seen from two directions:
-
-  - On each diabatic state's diagonal, as `-CCOUL sum_{excl} Q_i Q_j K_ij` --
-    one lookup per excluded pair into a kernel matrix that has already been
-    built (`ACKS2.exclusion_energy`).  This is what lets the exclusion decide
-    which bonding pattern is lower, which is the whole point of putting it on a
-    diagonal.
-  - Once on the whole system, as a screen on the Coulomb *energy* functional.
-    The screen is `1 - sum_s w_s M_s`, `w_s` the ground-state weights the EVB
-    diagonalization just produced, so a pair bonded in every state of its block
-    is removed outright and one bonded in some of them is removed in proportion.
-    That is not an interpolation: `sum_s w_s d(correction_s)/dr` is linear in
-    the masks and the kernel contraction is linear in its weight, so the whole
-    Hellmann-Feynman sum collapses into a single weight matrix.  One contraction
-    and one adjoint solve serve the entire system, which is the same cost the
-    unexcluded term always had.
-
-`ACKS2.prepare`/`ACKS2.compute` is the split that makes the ordering possible,
-and `ACKS2.compute_response_forces` carries the one asymmetry that has to be got
-right: `dE/dQ` is screened because the energy is, while the `-lam^T (dA/dr) x`
-weight is not, because `A` was never screened.
-
-Two consequences worth knowing about.  The charges are exactly what they were
-before exclusions existed -- an isolated water still comes out at `q_H =
-+0.30399` -- so nothing about a molecule's dipole moves.  And the exclusion is
-the first thing in this codebase to contract the periodic charge kernel against
-a *non-neutral* weight, which is what exposed the missing `k = 0` background in
-`forcefield/ewald.py`; an individual `K_ij` was not a well-defined number until
-that was added.
-
-**What it does cost is the intramolecular half of the polarization response,
-and that is a real 0.07 eV of the hydrogen bond.**  The water dimer well goes
-from 0.1677 eV at 2.85 A to 0.1024 eV at 2.91 A -- measured with the datasets
-held fixed, so this is the mechanism and not a refit -- decomposed at 2.85 A as
-
-    dimerization gain, unscreened ACKS2      -0.2063 eV
-      of which intramolecular self-energy    -0.0691 eV   <- removed here
-    q_H, monomer -> dimer                +0.30399 -> +0.31264
-
-The molecules polarize each other, the charges grow, and the *intramolecular*
-Coulomb energy falls along with the intermolecular one.  Booking that gain
-inside the molecule is exactly what the exclusion exists to stop -- the bonded
-terms own the intramolecular energy, and a template whose gas-phase minimum
-depends on its neighbours is the thing this module was written to remove -- but
-the binding it took with it has to come back somewhere else.  `eta` is the lever
-(`datasets/Water/README.md`): the intermolecular term scales as `q**2`, so
-softening the hardness recovers the depth without reintroducing the coupling.
+`PointCharge` still reads them: with fixed charges the Coulomb energy *is*
+additive, and an excluded pair's direct `erf(gamma r)/r` is simply subtracted,
+per state, leaving its periodic images in place.  For the templates shipped here
+every intramolecular pair is within `exclusion_depth`, and the two routes then
+give the same energy -- which `tests/test_acks2_fragment.py` holds them to.
 """
 
 from __future__ import annotations

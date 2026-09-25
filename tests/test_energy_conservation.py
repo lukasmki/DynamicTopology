@@ -14,16 +14,15 @@ asserted here:
 
 What each calculator covers:
 
-  EVB               Bonded QForce terms only, with the empirical geometric-mean
-                    coupling.  ACKS2 is added once on top of the ground state
-                    rather than to the Hamiltonian diagonal, so it does not
-                    pass through the nonlinear coupling.  Conservative.
-  DynamicTopology   QForce + RMSD EVB coupling + ACKS2 electrostatics.  ACKS2
-                    charges respond to the geometry, and that response is now
-                    carried into the force by an adjoint solve
-                    (ACKS2.compute_response_forces), so the electrostatic force
-                    is the gradient of the electrostatic energy for polar
-                    species too -- not only where charges vanish by symmetry.
+  EVB               QForce terms plus each state's electrostatics on the
+                    diagonal, with the empirical geometric-mean coupling.
+                    Conservative.
+  DynamicTopology   QForce + RMSD EVB coupling + ACKS2 electrostatics.  Each
+                    state's ACKS2 energy is the minimum of its own functional,
+                    so it is stationary in the charges and the electrostatic
+                    force is its gradient with no charge-response term -- for
+                    polar species too, not only where charges vanish by
+                    symmetry.
 
 Both calculators are exercised only where the bonding topology is constant.  A
 topology switch is a discontinuous change of the potential and is not expected
@@ -348,12 +347,15 @@ class TestEVBEnergyConservation:
 class TestDynamicTopologyEnergyConservation:
     """DynamicTopology adds the RMSD EVB coupling and ACKS2 electrostatics.
 
-    The polar cases are the ones that matter here.  O2 conserved even under the
+    The polar pair is the case that matters here.  O2 conserved even under the
     old frozen-charge forces, because its charges vanish by symmetry and the
-    missing term was identically zero; HO2 and H2O2 did not, and they are what
-    the charge-response adjoint bought.  Keep at least one of each, so a
-    regression that reintroduces the frozen-charge force is caught rather than
-    hidden behind the symmetric cases.
+    missing term was identically zero; HO2 and H2O2 did not, and they were what
+    the charge-response adjoint bought.  Under fragment ACKS2 a lone molecule's
+    electrostatics are its own isolated reference and score exactly zero, so
+    HO2 and H2O2 alone now test only the bonded terms -- H2O2 + HO2 is the case
+    where two polar molecules polarize each other and every piece of the
+    electrostatic force (the environment's response, the isolated references)
+    is live.
     """
 
     SYSTEMS = [
@@ -361,6 +363,7 @@ class TestDynamicTopologyEnergyConservation:
         pytest.param(["O2", "O2"], id="O2+O2"),
         pytest.param(["HO2"], id="HO2"),
         pytest.param(["H2O2"], id="H2O2"),
+        pytest.param(["H2O2", "HO2"], id="H2O2+HO2"),
     ]
 
     @pytest.mark.parametrize("formulas", SYSTEMS)

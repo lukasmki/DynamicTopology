@@ -11,7 +11,8 @@ and per-reaction transition-state ensembles. Three ship with the repository:
 ``datasets/Water``
    Proton transfer in bulk water (the Zundel and hydroxide hops, plus
    autoionization), computed at ωB97X-V/aug-cc-pVTZ, with ACKS2
-   electrostatics.
+   electrostatics. Its hydronium and hydroxide templates do not yet state
+   reference charges (``q0``), so ACKS2 currently treats them as neutral.
 
 ``datasets/Water-fixed-pc``
    The same chemistry with fixed per-template point charges
@@ -69,7 +70,11 @@ Each entry's ``path`` has no extension. Loading pairs ``<path>.xyz`` with
 
 * **Molecules**: the ``.xyz`` is one geometry. Its energy, if present, is the
   atomization energy used to put every template on a common reference scale.
-  The ``.jsonl`` holds the parameter terms, one per line, in eV and Å.
+  The ``.jsonl`` holds the parameter terms, one per line, in eV and Å. Under
+  ACKS2 each atom's ``atom`` term holds ``mu``, ``eta``, ``soft_amp``,
+  ``soft_decay`` and an optional reference charge ``q0`` (in e). The ``q0``
+  values of a molecule sum to its formal charge. Under point charges each atom
+  has a ``charge`` term with ``q``.
 * **Reactions**: the ``.xyz`` holds several frames, read as reactant,
   transition-state frames, then product. The ``.jsonl`` holds the coupling
   terms.
@@ -80,7 +85,8 @@ Every reaction is stored in both directions.
 
 Intramolecular exclusion terms (``exclusion``, ``zblexclusion``,
 ``coulombexclusion``) are not stored in the ``.jsonl``. They are derived from
-the bond graph at load time.
+the bond graph at load time. Only the point-charge model reads
+``coulombexclusion``. ACKS2 subtracts each molecule's isolated energy instead.
 
 .. _global-params:
 

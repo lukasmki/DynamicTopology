@@ -3,9 +3,8 @@
 `System.calculate` never evaluates a single topology in isolation -- it builds
 an EVB basis, and each diabat's energy is assembled from pieces that live in
 different places: `QForce` on the diagonal (the intramolecular exclusions
-included, as ordinary terms), the electrostatics prepared before the
-diagonalization and screened after it, `ZBL` and the 12-6 once for the whole
-system.  Anything that has to score one bonding pattern on its own -- a fitter
+included, as ordinary terms), the electrostatics solved per state and evaluated
+once at the ground-state weights, `ZBL` and the 12-6 once for the whole system.  Anything that has to score one bonding pattern on its own -- a fitter
 matching a template to its reference energy, a test pinning a template, a
 report decomposing an energy -- needs that same sum, and assembling it by hand
 is how the fitter once scored templates without the 12-6 the calculator applied.
@@ -49,7 +48,7 @@ class Evaluation:
 
     `bonded` is everything `QForce` evaluates -- the bonded terms, the reference
     shift and the ZBL and 12-6 exclusions; `electrostatics` is ACKS2 or the
-    point charges (see `surface`), with its own exclusion screen applied.  The
+    point charges (see `surface`), with its own exclusions applied.  The
     four parts sum to `energy`.
 
     `charges` are per atom, in global order: solved for by ACKS2, or read off
@@ -113,10 +112,9 @@ def _charges(td: dict, natoms: int) -> np.ndarray:
         if block is not None:
             charges[block["atoms"][:, 0]] = block["kwargs"]["q"]
     else:
-        block = td.get("atom")
-        solved = _ELECTROSTATICS.get().Q
-        if block is not None and solved is not None:
-            charges[block["atoms"][:, 0]] = solved
+        solver = _ELECTROSTATICS.get()
+        if td.get("atom") is not None and solver.Q is not None:
+            charges[solver.act] = solver.Q
     return charges
 
 
@@ -141,7 +139,7 @@ def _nonbonded_parts(atoms: Atoms, td: dict) -> tuple:
 def nonbonded(atoms: Atoms, td: dict) -> tuple[float, np.ndarray, np.ndarray]:
     """`(E, F, W)` of everything `evaluate` adds on top of `QForce`.
 
-    The electrostatics, screened by its own exclusion, the whole-system ZBL and
+    The electrostatics under its own exclusions, the whole-system ZBL and
     the switched 12-6 -- for a caller that memoizes this half across a fit of
     the bonded parameters, which it does not depend on.
     """

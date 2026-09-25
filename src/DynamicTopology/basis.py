@@ -208,8 +208,13 @@ class EVBBasis:
         max_states: int = 128,
         max_depth: int | None = None,
         switch_width: float | None = None,
+        gap=None,
     ):
         self.reaction_set = reaction_set
+        # What a reaction changes in the electrostatics, added to the bonded gap
+        # the gate screens on (`forcefield.electrostatics.ElectrostaticGap`).
+        # None screens on the bonded gap alone.
+        self.gap = gap
         self.bonded_ff = bonded_ff
         self.coupling_ff = coupling_ff
         self.eps = eps
@@ -304,13 +309,10 @@ class EVBBasis:
     def _local_energy(self, graph: nx.Graph, atoms: Atoms) -> float:
         """Bonded energy of the molecules in `graph`.
 
-        Bonded only, because that is now the whole of what differs between two
-        diabats.  Both nonbonded terms -- `ACKS2` and `ZBL` -- are functions of
-        the geometry and the elements alone, so they contribute equally to every
-        state of a block and cancel from the gap this screens on.  That is the
-        property the previous Lennard-Jones design did not have, and paying for
-        it here is what the Lennard-Jones correction that used to sit on this
-        line was doing.
+        `ZBL` and the 12-6 are functions of the geometry and the elements alone,
+        so they contribute equally to every state of a block and cancel from the
+        gap this screens on.  The electrostatics do not -- the charges follow the
+        bonding -- and `_channel_weight` adds them through `self.gap`.
         """
         return sum(
             self._molecule_energy(Topology(graph.subgraph(nodes)), atoms)
@@ -378,6 +380,8 @@ class EVBBasis:
 
         energy_before = self._local_energy(before, atoms)
         energy_after = self._local_energy(after, atoms)
+        if self.gap is not None:
+            energy_after += self.gap.energy(parent, before, after)
         weight = self._switch(energy_before, energy_after, coupling)
         if weight <= 0.0 or weight >= 1.0:
             return weight, None, None
@@ -396,6 +400,10 @@ class EVBBasis:
 
         forces_before, virial_before = self._local_gradients(before, atoms)
         forces_after, virial_after = self._local_gradients(after, atoms)
+        if self.gap is not None:
+            gap_forces, gap_virial = self.gap.gradients(parent, before, after)
+            forces_after = forces_after + gap_forces
+            virial_after = virial_after + gap_virial
         dgap = 0.5 * (forces_before - forces_after)
         dstabilization = (half_gap / hyp - np.sign(half_gap)) * dgap + (
             coupling / hyp

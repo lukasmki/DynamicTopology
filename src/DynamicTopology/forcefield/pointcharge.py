@@ -1,14 +1,11 @@
 """Fixed point-charge electrostatics, set per molecule topology.
 
-`ACKS2` solves one set of charges from the geometry and the elements, the same
-for every diabatic state, under a single constraint that the whole system is
-neutral.  That is what lets it sit outside the EVB Hamiltonian, and it is also
-exactly what it cannot do for proton transfer: an H3O+ and an H2O are the same
-atoms, so ACKS2 has no way to put the +1 on one rather than the other, and a
-hop moves no charge at all.  Here every template carries its own charges
+Every template carries its own charges
 (`{"type": "charge", "atoms": {"p0": i}, "kwargs": {"q": ...}}`), so the charge
 distribution is a function of the bonding, and a Grotthuss hop carries the
-excess charge with the proton.
+excess charge with the proton.  It is fragment ACKS2's zero-softness limit
+(`forcefield/acks2.py`): the same per-state structure with the charges fixed at
+the reference `q0` instead of solved for, so no linear system at all.
 
 **What that costs is that electrostatics becomes state-dependent**, so it moves
 onto the EVB diagonal, and it does so in a way no other term here does: it is
@@ -51,7 +48,7 @@ larger cost and both terms pay it.
 **The exclusion removes the direct pair and not its images.**  Under Ewald,
 `K_ij` for an excluded pair is the direct `erf(gamma r)/r` *plus* the
 interaction of `i` with every periodic image of `j`.  Only the first is what the
-bonded terms own; removing the whole `K_ij`, as `ACKS2`'s screen does, also
+bonded terms own; removing the whole `K_ij`, as the old ACKS2 screen did, also
 removes the image part while keeping each atom's own `K_ii`, which leaves
 `CCOUL/2 * K_self * sum_i q_i**2` per molecule behind -- -0.91 eV per water in a
 12.43 A box, scaling as 1/L, i.e. a pressure.  So the correction here is always
@@ -69,11 +66,11 @@ background**, which `Ewald.background` carries explicitly.  A reaction never
 changes the total charge, so the background energy is the same number on every
 diabatic state and does not affect which is lower.
 
-Admission into the EVB basis (`basis.py`) still screens on the *bonded* gap
-alone.  The gate is a smooth function of the geometry either way, so energy
-conservation does not depend on it, but a state whose electrostatics would pull
-it far below its bonded energy -- autoionization in a polar environment -- is
-screened as though it were in vacuum.
+Admission into the EVB basis (`basis.py`) screens on the bonded gap plus the
+electrostatic one, `forcefield.electrostatics.ElectrostaticGap`, which under
+this term is exactly the difference of the two states' diagonal corrections
+when one block is multi-state -- so a hop the environment favours, or
+autoionization in a polar environment, is not screened as though in vacuum.
 """
 
 from __future__ import annotations
@@ -105,6 +102,62 @@ def exclusion_pairs(term_dict: dict) -> np.ndarray:
     """The `coulombexclusion` pairs of a term dict, `(m, 2)`, or none."""
     params = term_dict.get("coulombexclusion")
     return _NO_PAIRS if params is None else params["atoms"][:, :2]
+
+
+def geometry(pos, pbc, cell) -> tuple[np.ndarray, np.ndarray]:
+    """Minimum-image displacements `r_i - r_j`, `(n, n, 3)`, and their lengths."""
+    pbc = np.asarray(pbc, dtype=bool)
+    vecs = pos[:, None, :] - pos[None, :, :]
+    if np.any(pbc):
+        cell = np.asarray(cell, dtype=float)
+        F = vecs @ np.linalg.inv(cell)
+        vecs = vecs - (pbc * np.floor(F + 0.5)) @ cell
+    return vecs, np.sqrt(np.sum(vecs * vecs, -1))
+
+
+class KernelCache:
+    """The charge kernel for a set of boundary conditions, Ewald setup cached per cell.
+
+    Ewald needs all three directions periodic; a slab or a wire keeps the
+    nearest-image kernel.  The cell-dependent half of the Ewald setup -- the
+    splitting parameter and the reciprocal vectors -- is rebuilt only when the
+    cell changes, so a fixed cell builds it once and an NPT trajectory once per
+    step.
+    """
+
+    def __init__(self):
+        self.ewald = None
+        self.key = None
+
+    def get(self, pos, vecs, rij, pbc, cell):
+        if not np.all(pbc):
+            return MinimumImage(rij, vecs)
+        cell = np.asarray(cell, dtype=float)
+        key = cell.tobytes()
+        if self.ewald is None or key != self.key:
+            self.ewald = Ewald(cell)
+            self.key = key
+        return self.ewald.bind(pos, vecs, rij)
+
+
+def pair_gradients(
+    i: np.ndarray, j: np.ndarray, dE_dr: np.ndarray, vecs: np.ndarray, rij: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Forces and virial of a sum over the pairs `(i[p], j[p])`, one term each.
+
+    `dE_dr[p]` is the radial derivative of pair `p`'s term.  `vecs` is `r_i -
+    r_j`, so `dE/dr_i = dE_dr * v / r` and minus that on `j`; the virial is
+    `sum_p dE_dr v_a v_b / r`, the same per-pair gradient against strain.
+    """
+    forces = np.zeros((len(rij), 3))
+    if len(i) == 0:
+        return forces, np.zeros((3, 3))
+    v = vecs[i, j]
+    coeff = dE_dr / rij[i, j]
+    grad = coeff[:, None] * v
+    np.add.at(forces, i, -grad)
+    np.add.at(forces, j, grad)
+    return forces, np.einsum("p,pa,pb->ab", coeff, v, v)
 
 
 def direct_kernel(r: np.ndarray, gamma: float) -> tuple[np.ndarray, np.ndarray]:
@@ -153,9 +206,10 @@ class PointCharge:
         return active().ccoul
 
     def __init__(self):
-        self.ewald = None
-        self.ewald_key = None
+        self.kernels = KernelCache()
         self.natoms = 0
+        self.act = None
+        self.local = None
         self.vecs = None
         self.rij = None
         self.kernel = None
@@ -163,17 +217,6 @@ class PointCharge:
         self.qbar = None
         self.phi = None
         self.blocks: list[_Block] = []
-
-    def get_kernel(self, pos, vecs, rij, pbc, cell):
-        """`MinimumImage` unless fully periodic; the Ewald setup is cached per cell."""
-        if not np.all(pbc):
-            return MinimumImage(rij, vecs)
-        cell = np.asarray(cell, dtype=float)
-        key = cell.tobytes()
-        if self.ewald is None or key != self.ewald_key:
-            self.ewald = Ewald(cell)
-            self.ewald_key = key
-        return self.ewald.bind(pos, vecs, rij)
 
     # -- the geometry ---------------------------------------------------------
 
@@ -183,17 +226,16 @@ class PointCharge:
         The seed's charges are the starting environment for every block, and
         remain the charges of any atom no block claims.
         """
-        pbc = np.asarray(pbc, dtype=bool)
-        vecs = pos[:, None, :] - pos[None, :, :]
-        if np.any(pbc):
-            F = vecs @ np.linalg.inv(cell)
-            vecs = vecs - (pbc * np.floor(F + 0.5)) @ cell
-        rij = np.sqrt(np.sum(vecs * vecs, -1))
+        vecs, rij = geometry(pos, pbc, cell)
 
         self.natoms = len(pos)
+        # Every atom takes part, in global order; `act`/`local` are the index
+        # maps `ACKS2` needs and the admission gate reads off either term.
+        self.act = np.arange(self.natoms)
+        self.local = self.act
         self.vecs = vecs
         self.rij = rij
-        self.kernel = self.get_kernel(pos, vecs, rij, pbc, cell)
+        self.kernel = self.kernels.get(pos, vecs, rij, pbc, cell)
         self.K = self.kernel.matrix()
 
         indices, q = template_charges(term_dict)
@@ -330,16 +372,12 @@ class PointCharge:
             i = np.concatenate(pair_i)
             j = np.concatenate(pair_j)
             c = np.concatenate(pair_c)
-            v = self.vecs[i, j]
-            r = self.rij[i, j]
-            g, dg = direct_kernel(r, active().gamma)
+            g, dg = direct_kernel(self.rij[i, j], active().gamma)
+            # The exclusion is subtracted, so its radial derivative is `-c g'`.
             energy -= float(np.sum(c * g))
-            # d(c g(r))/dr_i = c g'(r) v / r with v = r_i - r_j, and minus that on j.
-            # The exclusion is subtracted, so its force enters with a plus.
-            grad = (c * dg / r)[:, None] * v
-            np.add.at(forces, i, grad)
-            np.add.at(forces, j, -grad)
-            virial = virial - np.einsum("p,pa,pb->ab", c * dg / r, v, v)
+            f_pair, w_pair = pair_gradients(i, j, -c * dg, self.vecs, self.rij)
+            forces = forces + f_pair
+            virial = virial + w_pair
 
         return (
             energy * units.eV,

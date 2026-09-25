@@ -4,20 +4,21 @@ ACKS2 needs the smeared-charge kernel
 
     g(r) = erf(gamma * r) / r
 
-in three places: as the Coulomb block of its linear system, as the energy
-`E = CCOUL/2 * Q.K.Q`, and as the `dE/dQ` that drives the charge-response
-adjoint.  Under periodic boundary conditions each of those is a lattice sum
-over every image rather than a nearest-image pair term, so this module puts the
-two behind one interface and `acks2.py` never branches on `pbc`:
+in two places: as the Coulomb block of each diabatic state's linear system, and
+in the derivative of the solved functional, `1/2 <dA/dr, Z>`.  Under periodic
+boundary conditions both are a lattice sum over every image rather than a
+nearest-image pair term, so this module puts the two behind one interface and
+`acks2.py` never branches on `pbc`:
 
     kernel.matrix()    -> `K`, the (n, n) kernel matrix
     kernel.contract(W) -> `(dS/dr_i, dS/de_ab)` for `S = sum_ij W_ij K_ij`
 
-`contract` is what makes the abstraction worth having.  Both places ACKS2
-differentiates the kernel -- the explicit Coulomb force and the
-`-lam^T (dA/dr) x` response term -- are of exactly that form and differ only in
-the symmetric weight matrix `W` they contract against, so the periodic
-derivatives are written once instead of once per caller.  Under `MinimumImage`
+`contract` is what makes the abstraction worth having.  Every caller that
+differentiates the kernel -- ACKS2 against the weight-averaged second moment of
+its states' charges, `PointCharge` against its own, the admission gate against
+the difference of two states -- is of exactly that form and differs only in the
+symmetric weight matrix `W`, so the periodic derivatives are written once
+instead of once per caller.  Under `MinimumImage`
 that contraction is the pair sum the old inline code did; under `Ewald` it also
 carries a reciprocal-space term that is *not* a sum over pair separations, and
 which is why the kernel had to become an object rather than a matrix.
@@ -40,12 +41,14 @@ diagonal of the ACKS2 matrix alongside the atomic hardness.
 a neutralizing background leaves a constant `-pi / (V kappa^2)` in every entry
 of `K`, carried as `background` and added to every entry.  Adding any constant
 to every entry of `K` changes the energy by that constant times
-`(sum_i q_i)^2` and the ACKS2 rows by that constant times `sum_i q_i`, so for a
-neutral contraction -- which `ACKS2.build_system` imposes as a hard constraint --
-it drops out of the energy, the forces, the virial and the solved charges alike,
-and it was once omitted on those grounds.  It is carried because a Coulomb
-exclusion contracts `K` against a *non*-neutral weight and needs the entries
-themselves, which without it drifted with `kappa`.
+`(sum_i q_i)^2` and every ACKS2 charge row by the same constant times
+`sum_i q_i` -- which the molecules' charge multipliers absorb, so the solved
+charges never see it.  For a neutral contraction it drops out of the energy, the
+forces and the virial as well, and it was once omitted on those grounds.  It is
+carried because not every contraction is neutral: a cell holding an H3O+ is
+charged, and a point-charge exclusion or the admission gate's difference of two
+states contracts `K` against a weight whose entries do not sum to zero -- each
+needs the entries themselves, which without it drifted with `kappa`.
 
 **Only the Coulomb block is summed over images.**  ACKS2's other
 geometry-dependent block, the bond softness, decays as `exp(-r / tau)` with
@@ -123,10 +126,9 @@ class MinimumImage:
     def derivative(self):
         """`dK_ij/dr_ij`, memoized for the same reason `matrix` is.
 
-        `ACKS2` contracts the kernel twice per force call -- once for the
-        explicit Coulomb force and once for the charge response -- with two
-        different weight matrices against the one geometry, so the kernel's own
-        derivative is the same array both times.
+        More than one weight matrix can be contracted against one geometry --
+        the electrostatics and the admission gate's gradient both do -- so the
+        kernel's own derivative is the same array each time.
         """
         if self._derivative is None:
             self._derivative = _screened(self.rij, self.r, self.gamma)[1]
@@ -214,8 +216,8 @@ class Ewald:
         #
         # **It contracts to zero against any neutral weight, and that is why it
         # was absent.**  `sum_ij q_i q_j c = c (sum_i q_i)**2`, so with the
-        # sum-zero constraint `ACKS2.build_system` imposes it changes no energy,
-        # no force and no charge this code has ever computed.  What it does
+        # sum-zero constraint the original ACKS2 imposed it changed no energy,
+        # no force and no charge that code ever computed.  What it does
         # change is an individual `K_ij`, which without it is not a well-defined
         # number at all: it drifts with the splitting parameter, by 0.0054 on an
         # O-H pair between `accuracy` 1e-4 and 1e-12 while the neutral

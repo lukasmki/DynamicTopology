@@ -8,27 +8,23 @@ which states exist, which channels connect them and how the Hamiltonian is
 diagonalized is `basis.py` and `system.py`.
 
 ```
-H_ss  =  E_bonded  +  E_ZBL  +  E_12-6  +  E_Coulomb  -  E_excl
-         \________/  \______________________________/  \______/
-          qforce.py   summed over every pair in the     removes the
-          per term    system, no bond graph consulted   near-neighbour
-                      (zbl.py, lj.py, acks2.py)         double count
+H_ss  =  E_bonded  +  E_ZBL  +  E_12-6  -  E_excl  +  E_el(s)
+         \________/  \_______________/  \______/     \_____/
+          qforce.py   every pair, no     removes the  the state's own charges:
+          per term    bond graph         near-pair    ACKS2 per state, or its
+                      (zbl.py, lj.py)    double count template point charges
 
 H_st  =  V(x)        coupling.py -- one Gaussian per reaction channel,
                      nonzero only near the geometry it is centred on
 ```
 
-Only two of those five depend on the bonding pattern: `E_bonded` and `E_excl`.
-The three whole-system sums are deliberately blind to the bond graph, so they
-are the same number on every state and are evaluated once, outside the
-Hamiltonian — which is what makes the exclusions the interesting term rather
-than a bookkeeping detail.
-
-**The exception is `electrostatics = "pointcharge"`** (`pointcharge.py`), which
-replaces ACKS2 with charges fixed per template.  Those differ between the states
-of a proton transfer, so `E_Coulomb` joins `E_bonded` as a function of the
-bonding pattern and sits on the diagonal — see "Electrostatics — fixed point
-charges" below.
+Three of those depend on the bonding pattern: `E_bonded`, `E_excl` and `E_el`.
+The two repulsion sums are deliberately blind to the bond graph, so they are the
+same number on every state and are evaluated once, outside the Hamiltonian.  The
+electrostatics are not: under either term (`electrostatics = "acks2"` or
+`"pointcharge"`) each state carries its own charges, so a proton transfer moves
+its +1 and the environment decides which side it prefers.  They sit on the
+diagonal, and the blocks see each other through their weight-averaged charges.
 
 ## Units
 
@@ -66,12 +62,12 @@ has no method for.  Every type in play, and where it comes from:
 | `bondbond`, `bondangle`, `angleangle` | `QForce` | see cross terms | template `.jsonl` |
 | `periodicdihedral`, `dihedralbond`, `dihedralangle`, `dihedralangleangle` | `QForce` | see dihedrals | template `.jsonl` |
 | `reference` | `QForce` | `E0` | set by `ReactionSet.load` |
-| `atom` | `ACKS2` | `mu, eta, soft_amp, soft_decay` | template `.jsonl` |
+| `atom` | `ACKS2` | `mu, eta, soft_amp, soft_decay`, optional `q0` | template `.jsonl` |
 | `charge` | `PointCharge` | `q`, in e | template `.jsonl` |
 | `lennardjones` | `LennardJones` | `sigma, eps` | template `.jsonl` |
 | `exclusion` | `QForce` | `sigma, eps`, already combined | derived at load |
 | `zblexclusion` | `QForce` | `z1, z2` | derived at load |
-| `coulombexclusion` | `ACKS2` or `PointCharge` | none — the pair is the whole term | derived at load |
+| `coulombexclusion` | `PointCharge` (ACKS2 ignores it) | none — the pair is the whole term | derived at load |
 | `twobody`, `threebody`, `rmsd` | `EVBCoupling` | see coupling | reaction `.jsonl` |
 
 `atom`, `charge` and `lennardjones` carry no energy of their own; they are how a template
@@ -261,51 +257,67 @@ Here `K_ii != 0` — an atom interacts with its own images.  The `k = 0` term is
 dropped and its neutralizing background added back explicitly.  `kappa` and the
 reciprocal cutoff are both set by `accuracy = 1e-8`.
 
-### The solve
+### The solve, per diabatic state
 
 Per-atom parameters `mu` (electronegativity), `eta` (hardness), `soft_amp` and
-`soft_decay` (the softness kernel).  The stationary point of the ACKS2
-functional in the charges `Q` and the Kohn–Sham potentials `u` is the linear
-system `A x = b`, `x = [Q, u, λ_tot, λ_KS]`:
+`soft_decay` (the softness kernel), and an optional reference charge `q0` (zero
+if absent).  Each state `s` minimizes its own ACKS2 functional over the charges
+`q` and Kohn–Sham potentials `u` of every atom:
 
 ```
-        | K + 2 diag(eta)     -I        -1   0 |        | -mu |
-  A  =  |      -I           -L_X         0  -1 |   b =  |  0  |
-        |      -1^T            0         0   0 |        |  0  |
-        |       0            -1^T        0   0 |        |  0  |
+F_s(q, u) = mu.q + (1/2) q.(K + 2 diag(eta)).q - u.(q - q0_s) - (1/2) u.L_X.u
 
-  X_ij   = soft_amp_i * soft_amp_j * exp( -r_ij / tau_ij ),
+  X_ij   = soft_amp_i * soft_amp_j * exp( -r_ij / tau_ij )   i != j, same molecule of s
            tau_ij = ( soft_decay_i + soft_decay_j ) / 2
-  L_X    = diag( sum_j X_ij ) - X                 (the graph Laplacian of X)
+  L_X    = diag( sum_j X_ij ) - X                             (block diagonal by molecule)
+
+  per molecule m:   sum_{i in m} q_i = sum_{i in m} q0_i,     sum_{i in m} u_i = 0
 ```
 
-The last two rows are the constraints `sum_i Q_i = 0` and `sum_i u_i = 0`.  Only
-the `K` block and the `X` block depend on geometry — `compute_response_forces`
-differentiates exactly those two.  The hardness is *added* to the Coulomb
-diagonal, not written over it: under periodic boundaries `K_ii` is a real
-self-image interaction and belongs in the equilibration alongside `2 eta`.  The
-solve uses the **unmasked** kernel over every pair, so the charges are a
-function of positions and elements alone.
-
-Note that `A` carries the bare kernel while the energy below carries `ccoul`, so
-`mu` and `eta` are in the units that implies rather than in eV directly.
+The stationary point is `A x = b`, `x = [q, u, lambda_q, lambda_u]`, one pair of
+multipliers per molecule.  Softness within a molecule only means no charge
+crosses between molecules: an H3O+ holds its `+1` (from `q0`), a water `0`, and
+charge moves only when the bonding does.  The hardness is *added* to the Coulomb
+diagonal: under periodic boundaries `K_ii` is a real self-image interaction.
+`A` carries the bare kernel while the energy carries `ccoul`, so `mu` and `eta`
+are in the units that implies rather than in eV directly.
 
 ### Energy and forces
 
 ```
-E = (ccoul / 2) * sum_ij  S_ij * Q_i * Q_j * K_ij            ccoul = 14.4 eV·Å
+E_el(s) = ccoul * [ F_s*  -  sum_{m in s} F_m*(isolated, open boundaries) ]
+F*      = -1/2 b.x*                                (a quadratic's value at its stationary point)
 ```
 
-with `S` the exclusion screen (below).  The charges move when the atoms do, so
-the gradient has two pieces:
+The isolated references make a lone template score exactly zero — its gas-phase
+electrostatics belong to its bonded terms — so no `coulombexclusion` is needed
+and the kernel inside the solve stays whole.  Both pieces are stationary in their
+own variables, so
 
 ```
-dE/dr  =  (dE/dr)|_Q  -  lam^T (dA/dr) x,        lam = A^-1 (dE/dx)
+dE/dr = (ccoul/2) x*.(dA/dr).x*  -  sum_m (ccoul/2) x_m.(dA_m/dr).x_m
 ```
 
-one extra solve rather than one per coordinate (`A` is symmetric, so no
-transpose).  The screen belongs to `dE/dx` only — `A` is the unscreened matrix,
-so `dA/dr` must be contracted against an unmasked weight.
+with no charge-response term and no adjoint solve.
+
+### Every state for one solve
+
+The atoms outside every multi-state block (the environment `e`) form one fixed
+system; each state differs only in its own block's rows.
+
+```
+once       A_ee = LU,  y = A_ee^-1 b_e,  G_b = A_ee^-1 K_eb,
+           p_b = K_be y_q,  Sigma_bb' = K_be G_b'            (n_b back-substitutions)
+per state  (A_bb,s - Sigma_bb) z_s = b_b,s - p_b - h_b,  h_b = sum_b' (K_bb' - Sigma_bb') qbar_b'
+           z_e,s = y - G_b q_s                                (the environment's exact response)
+```
+
+Two multi-state blocks see each other through their mean charges `qbar`
+(a Hartree product), swept by `System.calculate` to `SCF_TOLERANCE`; with one the
+first pass is final.  Forces and virial are one `kernel.contract(W)` with
+`W = E[q q^T]/2 = (qbar qbar^T + sum_b R_b Cov_b R_b^T)/2`, `R_b = [-G_b,q ; I]`,
+plus sparse intramolecular pair sums for the softness and the isolated
+references.  With `X = 0` (and `mu = eta = 0`) the result is `PointCharge`'s.
 
 ---
 
@@ -314,7 +326,7 @@ so `dA/dr` must be contracted against an unmasked weight.
 Selected by `electrostatics = "pointcharge"` in the manifest, in place of ACKS2.
 Every template carries a `charge` term per atom, summing to its formal charge,
 so an H3O+ carries +1 and the water it hops to carries 0: the charge moves with
-the proton, which ACKS2's single sum-zero constraint cannot express.  Same
+the proton.  It is fragment ACKS2's zero-softness limit, without the solve.  Same
 kernel `K` as ACKS2, so the same Ewald sum under full periodicity.
 
 Each state `s` of a block `B` gets, on its diagonal,
@@ -344,22 +356,23 @@ exact.  No solve, no response term.
 `K_ij` also contains `i`'s interaction with every image of `j`; removing that as
 well leaves `(ccoul/2) K_self sum_i q_i^2` per molecule — −0.91 eV per water in a
 12.43 Å box, falling only as 1/L, so it acts on the pressure.  With the direct
-pair alone the residue is the molecule's dipole–image energy, −1.9 meV.  ACKS2's
-screen removes the whole `K_ij`; see the note in `pointcharge.py`.
+pair alone the residue is the molecule's dipole–image energy, −1.9 meV.  (The
+screen the previous ACKS2 applied removed the whole `K_ij`.)
 
 ---
 
 ## Exclusions (`exclusions.py`)
 
-The three nonbonded terms above are summed over every pair with no reference to
-the bond graph.  Pairs within `exclusion_depth = 3` bonds of each other are then
-removed, so that a molecule's geometry is set by its bonded terms:
+The repulsion sums above are summed over every pair with no reference to the
+bond graph.  Pairs within `exclusion_depth = 3` bonds of each other are then
+removed, so that a molecule's geometry is set by its bonded terms; the
+electrostatics reach the same end their own way:
 
 | term | how it is removed | where |
 | --- | --- | --- |
 | 12-6 | `exclusion` term, `E = -u_126(r, σ_ij, ε_ij)` | `QForce.compute_exclusion` |
 | ZBL | `zblexclusion` term, `E = -u_ZBL(r, Z1, Z2)` | `QForce.compute_zblexclusion` |
-| Coulomb | `coulombexclusion` term, in two places (below) | `ACKS2`, `System.calculate` |
+| Coulomb, ACKS2 | none: each molecule's isolated minimum is subtracted instead | `ACKS2` |
 | Coulomb, point charges | `coulombexclusion` term, per state inside `E_intra` | `PointCharge` |
 
 The first two are ordinary additive pair corrections, evaluated per diabatic
@@ -371,62 +384,27 @@ there is nothing to cancel and a term would be an expensive no-op.  ZBL and
 Coulomb have no such escape — ZBL has no free parameters and the charge kernel is
 element-independent — so every near pair gets one of each.
 
-### Why Coulomb takes two
+### Why ACKS2 takes none
 
-`ACKS2`'s charges come from a solve whose matrix *contains* the kernel, so the
-exclusion cannot simply be subtracted from the energy.  Masking the kernel inside
-the solve would be the more obviously consistent thing to do and is still wrong:
-it makes the charges a function of the bond graph, and a term evaluated once
-outside the Hamiltonian must not be (measured at **0.88 eV** of pivot dependence,
-`tests/test_evb_invariants.py`).  So the charges are solved once from the
-**unmasked** kernel and the exclusion is applied afterwards, as the same quantity
-seen from two directions:
+`ACKS2`'s charges come from a solve whose matrix *contains* the kernel, so an
+exclusion cannot simply be subtracted from the energy.  The previous design
+solved the charges once from the unmasked kernel and applied the exclusion
+afterwards, as a per-state scalar and a ground-state-weighted screen on the
+energy.  That energy was not the one the charges minimize: it needed an adjoint
+solve, removed the intramolecular half of the polarization response (0.07 eV of
+the water dimer's hydrogen bond), and removed the image part of a periodic
+`K_ij` along with the pair.
 
-```
-per state   H_ss += -ccoul * sum_{(i,j) in excl(s)} Q_i Q_j K_ij
-            one lookup per excluded pair into a kernel already built
-            (ACKS2.exclusion_energy).  This is the half that lets the
-            exclusion decide which bonding pattern is lower.
-
-once        S_ij = 1 - sum_s w_s M_ij^s
-            E    = (ccoul / 2) sum_ij S_ij Q_i Q_j K_ij
-            M^s the mask of state s, w_s its ground-state weight
-            (ACKS2.screen_matrix).  One contraction, one adjoint solve,
-            for the whole system.
-```
-
-Fractional entries of `S` are the normal case and not an interpolation: every
-state's correction is linear in its own mask and the kernel contraction is linear
-in its weight, so the Hellmann-Feynman sum `sum_s w_s dE_s/dr` collapses into a
-single weight matrix.  A pair bonded in every state of a block comes out at
-exactly 0; one bonded in some of them is removed in proportion.  `S` is held
-fixed under the derivative, which is what Hellmann-Feynman says to do with
-eigenvector components.
-
-That is why `ACKS2` is split in two.  `prepare` solves the charges *before* the
-diagonalization, because the per-state diagonal corrections need them; `compute`
-applies the screen *after* it, because the screen needs the weights the
-diagonalization produced.  One asymmetry has to be got right in
-`compute_response_forces`: `dE/dQ` is screened because the energy is, while the
-`-lam^T (dA/dr) x` weight is not, because `A` never was.  Either mistake shows up
-only as NVE drift.
-
-**What the exclusion costs is the intramolecular half of the polarization
-response, and that is a real 0.07 eV of the hydrogen bond.**  The water dimer
-well goes from 0.1677 eV at 2.85 Å to 0.1024 eV at 2.91 Å — datasets held fixed,
-so this is the mechanism and not a refit.  The molecules polarize each other, the
-charges grow (`q_H` +0.30399 → +0.31264 at 2.85 Å), and the intramolecular
-Coulomb energy falls along with the intermolecular one; booking that gain inside
-the molecule is exactly what the exclusion exists to stop.  `eta` is the lever
-that pays it back, since the intermolecular term scales as `q²` — see
-`datasets/Water/README.md`.
-
-The charges themselves are untouched by all of this: an isolated water still
-comes out at `q_H = +0.30399`, so nothing about a molecule's dipole moves.  The
-exclusion is, however, the first thing here to contract the periodic kernel
-against a **non-neutral** weight, which is what exposed the missing `k = 0`
-background above — an individual `K_ij` was not a well-defined number until that
-was carried explicitly.
+Solving per state removes the reason for it.  Each molecule's isolated ACKS2
+minimum is exactly its gas-phase electrostatics, so subtracting it keeps them off
+the bonded terms — the property the exclusion was for — while the kernel inside
+the solve stays whole.  An isolated water's charges are the ones the `atom`
+parameters were fitted to (`q_H = +0.30399`), and the dimer keeps the
+intramolecular part of its polarization.  What it gives up is the intermolecular
+charge transfer the global softness allowed, which is most of the difference in
+the dimer well: 0.088 eV at 2.95 Å at the shipped `eta`, against 0.168 eV for the
+old unscreened energy.  `eta` is the lever — see `datasets/Water/README.md` and
+`DYNAMICTOPOLOGY.md` §2.3.2 for the scan.
 
 ---
 
@@ -641,7 +619,11 @@ the reverse channel is enumerated where the forward one hands over.
 **`taper_radius` (1.5 Å), bounded from both sides.** From below, the wall has
 to stay ahead of the ACKS2 contact funnel at every separation: at 1.2 Å the
 H2 + O2 approach in `tests/test_collapse.py` already reads +0.52 eV against
-+3.14 eV untapered, and by 1.0 Å that approach is downhill. From above, every
++3.14 eV untapered, and by 1.0 Å that approach is downhill.  (Measured under the
+previous ACKS2, whose global softness moved charge between two molecules in
+contact.  Fragment ACKS2 moves none, and H2 and O2 carry no charge of their
+own, so that funnel is gone; the bound from below now guards the bond-length
+wall alone.) From above, every
 0.1 Å of extra reach costs roughly another 0.2 eV of hydrogen-bond depth —
 measured on the water dimer, the minimum moves −0.148 eV at 1.4 → −0.116 eV at
 1.5 → −0.090 eV at 1.6, against a −0.218 eV reference at 2.91 Å. 1.5 puts the

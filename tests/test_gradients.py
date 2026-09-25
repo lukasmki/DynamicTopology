@@ -318,235 +318,186 @@ class TestQForceGradients:
 # ---------------------------------------------------------------------------
 
 
-class TestACKS2Gradients:
-    """Verify ACKS2 forces against central finite differences.
+# The HCombustion `atom` parameters, per element.
+ACKS2_ELEMENT = {
+    "O": {"mu": 8.12034, "eta": 3.74452, "soft_amp": 3.88211, "soft_decay": 0.43584},
+    "H": {"mu": 1.87965, "eta": 7.28464, "soft_amp": 2.09682, "soft_decay": 0.26887},
+}
 
-    Two different things are checked here and the distinction matters.
-    `test_coulomb_forces` freezes Q on both sides, so it tests only the Coulomb
-    force formula in isolation -- by construction it cannot see whether the
-    charge response is handled, and for a long time it passed while
-    `ACKS2.__call__` was not conservative at all.  `test_call_forces` is the one
-    that covers the real calculator: it perturbs the geometry and lets the
-    charges re-solve, exactly as they do along a trajectory.
+
+def acks2_term_dict(symbols, bonds, q0=None, atoms=None):
+    """An ACKS2 term dict: `atom` rows on `atoms` (global indices) and `bond` rows.
+
+    `symbols`, `q0` run over `atoms`, which defaults to `range(len(symbols))`.
+    The bonds are what the solve reads the molecules off, so a term dict with
+    none makes every atom its own molecule -- and a lone neutral atom carries no
+    charge at all.
+    """
+    atoms = np.arange(len(symbols)) if atoms is None else np.asarray(atoms)
+    kwargs = {
+        name: np.array([ACKS2_ELEMENT[s][name] for s in symbols])
+        for name in ACKS2_ELEMENT["O"]
+    }
+    kwargs["q0"] = np.zeros(len(symbols)) if q0 is None else np.asarray(q0, float)
+    td = {"atom": {"atoms": atoms[:, None], "kwargs": kwargs}}
+    if bonds:
+        td["bond"] = {"atoms": np.array(bonds, dtype=int), "kwargs": {}}
+    return td
+
+
+# A water and a hydronium sharing a proton (atom 6), plus a spectator water.
+# `ZUNDEL_A` puts the proton on O3, `ZUNDEL_B` on O0; the spectator is the
+# environment either way.
+POS_ZUNDEL = np.array(
+    [
+        [0.00, 0.00, 0.00],  # O0
+        [-0.55, 0.78, 0.05],
+        [-0.52, -0.80, -0.04],
+        [2.45, 0.08, 0.10],  # O3
+        [2.95, 0.85, 0.20],
+        [2.90, -0.75, 0.30],
+        [1.18, 0.12, 0.35],  # the shared proton
+        [0.40, 3.10, 0.30],  # spectator O
+        [1.30, 3.35, 0.10],
+        [0.10, 3.75, 0.90],
+    ]
+)
+_HYDRONIUM_Q0 = [-0.5, 0.5, 0.5, 0.5]
+ZUNDEL_SYMBOLS = ["O", "H", "H", "O", "H", "H", "H", "O", "H", "H"]
+ZUNDEL_A = ([(0, 1), (0, 2), (3, 4), (3, 5), (3, 6)], [0, 0, 0, -0.5, 0.5, 0.5, 0.5])
+ZUNDEL_B = ([(0, 1), (0, 2), (0, 6), (3, 4), (3, 5)], [-0.5, 0.5, 0.5, 0, 0, 0, 0.5])
+SPECTATOR = [(7, 8), (7, 9)]
+
+
+def zundel_state(state, offset=0):
+    """One diabat of the block, over its own seven atoms."""
+    bonds, q0 = state
+    atoms = np.arange(7) + offset
+    return acks2_term_dict(
+        ZUNDEL_SYMBOLS[:7],
+        [(i + offset, j + offset) for i, j in bonds],
+        q0,
+        atoms,
+    )
+
+
+def zundel_system(state, spectator=True):
+    """The whole system in one diabat, as `ACKS2.__call__` takes it."""
+    bonds, q0 = state
+    if spectator:
+        return acks2_term_dict(ZUNDEL_SYMBOLS, bonds + SPECTATOR, q0 + [0, 0, 0])
+    return acks2_term_dict(ZUNDEL_SYMBOLS[:7], bonds, q0)
+
+
+def fake_block(term_dicts, seed=0):
+    """What `ACKS2.bind` reads off a `basis.Block`: states with a graph and terms."""
+    from types import SimpleNamespace
+
+    import networkx as nx
+
+    states = []
+    for td in term_dicts:
+        graph = nx.Graph()
+        graph.add_nodes_from(td["atom"]["atoms"][:, 0].tolist())
+        states.append(SimpleNamespace(graph=graph, term_dict=td))
+    return SimpleNamespace(nstates=len(states), states=states, seed_index=seed)
+
+
+def acks2_at_weights(pos, pbc, cell, seed_td, blocks, weights, sweeps=60):
+    """`ACKS2.evaluate` at fixed EVB weights, the blocks swept to self-consistency.
+
+    Held fixed, the weights are what the Hellmann-Feynman contraction holds
+    fixed; what must then be right is that every solved charge is stationary,
+    which the sweep makes true for two or more blocks and one pass for one.
+    """
+    acks2 = ACKS2()
+    acks2.prepare(pos, pbc, cell, seed_td)
+    acks2.bind(blocks)
+    multi = [k for k, block in enumerate(blocks) if block.nstates > 1]
+    for _ in range(sweeps if len(multi) > 1 else 1):
+        for k in multi:
+            acks2.corrections(k)
+            acks2.update(k, weights[k])
+    return acks2, acks2.evaluate()
+
+
+class TestACKS2Gradients:
+    """Fragment ACKS2 forces against central finite differences.
+
+    Nothing here freezes a charge: every displaced geometry re-solves every
+    state, which is what a trajectory does.  There is no response term to get
+    wrong -- the functional is stationary in its own variables -- so what these
+    check is that `1/2 <dA/dr, Z>` is assembled from the right second moment:
+    the environment's response to each state, the block covariance, and the
+    isolated references subtracted per molecule.
     """
 
-    acks2 = ACKS2()
-
-    _TERM_DICT = {
-        "atom": {
-            "atoms": np.array([[0], [1], [2], [3]]),
-            "kwargs": {
-                "mu": np.array([8.12, 8.12, 1.88, 1.88]),
-                "eta": np.array([3.74, 3.74, 7.28, 7.28]),
-                "soft_amp": np.array([3.88, 3.88, 2.10, 2.10]),
-                "soft_decay": np.array([0.44, 0.44, 0.27, 0.27]),
-            },
-        }
-    }
-
-    def test_coulomb_forces(self):
-        """Test compute_coulomb gradients with frozen charges.
-
-        Charges Q are solved once at the reference geometry and held fixed for
-        both the analytical forces and the finite-difference energy perturbations.
-        This isolates the Coulomb force formula from the charge-response (dQ/dr)
-        contribution, which `test_call_forces` covers instead.
-        """
-        indices = self._TERM_DICT["atom"]["atoms"][:, 0]
-        params = self._TERM_DICT["atom"]["kwargs"]
-        sub = np.ix_(indices, indices)
-
-        # Solve charges at reference geometry
-        vecs_ref = (POS_H2O2[:, None, :] - POS_H2O2[None, :, :])[sub]
-        rij_ref = np.sqrt(np.sum(vecs_ref * vecs_ref, -1))
-        Q = self.acks2.compute_charges(rij_ref, params)
-
-        def energy_fn(p):
-            v = (p[:, None, :] - p[None, :, :])[sub]
-            r = np.sqrt(np.sum(v * v, -1))
-            e, _, _ = self.acks2.compute_coulomb(Q, r, v)
-            return e
-
-        _, f_analytical, _ = self.acks2.compute_coulomb(Q, rij_ref, vecs_ref)
-        f_fd = finite_difference_forces(energy_fn, POS_H2O2)
-        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-3, rtol=1e-3)
-
-    @pytest.mark.parametrize(
-        "positions", [POS_2, POS_3, POS_4, POS_H2O2], ids=["n2", "n3", "n4", "h2o2"]
-    )
-    def test_call_forces(self, positions):
-        """The full calculator must be conservative, charge response included.
-
-        Unlike `test_coulomb_forces`, the charges are *not* frozen: every
-        finite-difference displacement re-solves them, which is what happens
-        between MD steps.  The gap between the two is the dQ/dr term, and it is
-        large -- dropping it moves the H2O force by ~1 eV/A and makes NVE energy
-        drift by hundreds of percent (see test_energy_conservation.py).
-        """
-        params = self._TERM_DICT["atom"]["kwargs"]
-        term_dict = {
-            "atom": {
-                "atoms": np.array([[i] for i in range(len(positions))]),
-                "kwargs": {k: v[: len(positions)] for k, v in params.items()},
-            }
-        }
-        acks2 = ACKS2()
-
-        def energy_fn(p):
-            # A fresh instance per call: the cache keys on positions, and
-            # reusing one here would be testing the cache, not the gradient.
-            return ACKS2()(p, PBC, CELL, term_dict)[0]
-
-        _, f_analytical, _ = acks2(positions, PBC, CELL, term_dict)
-        f_fd = finite_difference_forces(energy_fn, positions)
-        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
-
-    @pytest.mark.parametrize("positions", [POS_3, POS_H2O2], ids=["n3", "h2o2"])
-    def test_call_forces_periodic(self, positions):
-        """The same, with the Ewald lattice sum carrying the electrostatics.
-
-        Every other case in this class runs at `PBC = False`, where the kernel
-        is the nearest-image one and the reciprocal-space force does not exist.
-        That force is not a pair term -- it is a sum over reciprocal vectors of
-        the structure factor's derivative -- so nothing in the open-boundary
-        tests constrains it, and it enters the charge response as well as the
-        explicit gradient.  The cell is small enough (9 A, as in
-        `test_stress.py`) that the images contribute rather than merely being
-        present.
-        """
-        params = self._TERM_DICT["atom"]["kwargs"]
-        term_dict = {
-            "atom": {
-                "atoms": np.array([[i] for i in range(len(positions))]),
-                "kwargs": {k: v[: len(positions)] for k, v in params.items()},
-            }
-        }
-        pbc = np.ones(3, dtype=bool)
-        cell = np.eye(3) * 9.0
-
-        def energy_fn(p):
-            return ACKS2()(p, pbc, cell, term_dict)[0]
-
-        _, f_analytical, _ = ACKS2()(positions, pbc, cell, term_dict)
-        f_fd = finite_difference_forces(energy_fn, positions)
-        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
-
-    @pytest.mark.parametrize("positions", [POS_3, POS_H2O2], ids=["n3", "h2o2"])
     @pytest.mark.parametrize("periodic", [False, True], ids=["open", "pbc"])
-    def test_screened_call_forces(self, positions, periodic):
-        """The intramolecular exclusion, as a *fractional* screen.
-
-        This is the geometry `System.calculate` actually evaluates: the screen
-        is `1 - sum_s w_s M_s` over an EVB block's states, so its entries are
-        arbitrary numbers in [0, 1] rather than 0 or 1.  The weights are held
-        fixed here, which is the same thing the Hellmann-Feynman contraction
-        does to them -- they are eigenvector components, and the ground-state
-        gradient does not differentiate those.
-
-        Two asymmetries have to be right at once for this to pass, and each one
-        fails silently on its own.  `dE/dQ` carries the screen because the
-        energy does; the `-lam^T (dA/dr) x` weight does *not*, because `A` is
-        built from the unscreened kernel.  Screening both, or neither, still
-        gives plausible forces and an NVE trajectory that drifts.
-        """
-        params = self._TERM_DICT["atom"]["kwargs"]
-        n = len(positions)
-        term_dict = {
-            "atom": {
-                "atoms": np.array([[i] for i in range(n)]),
-                "kwargs": {k: v[:n] for k, v in params.items()},
-            }
-        }
+    @pytest.mark.parametrize("state", [ZUNDEL_A, ZUNDEL_B], ids=["a", "b"])
+    def test_call_forces(self, state, periodic):
         pbc = np.ones(3, dtype=bool) if periodic else PBC
         cell = np.eye(3) * 9.0 if periodic else CELL
-
-        # Deliberately irrational, deliberately not 0 or 1, and symmetric.
-        screen = np.ones((n, n))
-        for k, (i, j) in enumerate((i, j) for i in range(n) for j in range(i + 1, n)):
-            screen[i, j] = screen[j, i] = 1.0 - 0.2 - 0.13 * (k % 5)
+        td = zundel_system(state)
 
         def energy_fn(p):
-            acks2 = ACKS2()
-            acks2.prepare(p, pbc, cell, term_dict)
-            return acks2.compute(screen)[0]
+            return ACKS2()(p, pbc, cell, td)[0]
 
-        acks2 = ACKS2()
-        acks2.prepare(positions, pbc, cell, term_dict)
-        _, f_analytical, _ = acks2.compute(screen)
-        f_fd = finite_difference_forces(energy_fn, positions)
+        _, f_analytical, _ = ACKS2()(POS_ZUNDEL, pbc, cell, td)
+        f_fd = finite_difference_forces(energy_fn, POS_ZUNDEL)
         np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
 
-    def test_the_screen_does_not_move_the_charges(self):
-        """Screening the energy must leave the equilibration alone.
+    @pytest.mark.parametrize("periodic", [False, True], ids=["open", "pbc"])
+    def test_block_forces(self, periodic):
+        """One two-state block in an environment, at a fractional ground state.
 
-        The whole reason the exclusion is a screen on the *energy* and not a
-        mask on the matrix is that the charges have to stay a function of the
-        coordinates and the elements alone -- topology-free, hence the same on
-        every diabatic state, hence solvable once outside the EVB Hamiltonian.
-        A mask inside `build_system` is what
-        `test_evb_invariants.TestPivotInvariance` measured at 0.88 eV.
+        The environment answers each state separately (`z_e = y - G q_s`), so
+        the covariance term in `W` is what carries its share of the force; at
+        weights of 0 or 1 it would vanish and pass for the wrong reason.
         """
-        n = len(POS_H2O2)
-        screen = np.ones((n, n))
-        screen[0, 1] = screen[1, 0] = 0.0
+        pbc = np.ones(3, dtype=bool) if periodic else PBC
+        cell = np.eye(3) * 9.0 if periodic else CELL
+        block = fake_block([zundel_state(ZUNDEL_A), zundel_state(ZUNDEL_B)])
+        seed = zundel_system(ZUNDEL_A)
+        weights = {0: np.array([0.37, 0.63])}
 
-        plain = ACKS2()
-        plain.prepare(POS_H2O2, PBC, CELL, self._TERM_DICT)
-        plain.compute(None)
+        def energy_fn(p):
+            return acks2_at_weights(p, pbc, cell, seed, [block], weights)[1][0]
 
-        screened = ACKS2()
-        screened.prepare(POS_H2O2, PBC, CELL, self._TERM_DICT)
-        screened.compute(screen)
+        _, (_, f_analytical, _) = acks2_at_weights(
+            POS_ZUNDEL, pbc, cell, seed, [block], weights
+        )
+        f_fd = finite_difference_forces(energy_fn, POS_ZUNDEL)
+        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
 
-        np.testing.assert_allclose(screened.Q, plain.Q, atol=0.0, rtol=0.0)
+    def test_two_blocks_forces(self):
+        """Two multi-state blocks seeing each other through their mean charges.
 
-    def test_the_screen_removes_exactly_the_pair(self):
-        """`exclusion_energy` is what a screened pair is worth, to the last bit.
-
-        The per-state diagonal correction and the screened energy are two
-        routes to the same number -- the first is what `System` puts on an EVB
-        diagonal, the second what it evaluates once at the end -- and the
-        identity between them is what stops the exclusion being counted twice
-        or not at all.
+        The Hartree coupling, screened by the environment (`K_bb' - Sigma_bb'`).
+        Stationary only once swept, which is the state `System` hands on.
         """
-        acks2 = ACKS2()
-        acks2.prepare(POS_H2O2, PBC, CELL, self._TERM_DICT)
-        unscreened = acks2.compute(None)[0]
+        second = POS_ZUNDEL[:7] + np.array([0.3, -3.6, 1.2])
+        pos = np.vstack([POS_ZUNDEL, second])
+        blocks = [
+            fake_block([zundel_state(ZUNDEL_A), zundel_state(ZUNDEL_B)]),
+            fake_block([zundel_state(ZUNDEL_A, 10), zundel_state(ZUNDEL_B, 10)], 1),
+        ]
+        bonds_a, q0_a = ZUNDEL_A
+        bonds_b, q0_b = ZUNDEL_B
+        seed = acks2_term_dict(
+            ZUNDEL_SYMBOLS + ZUNDEL_SYMBOLS[:7],
+            bonds_a + SPECTATOR + [(i + 10, j + 10) for i, j in bonds_b],
+            q0_a + [0, 0, 0] + q0_b,
+        )
+        weights = {0: np.array([0.37, 0.63]), 1: np.array([0.8, 0.2])}
 
-        pairs = np.array([[0, 1], [0, 2], [1, 3]])
-        screen = acks2.screen_matrix([(pairs, 1.0)])
-        screened = acks2.compute(screen)[0]
+        def energy_fn(p):
+            return acks2_at_weights(p, PBC, CELL, seed, blocks, weights)[1][0]
 
-        correction = acks2.exclusion_energy(pairs)
-        assert screened - unscreened == pytest.approx(correction, abs=1e-12)
-        assert abs(correction) > 1e-3, "a vacuous correction proves nothing"
-
-    @pytest.mark.parametrize("seed", [0, 1, 2])
-    def test_invariant_under_atom_relabeling(self, seed):
-        """Relabeling atoms must not change the energy, only permute the forces.
-
-        The per-atom parameters arrive in term order while positions and forces
-        are in global order.  When the two coincide -- as in every other test
-        here -- an index-space mix-up is invisible, so this drives them apart on
-        purpose.  Both the parameters and the term's atom indices are permuted
-        together, so the physical system is identical throughout.
-        """
-        permutation = np.random.default_rng(seed).permutation(len(POS_H2O2))
-        params = self._TERM_DICT["atom"]["kwargs"]
-
-        reference_e, reference_f, _ = ACKS2()(POS_H2O2, PBC, CELL, self._TERM_DICT)
-
-        # Same molecule, atoms listed in a different order.
-        permuted_term_dict = {
-            "atom": {
-                "atoms": np.array([[i] for i in permutation]),
-                "kwargs": {k: v[permutation] for k, v in params.items()},
-            }
-        }
-        energy, forces, _ = ACKS2()(POS_H2O2, PBC, CELL, permuted_term_dict)
-
-        assert energy == pytest.approx(reference_e, abs=1e-10)
-        np.testing.assert_allclose(forces, reference_f, atol=1e-10)
+        _, (_, f_analytical, _) = acks2_at_weights(
+            pos, PBC, CELL, seed, blocks, weights
+        )
+        f_fd = finite_difference_forces(energy_fn, pos)
+        np.testing.assert_allclose(f_analytical, f_fd, atol=1e-6, rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------

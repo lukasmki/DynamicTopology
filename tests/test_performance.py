@@ -306,17 +306,32 @@ RSET_PATH = "datasets/HCombustion/HCombustion.json"
 # O-O at 2.5 A -- and which only the dense box's contacts reach: a thousand
 # times the dilute box's move.  Measured against the old kernel monkeypatched
 # back in, which reproduces the previous block below to the last bit.
+# And again when ACKS2 became per-state fragment ACKS2 (`forcefield/acks2.py`):
+# softness within a molecule only, the energy the functional's own minimum less
+# each molecule's isolated minimum.  Both boxes are H2 and O2 alone, which carry
+# no charge of their own, so every joule of the old electrostatic energy was the
+# charge the global softness moved *between* molecules -- and that is gone:
+#
+#     d30  (dilute)   -508.26301 -> -508.18588 eV     +7.71e-02 eV
+#     d250 (dense)    -506.73955 -> -504.60116 eV     +2.14e+00 eV
+#     energy_nonbonded   -0.07713 -> ~1e-13 (d30)    -2.13839 -> ~1e-12 (d250)
+#     energy_bonded          identical            identical
+#     blocks                 identical            identical
+#
+# The residue is the rounding of `F - F_iso` for molecules whose charges are
+# zero.  No template's own energy moved: a lone molecule scores exactly zero
+# electrostatics under both the old exclusion screen and the new reference.
 REFERENCE = {
     "tests/data/mix-n100-d30.xyz": (
-        -508.26301235315725,
+        -508.1858837874171,
         -1184.4404370873278,
-        -0.0771285657403261,
+        -2.285387667824486e-13,
         87,
     ),
     "tests/data/mix-n100-d250.xyz": (
-        -506.73955049240084,
+        -504.60116452552637,
         -1184.5331484980647,
-        -2.1383859668755543,
+        -1.1439651710634495e-12,
         28,
     ),
 }

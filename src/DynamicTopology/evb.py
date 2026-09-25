@@ -63,33 +63,22 @@ class EVBSystem:
         ham = np.zeros((nstates, nstates))
         state_forces = np.zeros((nstates,) + pos.shape)
 
-        # ACKS2 electrostatics are topology-independent, so they are the same number
-        # for every state; adding them here would still change the result,
-        # because the coupling sqrt((1+h)*H_ii*H_jj) is nonlinear in the
-        # diagonal and a common shift does not pass through it.  They are added
-        # once, outside the Hamiltonian, below.
+        # `ZBL` and `LennardJones` are topology-independent, so they are added
+        # once, outside the Hamiltonian, below: adding them here would still
+        # change the result, because the coupling sqrt((1+h)*H_ii*H_jj) is
+        # nonlinear in the diagonal and a common shift does not pass through it.
+        # The Lennard-Jones sum used to have to go *on* the diagonal instead,
+        # because the pairs it should not have counted were cancelled by
+        # `exclusion` terms that were already there, and splitting a cancelling
+        # pair across the two sides is ruinous here: it left a water molecule's
+        # diagonal at -1833 eV against a bonded energy of -9.87, and a coupling
+        # of sqrt(1.95 * 1833 * 1829) = 2560 eV followed.  Now that `lj.switch`
+        # has taken the term to zero at bond lengths there are no exclusions to
+        # be split from.
         #
-        # `ZBL` and `LennardJones` are topology-independent in exactly the same
-        # way and are placed the same way, outside.  The Lennard-Jones sum used
-        # to have to go *on* the diagonal instead, because the pairs it should
-        # not have counted were cancelled by `exclusion` terms that were already
-        # there, and splitting a cancelling pair across the two sides is ruinous
-        # here: it left a water molecule's diagonal at -1833 eV against a bonded
-        # energy of -9.87, and a coupling of sqrt(1.95 * 1833 * 1829) = 2560 eV
-        # followed.  Now that `lj.switch` has taken the term to zero at bond
-        # lengths there are no exclusions to be split from -- `ReactionSet.load`
-        # derives none -- so neither term raises the question and both join the
-        # electrostatics.
-        #
-        # `System.calculate` also adds both outside its Hamiltonian, and for a
-        # different reason: its couplings come from `EVBCoupling` and do not
-        # depend on the diagonal at all, so for `D + V` with `V` fixed a common
-        # shift of `d_i` shifts the eigenvalue by exactly that constant.  There
-        # the placement is free; here it is forced.
-        #
-        # `PointCharge` is the exception: see the loop body.
+        # The electrostatics are not topology-independent under either term --
+        # each state carries its own charges -- so they go on the diagonal.
         nonbonded = self.electrostatics.get()
-        state_dependent = nonbonded.self_consistent
         state_nb = np.zeros(nstates)
         for i, istate in enumerate(self.states):
             if not istate.term_dict:
@@ -97,13 +86,9 @@ class EVBSystem:
             # `EVBSystem` reports no stress -- it holds a fixed state list and
             # is the simple alternative to `System` -- so the virial is dropped.
             en, fr, _ = self.bonded_ff(pos, pbc, cell, istate.term_dict)
-            if state_dependent:
-                # Fixed template charges differ between states, so here the
-                # electrostatics are part of what distinguishes the diabats and
-                # belong on the diagonal with everything else that does.
-                en_q, fr_q, _ = nonbonded(pos, pbc, cell, istate.term_dict)
-                en, fr = en + en_q, fr + fr_q
-                state_nb[i] = en_q
+            en_q, fr_q, _ = nonbonded(pos, pbc, cell, istate.term_dict)
+            en, fr = en + en_q, fr + fr_q
+            state_nb[i] = en_q
             ham[i, i] = en
             state_forces[i] = fr
 
@@ -141,39 +126,28 @@ class EVBSystem:
         energy = np.einsum("i,ij,j->", statevec, ham, statevec)
         forces = np.einsum("i,ijnd,j->nd", statevec, fham, statevec)
 
-        # Topology-independent electrostatics, added once on top of the ground
-        # state.  Every state carries the same `atom` terms, so state 0's
-        # term_dict is representative; a state with no terms at all (a fully
-        # dissociated topology) would carry none, hence the search.
-        en_nb, fr_nb = 0.0, np.zeros_like(pos)
-        if state_dependent:
-            # Already on the diagonal; reported as the ground state's share.
-            en_nb = float(statevecsq @ state_nb)
-        else:
-            for state in self.states:
-                if state.term_dict:
-                    en_nb, fr_nb, _ = nonbonded(pos, pbc, cell, state.term_dict)
-                    break
+        # The electrostatics are already on the diagonal; reported as the
+        # ground state's share.
+        en_nb = float(statevecsq @ state_nb)
 
         # `EVBSystem` holds a fixed state list and reports no stress; the
         # virials are discarded here rather than threaded through.
         en_zbl, fr_zbl, _ = self.zbl_ff(pos, self.atoms.numbers, pbc, cell)
 
-        # The switched 12-6, found through the same representative state as the
-        # electrostatics and for the same reason: it reads per-atom parameters
-        # out of a `term_dict`, and every state of a given system carries the
-        # same ones because they are per element.
+        # The switched 12-6, found through a representative state: it reads
+        # per-atom parameters out of a `term_dict`, and every state of a given
+        # system carries the same ones because they are per element.
         en_lj, fr_lj = 0.0, np.zeros_like(pos)
         for state in self.states:
             if state.term_dict:
                 en_lj, fr_lj, _ = self.lj_ff(pos, pbc, cell, state.term_dict)
                 break
 
-        # With state-dependent electrostatics `energy` already contains them.
-        energy_bonded = energy - en_nb if state_dependent else energy
+        # `energy` already contains the electrostatics.
+        energy_bonded = energy - en_nb
         results: dict[str, Any] = {
             "energy": energy_bonded + en_nb + en_zbl + en_lj,
-            "forces": forces + fr_nb + fr_zbl + fr_lj,
+            "forces": forces + fr_zbl + fr_lj,
             "energy_bonded": energy_bonded,
             "energy_nonbonded": en_nb,
             "energy_zbl": en_zbl,

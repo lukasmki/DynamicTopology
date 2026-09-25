@@ -171,6 +171,39 @@ hydrogen bond and the wrong way.  It is now +0.009 eV, and the 12-6 supplies the
 wall that stops two waters at 2.40 A from closing, which is why the liquid no
 longer comes out a quarter too dense.
 
+## Under fragment ACKS2 (2026-09-24): what this dataset still needs
+
+ACKS2 is now solved per diabatic state (`src/DynamicTopology/forcefield/acks2.py`):
+softness only within a molecule, reference charges `q0` from each template's
+`atom` terms, and the energy each state's minimum less its molecules' isolated
+minima.  **Every number under "The hydrogen bond" below was measured under the
+previous single-solve ACKS2** and describes that model.
+
+- **The ions are scored neutral until their templates carry `q0`.**  No `atom`
+  term here states one, so `h3o` and `h1o` equilibrate as neutral H3O and OH.
+  `q0` per atom, summing to the formal charge (+1, -1), is a fast-forces edit to
+  those two `.jsonl` files; Water-fixed-pc's `charge` values are one choice.
+  Until then the per-state machinery runs, but a hop moves no charge.
+- **The bonded fits are untouched.**  A lone template's electrostatics are zero
+  under both the old exclusion screen and the new isolated reference, so no
+  Morse `D` or `r0` moves.  The couplings are fitted on multi-molecule frames and
+  do move: `fast-forces refit` without `--force-constants` (the idempotent one).
+- **The dimer is under-bound at the shipped `eta`.**  With no intermolecular charge
+  transfer and the polarization cost now in the energy, the Cs dimer well is
+  0.088 eV at 2.95 A (0.05 A grid) against CCSD(T)'s 0.218.  Scaling the shipped
+  `eta` on the rigid dimer at inference:
+
+      eta scale   well       R_OO     q_H (monomer)   dipole
+      1.00        0.0884 eV  2.95 A   +0.3040         1.71 D
+      0.90        0.1146     2.95     +0.3408         1.92
+      0.85        0.1324     2.90     +0.3627         2.04
+      0.80        0.1546     2.90     +0.3877         2.18
+      0.75        0.1829     2.85     +0.4164         2.34
+
+  Choosing one is outstanding, and `tests/test_water_structure.py`'s two dimer
+  assertions fail until it is made.  Applying it also needs the `sigma_O`
+  pressure recheck below.
+
 ## The hydrogen bond
 
 **The bond the taper made room for was still only a third of the real one, and

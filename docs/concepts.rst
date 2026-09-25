@@ -16,44 +16,70 @@ One force call
    (:meth:`~DynamicTopology.core.ReactionSet.get_network`). A molecule's
    unimolecular channels always apply; a bimolecular channel applies only when
    the two molecules are within ``bimol_cutoff``. Applying a reaction to a
-   state gives a new state. The closure is split into independent *blocks*,
-   groups of molecules that share reactive states.
+   state gives a new state. A channel is admitted when mixing with it lowers
+   the energy by more than ``eps``, judged on the gap between the two states'
+   bonded energies plus the change in their fixed-charge electrostatics
+   (:class:`~DynamicTopology.forcefield.electrostatics.ElectrostaticGap`). The
+   closure is split into independent *blocks*, groups of molecules that share
+   reactive states.
 2. **Scores each state.** A state's diagonal energy is its bonded energy from
    :class:`~DynamicTopology.forcefield.qforce.QForce`, using the parameter
-   template of each molecule in it. The off-diagonal couplings come from
+   template of each molecule in it, plus its electrostatic energy (see
+   below): every state carries its own charges. The off-diagonal couplings come from
    :class:`~DynamicTopology.forcefield.coupling.EVBCoupling` and are centred on
    each reaction's stored transition-state geometries.
 3. **Diagonalizes.** Each multi-state block's EVB Hamiltonian is diagonalized
    with :func:`numpy.linalg.eigh`. Energy, forces and virial are the
-   Hellmann-Feynman average over the ground-state eigenvector.
+   Hellmann-Feynman average over the ground-state eigenvector. Blocks see each
+   other's charges, so when two or more blocks are multi-state they are
+   diagonalized in turn until no weight changes.
 4. **Carries the topology forward.** The state with the largest ground-state
    weight (with a small hysteresis against the incumbent) becomes that block's
    topology. The merged topology is returned and fed back into the ``System``
    for the next step.
-5. **Adds the nonbonded terms.** Electrostatics, the short-range screened-nuclear
-   repulsion (:class:`~DynamicTopology.forcefield.zbl.ZBL`) and the switched
-   12-6 (:class:`~DynamicTopology.forcefield.lj.LennardJones`) are evaluated
-   once for the whole system. Only their intramolecular exclusions depend on the
-   bonding pattern, and those are applied per state.
+5. **Adds the nonbonded terms.** The electrostatic energy, forces and virial
+   are evaluated once at the ground-state weights. The short-range
+   screened-nuclear repulsion (:class:`~DynamicTopology.forcefield.zbl.ZBL`)
+   and the switched 12-6 (:class:`~DynamicTopology.forcefield.lj.LennardJones`)
+   do not depend on the bonding, so they are evaluated once for the whole system
+   and added on top. Only their intramolecular exclusions depend on the bonding
+   pattern, and those are applied per state.
 
 Electrostatics
 --------------
 
-Two electrostatic models are available, selected by the dataset's
-``global_params.electrostatics``:
+The electrostatics are computed per diabatic state: each state carries its own
+charges, so a proton transfer moves its +1, and the surrounding charges decide
+which proton position is lower. Two models are available, selected by the
+dataset's ``global_params.electrostatics``:
 
 ``"acks2"`` (default)
-   Charge equilibration (:class:`~DynamicTopology.forcefield.acks2.ACKS2`),
-   solved once per force call and identical on every diabatic state.
+   Fragment charge equilibration (:class:`~DynamicTopology.forcefield.acks2.ACKS2`).
+   Each state solves its own ACKS2 problem:
+
+   * **Reference charges.** Each template's ``atom`` terms may state a
+     reference charge ``q0`` per atom (zero if absent), which carries the
+     molecule's formal charge.
+   * **Charge stays within a molecule.** Charge redistributes only inside each
+     molecule, so every molecule keeps exactly its formal charge. Charge moves
+     between molecules only when the bonding changes.
+   * **Energy relative to isolated molecules.** A state's energy is its ACKS2
+     minimum less each molecule's minimum in isolation. A lone template
+     therefore contributes zero electrostatic energy, and its gas-phase
+     electrostatics belong to its bonded terms.
+
+   The atoms outside every reacting block are solved once. Each state then
+   needs only a small solve over its own block, and the rest of the system
+   still responds to that state exactly.
 
 ``"pointcharge"``
    Fixed charges carried by each template's ``charge`` terms
-   (:class:`~DynamicTopology.forcefield.pointcharge.PointCharge`). A
-   hydronium's +1 moves with its proton, so the Coulomb energy differs between
-   states and sits on the EVB diagonal. Blocks interact through each other's
-   ground-state-averaged charges and are iterated to self-consistency.
+   (:class:`~DynamicTopology.forcefield.pointcharge.PointCharge`). This is the
+   ACKS2 model with zero polarizability, and needs no solve.
 
-Under full periodicity both are summed over images with an Ewald sum
+In both, a state's electrostatic energy sits on its EVB diagonal, and blocks
+interact through each other's ground-state-averaged charges. Under full
+periodicity the kernel is summed over images with an Ewald sum
 (:mod:`DynamicTopology.forcefield.ewald`). Otherwise the minimum-image kernel
 is used.
 
@@ -118,15 +144,3 @@ Units
    * - q-force XML and OpenMM (fast-forces import and export only)
      - nm
      - kJ/mol
-
-A ``.jsonl`` stores every parameter exactly as it is held in memory, so reading
-and writing one converts nothing. nm and kJ/mol appear only where fast-forces
-imports q-force XML or exports to OpenMM, and both conversions go through the
-table in :mod:`DynamicTopology.io.units`. The ACKS2 ``atom`` block, ``charge``
-and the EVB couplings are the same numbers in either unit system. The virial is
-``dE/d(strain)``, a 3×3 array in eV.
-
-Files written before 2026-09-23 stored the bonded and 12-6 parameters in nm and
-kJ/mol. :func:`~DynamicTopology.io.json.read_jsonl` refuses a bond ``r0`` below
-0.5, which only such a file can have. Convert one row at a time with
-:func:`~DynamicTopology.io.units.term_from_openmm`.

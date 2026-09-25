@@ -314,12 +314,9 @@ class TestPolarizability:
         atoms = Atoms("OHH", positions=positions, cell=[CELL] * 3, pbc=False)
         topology = Topology.from_atoms(atoms)
         topology.set_terms(reaction_set.get_terms(topology))
-        params = topology.term_dict["atom"]["kwargs"]
-
-        vecs = positions[:, None, :] - positions[None, :, :]
-        rij = np.sqrt((vecs * vecs).sum(-1))
-        acks2 = ACKS2()
-        A, b = acks2.build_system(rij, params)
+        A, b = ACKS2().linear_system(
+            positions, np.zeros(3, dtype=bool), np.eye(3) * CELL, topology.term_dict
+        )
 
         # A uniform field `F` along `axis` is the external potential
         # `phi_i = -F * r_i.e`, which adds to `dE/dQ_i`; `b[:n]` is `-mu`, so it

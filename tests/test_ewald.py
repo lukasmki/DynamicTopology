@@ -166,7 +166,8 @@ class TestConvergence:
         q = rng.normal(size=5)
         q -= q.mean()
 
-        # A screen of the kind `ACKS2.screen_matrix` builds: symmetric, off the
+        # A weight of the kind the old ACKS2 exclusion screen built, and a
+        # charged cell or the admission gate still does: symmetric, off the
         # diagonal, and with no reason at all to be neutral.
         screen = np.ones((5, 5))
         screen[0, 1] = screen[1, 0] = 0.0

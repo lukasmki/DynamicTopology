@@ -65,7 +65,7 @@ Beyond the ASE properties, the calculator exposes per-call diagnostics:
 
    calc = atoms.calc
    calc.diagnostics["energy_bonded"]     # EVB ground-state bonded energy
-   calc.diagnostics["energy_nonbonded"]  # electrostatics
+   calc.diagnostics["energy_nonbonded"]  # electrostatics, at the ground-state weights
    calc.diagnostics["energy_zbl"]        # short-range screened-nuclear repulsion
    calc.diagnostics["energy_lj"]         # switched 12-6
    calc.diagnostics["blocks"]            # per-EVB-block states and weights
@@ -136,6 +136,11 @@ scoring a template on its own:
    result.electrostatics  # ACKS2 or point charges
    result.zbl, result.lj  # the two repulsion terms
    result.charges         # per-atom charges, e
+
+A lone molecule's electrostatic energy is zero under ACKS2, because the
+energy is measured relative to each molecule in isolation. Its charges are
+still solved and reported. Electrostatics appear once a term list spans two or
+more molecules, or a periodic cell lets a molecule see its images.
 
 Overriding global parameters
 ----------------------------

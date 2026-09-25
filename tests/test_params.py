@@ -373,18 +373,23 @@ class TestTheParametersReachTheForceField:
         So it moves the charges themselves, not only the energy they are scored
         with -- which is why it is inside `E_nonbonded` and invalidates a fit.
         """
+        # Two hydroxyls: the charges live within each molecule, so it takes two
+        # of them for the kernel to reach the energy at all.
         term_dict = {
             "atom": {
-                "atoms": np.array([[0], [1]]),
+                "atoms": np.array([[0], [1], [2], [3]]),
                 "kwargs": {
-                    "mu": np.array([8.12, 1.88]),
-                    "eta": np.array([3.74, 7.28]),
-                    "soft_amp": np.array([3.88, 2.10]),
-                    "soft_decay": np.array([0.44, 0.27]),
+                    "mu": np.array([8.12, 1.88, 8.12, 1.88]),
+                    "eta": np.array([3.74, 7.28, 3.74, 7.28]),
+                    "soft_amp": np.array([3.88, 2.10, 3.88, 2.10]),
+                    "soft_decay": np.array([0.44, 0.27, 0.44, 0.27]),
                 },
-            }
+            },
+            "bond": {"atoms": np.array([[0, 1], [2, 3]]), "kwargs": {}},
         }
-        pos = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+        pos = np.array(
+            [[0.0, 0.0, 0.0], [0.97, 0.0, 0.0], [2.8, 0.3, 0.0], [3.3, 1.1, 0.0]]
+        )
         narrow = ACKS2()(pos, PBC, CELL, term_dict)[0]
         with use(gamma=0.5):
             wide = ACKS2()(pos, PBC, CELL, term_dict)[0]

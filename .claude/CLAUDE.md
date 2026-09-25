@@ -77,26 +77,33 @@ diagonalized state also decides the topology carried into the next step.
 5. The state with squared eigenvector weight > 0.9 becomes that subnetwork's new topology; the
    subnetwork topologies are merged and returned as `results["topology"]`, which the calculator
    feeds back into `System` — this is how bonds break and form across MD steps.
-6. Three nonbonded terms — electrostatics (`forcefield/acks2.py:ACKS2`), short-range repulsion
-   (`forcefield/zbl.py:ZBL`) and the switched 12-6 (`forcefield/lj.py:LennardJones`) — are computed
-   once on the whole system, topology-independent, and added on top. None sits on the EVB diagonal.
-   Their *intramolecular exclusions* do, because which pairs are 1-2/1-3/1-4 is exactly what a
-   diabatic state disagrees about: `forcefield/exclusions.py` derives them at load, `QForce`
-   evaluates the ZBL and 12-6 ones as ordinary additive terms, and the Coulomb one takes the route
-   that module's docstring lays out — charges solved once from the unmasked kernel, a per-state
-   scalar on the diagonal, and a single ground-state-weighted screen on the energy at the end.
-   `ACKS2.prepare` therefore runs *before* the diagonalization and `ACKS2.compute` after it.
-7. **Or, with `global_params.electrostatics = "pointcharge"`, fixed charges instead of ACKS2**
-   (`forcefield/pointcharge.py`, dataset `datasets/Water-fixed-pc`). Each template carries a
-   `charge` term per atom summing to its formal charge, so the +1 of an H3O+ moves with the
-   proton — which ACKS2's single sum-zero constraint cannot do. The Coulomb energy is then
-   state-dependent and goes *on* the diagonal, and blocks couple through each other's
-   ground-state-averaged charges, so `System.calculate` sweeps the multi-state blocks until no
-   weight moves (`SCF_TOLERANCE`; one sweep when at most one block is multi-state). Both terms
-   sit behind one protocol — `prepare` / `bind` / `corrections` / `update` / `evaluate`, plus
-   `__call__` for one topology — chosen per call by `forcefield/electrostatics.py`, which the
-   fitter and `evb.py` use too. The admission gate in `basis.py` still screens on the bonded
-   gap only.
+6. Two nonbonded repulsion terms — short-range repulsion (`forcefield/zbl.py:ZBL`) and the
+   switched 12-6 (`forcefield/lj.py:LennardJones`) — are computed once on the whole system,
+   topology-independent, and added on top; neither sits on the EVB diagonal. Their
+   *intramolecular exclusions* do, because which pairs are 1-2/1-3/1-4 is exactly what a diabatic
+   state disagrees about: `forcefield/exclusions.py` derives them at load and `QForce` evaluates
+   them as ordinary additive terms.
+7. **Electrostatics are per diabatic state and sit on the diagonal**, under either term, chosen
+   by `global_params.electrostatics` through `forcefield/electrostatics.py`:
+   - `"acks2"` (`forcefield/acks2.py`) is *fragment* ACKS2: each state minimizes its own ACKS2
+     functional, with reference charges `q0` from its templates' `atom` terms (so an H3O+ holds
+     +1 and a hop moves it) and softness only within a molecule (so no charge crosses between
+     molecules). The energy is the minimum **less each molecule's isolated minimum**, so a lone
+     template scores exactly zero and no `coulombexclusion` is needed; ACKS2 ignores those terms
+     and its kernel is whole. The functional is stationary, so there is no charge-response
+     term. The atoms outside every multi-state block are LU-factored once and folded into each
+     state's small block solve (a Schur complement), so all states cost about one solve.
+   - `"pointcharge"` (`forcefield/pointcharge.py`, dataset `datasets/Water-fixed-pc`) carries a
+     `charge` term per atom and subtracts its `coulombexclusion` pairs' direct kernel per state.
+     It is fragment ACKS2's zero-softness limit.
+
+   Blocks couple through each other's ground-state-averaged charges (a Hartree product), so
+   `System.calculate` sweeps the multi-state blocks until no weight moves (`SCF_TOLERANCE`; one
+   sweep when at most one block is multi-state). Both terms sit behind one protocol — `prepare` /
+   `bind` / `corrections` / `update` / `evaluate`, plus `__call__` for one topology — which the
+   fitter and `evb.py` use too. `prepare` runs *before* `EVBBasis.build`, because the admission
+   gate screens on the bonded gap plus the fixed-charge electrostatic one
+   (`electrostatics.ElectrostaticGap`, off for a dataset with no nonzero charges).
 
 **Electrostatics is the one nonbonded term that is not short ranged**, so under full periodicity it
 is summed over images rather than truncated at the nearest one. `forcefield/ewald.py` holds both
@@ -104,22 +111,22 @@ forms of the ACKS2 charge kernel `erf(2r)/r` behind one interface — `matrix()`
 kernel, `contract(W)` for `dS/dr` and `dS/de` of `S = sum_ij W_ij K_ij` — and `acks2.py` never
 branches on `pbc`. `MinimumImage` is the open-boundary kernel (and the fallback for a slab or wire,
 where a 3D Ewald sum would be the wrong sum); `Ewald` is the lattice sum. `contract` is the reason
-the kernel is an object: the explicit Coulomb force and the `-lam^T (dA/dr) x` charge response are
-the same contraction under different weights `W`, and the reciprocal-space part of each is not a
-sum over pair separations at all.
+the kernel is an object: ACKS2's force (`W = E[q q^T]/2` over its states), `PointCharge`'s and the
+admission gate's are the same contraction under different weights `W`, and the reciprocal-space
+part of each is not a sum over pair separations at all.
 
 Three things about the periodic kernel that the open-boundary one has no analogue for:
 
-- **`K_ii` is nonzero** — an atom interacts with its own images — so `build_system` *adds* the
+- **`K_ii` is nonzero** — an atom interacts with its own images — so the ACKS2 solve *adds* the
   hardness to the Coulomb diagonal instead of overwriting it. It is 80% of the rock-salt energy in
   `test_ewald.py`, not a rounding term.
-- **The `k = 0` term is dropped and its background put back.** Dropping it is legal only because
-  `build_system` constrains `sum_i q_i = 0`: a constant added to every entry of `K` scales as
-  `(sum_i q_i)^2` in the energy and `sum_i q_i` in each ACKS2 row. That made every *neutral*
-  contraction right and every individual `K_ij` meaningless — it drifted with `kappa`. The Coulomb
-  exclusion contracts `K` against a non-neutral weight and needs the entries themselves, so
-  `Ewald.background` is now carried explicitly. It changes no energy, force or charge that predates
-  it, by the same `(sum_i q_i)^2` argument.
+- **The `k = 0` term is dropped and its background put back.** A constant added to every entry
+  of `K` scales as `(sum_i q_i)^2` in the energy and `sum_i q_i` in each ACKS2 charge row (which
+  the molecules' multipliers absorb, so the charges never see it). That made every *neutral*
+  contraction right and every individual `K_ij` meaningless — it drifted with `kappa`. A charged
+  cell (an H3O+ under per-molecule formal charges), a point-charge exclusion and the gate's
+  difference of two states all contract `K` against a non-neutral weight, so `Ewald.background`
+  is carried explicitly.
 - **Reciprocal vectors strain inversely to positions** (`k -> (I - e) k`), which is where the
   reciprocal virial comes from; the structure factor is invariant, so there is no `v_a v_b` term.
 
@@ -273,6 +280,10 @@ note above and `forcefield/README.md`.
   Madelung constant (which `MinimumImage` misses by 17%), independence from the Ewald splitting
   parameter, and the 1/L³ approach to the open-boundary kernel. Finite differences cannot see a
   lattice sum converging to the wrong number, which is what this file is for.
+- `test_acks2_fragment.py` — fragment ACKS2 against values: each state's Schur solve equals the
+  full whole-system solve, every molecule keeps its formal charge, a lone template scores zero,
+  the zero-softness limit is `PointCharge`, a nearby anion flips which proton position is lower,
+  and the admission gate equals the point-charge diagonal difference (with its gradient).
 - `test_pointcharge.py` — the point-charge path through `System`: the block sweep (forces are
   off by 0.058 eV/Å on two interacting Zundels if it stops after one pass), a charged Ewald cell's
   forces and virial, and the exclusion's periodic self-image. Runs Water-fixed-pc under
@@ -285,6 +296,6 @@ note above and `forcefield/README.md`.
   the reported number has to move, which is the only way to catch a call site that still reads a
   stale default; plus the manifest plumbing and the two-dataset collision.
 - `test_energy_conservation.py` — NVE drift through the ASE calculators, plus a dt-halving check
-  that the residual is O(dt²) integrator error rather than inconsistent forces. Two xfails pin the
-  ACKS2 frozen-charge approximation (see below).
+  that the residual is O(dt²) integrator error rather than inconsistent forces. H2O2 + HO2 is the
+  case that exercises intermolecular ACKS2 (a lone molecule's electrostatics are zero).
 - `tests/profile/` holds cProfile drivers, not pytest tests.

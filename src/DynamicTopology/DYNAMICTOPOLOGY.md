@@ -5,12 +5,15 @@ Method and equation reference for the reactive `DynamicTopology` ASE calculator
 
 Every force evaluation does five things at the current nuclear geometry $\mathbf{x}$:
 
-1. solve the **charge equilibration** once, on the whole system, from the unmasked kernel;
-2. partition the system into independent **blocks** of coupled reaction channels;
-3. close a **diabatic basis** $\{|i\rangle\}$ over each block by a geometric admission criterion;
+1. partition the system into independent **blocks** of coupled reaction channels;
+2. close a **diabatic basis** $\{|i\rangle\}$ over each block by a geometric admission
+   criterion that sees the bonded and the fixed-charge electrostatic gap;
+3. solve the **charge equilibration of every diabatic state** — one factorization of the
+   environment, one small solve per state — and put each state's electrostatic energy
+   on its diagonal;
 4. build and diagonalize a small **EVB Hamiltonian** per block, taking the ground root;
-5. add the three **whole-system nonbonded** sums on top, the electrostatic one screened by
-   what the ground state has just decided is bonded.
+5. add the electrostatics' force at the ground-state weights, and the two
+   **whole-system repulsion** sums, on top.
 
 Energy, forces **and virial** are carried through all five steps together; the
 virial is contracted with the same ground-state eigenvector as the forces and
@@ -32,8 +35,7 @@ the next MD step — that feedback is the "dynamic topology".
 | $\rho$ | RMSD to a stored transition-state reference geometry |
 | $\mathbf{W}$ | virial, $W_{ab} = \partial E/\partial \epsilon_{ab}$ under a homogeneous strain |
 | $K_{ij}$ | the ACKS2 charge kernel, $\operatorname{erf}(\gamma r)/r$ or its lattice sum (§2.3.1) |
-| $S_{ij}$ | the intramolecular exclusion screen, $1 - \sum_s w_s M_s$ (§2.3.2) |
-| $C(T_i)$ | the Coulomb exclusion correction on state $i$'s diagonal (§2.3.2) |
+| $E^{\text{el}}(T_i)$ | state $i$'s electrostatic energy, on its diagonal (§2.3) |
 
 Units are ASE's throughout: **eV** and **Å**, for every force field, every
 parameter held in memory and every `.jsonl` on disk. Only q-force's XML and
@@ -270,6 +272,30 @@ channel passes ([basis.py:611](basis.py#L611)). Only admitted states are then
 evaluated in full. Four caches (`_energy_cache`, `_reaction_cache`,
 `_coupling_cache`, `_molecule_cache`) are cleared at the top of every `build`
 ([basis.py:537](basis.py#L537)), so they are per-geometry only.
+
+**The gap includes the electrostatics.** The charges follow the bonding, so a
+proton transfer that the surrounding charges make favourable has a smaller gap than
+its bonded one, and screening on the bonded gap alone would refuse it as though in
+vacuum. `EVBBasis` therefore takes a `gap` hook
+(`forcefield.electrostatics.ElectrostaticGap`) whose energy is added to the child's
+side:
+
+$$
+\Delta E^{\text{el}} = E(\text{child}) - E(\text{parent}),
+\qquad
+E(T) = C\Big[\tfrac12\,\mathbf q_T^{\mathsf T}K\mathbf q_T - \!\!\sum_{(i,j)\in\text{excl}(T)}\!\! q_iq_j\,g_{ij}\Big],
+$$
+
+at the fixed charges `charge.q`, else the reference `atom.q0`: the diagonal's own
+electrostatics under `PointCharge` (the two agree to $10^{-10}$ with one multi-state
+block), a smooth surrogate under ACKS2, whose diagonal stays the full solve. The
+states differ only on the reacting fragment $M$, so it is the fragment's charges in
+the potential of everything else plus its own interaction, $O(|M|N)$. As a difference
+of one function of the state it is antisymmetric, so the invariance argument below
+is untouched — except that atoms outside the block sit at the seed topology's
+charges, so another block's pivot reaches this block's gate. A dataset whose
+templates carry no nonzero charge (HCombustion) switches the hook off. Inside the
+ramp its gradient joins the bonded one in $\partial w/\partial\mathbf x$.
 
 **Seed invariance.** The criterion is symmetric under exchanging parent and child
 ($\eta \to -\eta$ leaves $\eta^2$ and $|\eta|$ fixed), so the admitted set is the
@@ -695,99 +721,135 @@ making the *sum* state-dependent, and they are gone.
 
 ### 2.3 Electrostatics (`ACKS2`, [forcefield/acks2.py](forcefield/acks2.py))
 
-Charge equilibration with a Kohn–Sham response block. Solve, in term order,
-$A\mathbf{z} = \mathbf{b}$ with $\mathbf{z} = [\,\mathbf{Q},\ \mathbf{u},\ \lambda_{\text{tot}},\ \lambda_{\text{KS}}\,]$:
+**Fragment ACKS2: one charge equilibration per diabatic state.** Each state $T_s$
+minimizes its own functional over the charges $\mathbf q$ and the Kohn–Sham
+potentials $\mathbf u$ of every atom in the system,
 
 $$
-A = \begin{pmatrix}
-K & -I & -\mathbf{1} & 0 \\
--I & X & 0 & -\mathbf{1} \\
--\mathbf{1}^{\mathsf T} & 0 & 0 & 0 \\
-0 & -\mathbf{1}^{\mathsf T} & 0 & 0
-\end{pmatrix},
-\qquad
-\mathbf{b} = \begin{pmatrix} -\boldsymbol{\mu} \\ \mathbf{0} \\ 0 \\ 0\end{pmatrix},
+F_s(\mathbf q,\mathbf u) \;=\; \boldsymbol\mu\cdot\mathbf q
+\;+\; \tfrac12\,\mathbf q^{\mathsf T}\big(K + 2\,\mathrm{diag}\,\boldsymbol\eta\big)\mathbf q
+\;-\; \mathbf u^{\mathsf T}\big(\mathbf q - \mathbf q^0_s\big)
+\;-\; \tfrac12\,\mathbf u^{\mathsf T} L_{X_s}\,\mathbf u,
 $$
 
 $$
-A_{ii} \mathrel{+}= 2\eta_i,
-\qquad
-X_{ij} = \chi_i\chi_j\,e^{-r_{ij}/\tau_{ij}}\ (i\ne j),
+X_{ij} = \chi_i\chi_j\,e^{-r_{ij}/\tau_{ij}}\ \ (i\ne j,\ \text{same molecule of } T_s),
 \qquad \tau_{ij} = \tfrac12(\tau_i + \tau_j),
-\qquad X_{ii} = -\sum_{j\ne i} X_{ij},
+\qquad L_X = \mathrm{diag}\Big(\textstyle\sum_j X_{ij}\Big) - X,
 $$
 
-with $K$ the charge kernel of §2.3.1 — $\operatorname{erf}(\gamma r)/r$ under open
-boundaries, its lattice sum under periodic ones.
+with one charge constraint $\sum_{i\in m} q_i = \sum_{i\in m} q^0_i$ and one
+Kohn–Sham constraint $\sum_{i\in m} u_i = 0$ per molecule $m$. $K$ is the charge
+kernel of §2.3.1, the same for every state; $A$ carries it bare, so $\mu$ and
+$\eta$ are in the units that implies and the energy is $E = C\,F$, $C = 14.4$ eV Å.
 
-**The hardness is added to the Coulomb diagonal, not written over it**
-([acks2.py:117](forcefield/acks2.py#L117)). Under open boundaries $K_{ii} = 0$ and
-the two are the same operation; the periodic kernel carries an atom's interaction
-with its own images there, and it belongs in the equilibration alongside $2\eta_i$.
+Two things make it a function of the bonding, and they are what the single-solve
+ACKS2 it replaced could not express:
 
-The two $\mathbf{1}$ rows/columns enforce total-charge and KS-potential
-constraints; both right-hand sides are hard-coded to zero
-([acks2.py:124](forcefield/acks2.py#L124), [acks2.py:129](forcefield/acks2.py#L129)),
-so the system is always **exactly neutral** — there is no net-charge parameter, and
-a formally charged fragment is scored as its neutral isomer. That is a real
-limitation and it has a consequence recorded in §2.3.2: it is why H₃O⁺ cannot be
-fitted without the Coulomb exclusion. $A$ is symmetric, which the force adjoint
-exploits.
+- **$\mathbf q^0_s$, the reference charges**, are the templates' `q0` per atom (zero
+  where a template states none). They carry each molecule's formal charge, so an
+  H₃O⁺ holds its +1 and a Grotthuss hop moves it. The old solve had one global
+  neutrality constraint and scored a charged fragment as its neutral isomer.
+- **The softness acts only within a molecule.** $L_X$ is block diagonal by
+  molecule, so $\mathbf q = \mathbf q^0 - L_X\mathbf u$ keeps every molecule at
+  exactly its formal charge: charge moves between molecules only by changing the
+  bonding, which is the EVB's job, never by the solve. The old global softness moved
+  0.145 e from H₂ to O₂ at a 2 Å contact.
+
+**The energy is the minimum, relative to the isolated molecules:**
+
+$$
+E^{\text{el}}(T_s) \;=\; C\Big[\,F_s^{*} \;-\; \sum_{m\,\in\,T_s} F_m^{*,\text{iso}}\Big],
+$$
+
+$F_m^{*,\text{iso}}$ the same functional minimized for molecule $m$ alone under open
+boundaries. A lone template therefore scores exactly zero — its gas-phase
+electrostatics belong to its bonded terms (§2.3.2) — and what remains is
+intermolecular electrostatics, each molecule's polarization by the others (its
+intramolecular half included), and every image interaction. At a stationary point
+of a quadratic $\tfrac12\mathbf z^{\mathsf T}A\mathbf z - \mathbf b^{\mathsf T}\mathbf z$ the
+value is $-\tfrac12\mathbf b^{\mathsf T}\mathbf z^*$, which is how both minima are
+read off.
+
+**No charge response.** Both pieces are stationary in their own variables, and
+$\mathbf b$ is geometry-free, so
+
+$$
+\frac{\partial E^{\text{el}}}{\partial\mathbf x} \;=\; \tfrac{C}{2}\,\mathbf z^{*\mathsf T}\frac{\partial A_s}{\partial\mathbf x}\mathbf z^{*}
+\;-\; \sum_m \tfrac{C}{2}\,\mathbf z_m^{\text{iso}\,\mathsf T}\frac{\partial A_m^{\text{iso}}}{\partial\mathbf x}\mathbf z_m^{\text{iso}}
+$$
+
+at the solved vectors, with no adjoint solve. Only $K$ and $X$ depend on the
+geometry. (The previous energy was $\tfrac{C}{2}\mathbf Q^{\mathsf T}K\mathbf Q$ alone, which is
+not stationary in $\mathbf Q$ and needed $-\boldsymbol\lambda^{\mathsf T}(\partial A/\partial\mathbf x)\mathbf z$
+on top.)
+
+**Every state for the price of one solve.** A block is a union of whole molecules,
+and both topology-dependent pieces are intramolecular, so the states of a block
+differ only in their own rows. Partition the atoms into the multi-state blocks $b$
+and the environment $e$ — every atom in a single-state block, in the seed topology.
+The environment's matrix $A_{ee}$ and its coupling to a block, the bare kernel
+$K_{eb}$, are shared by every state. Once per force call:
+
+$$
+A_{ee} = LU, \qquad \mathbf y = A_{ee}^{-1}\mathbf b_e, \qquad G_b = A_{ee}^{-1}K_{eb},
+\qquad \mathbf p_b = K_{be}\,\mathbf y_q, \qquad \Sigma_{bb'} = K_{be}\,G_{b',q} ,
+$$
+
+one LU and $n_b$ back-substitutions. Then each state $s$ of block $b$ is a dense
+solve over its own block alone,
+
+$$
+\big(A_{bb,s} - \Sigma_{bb}\big)\,\mathbf z_s \;=\; \mathbf b_{b,s} - \mathbf p_b - \mathbf h_b,
+\qquad
+\mathbf h_b = \sum_{b'\ne b}\big(K_{bb'} - \Sigma_{bb'}\big)\,\bar{\mathbf q}_{b'},
+$$
+
+with the environment folded in as a potential $\mathbf p$ and a reaction field
+$\Sigma$, and answering each state exactly: $\mathbf z_{e,s} = \mathbf y - G_b\mathbf q_s$.
+`tests/test_acks2_fragment.py` holds each state's diagonal entry to the full
+whole-system solve to $10^{-10}$ eV.
+
+**Two multi-state blocks see each other through their means** $\bar{\mathbf q}_b = \sum_s w_s\mathbf q_s$,
+a Hartree product with the environment-screened coupling $K_{bb'} - \Sigma_{bb'}$, and
+`System.calculate` sweeps the blocks until no weight moves (`SCF_TOLERANCE`). The
+functional is linear in each block's weights with the others fixed, so a sweep is
+block-coordinate descent, and at convergence it is stationary in every eigenvector and
+every $\mathbf z_s$ — which is what makes the Hellmann–Feynman forces exact. With one
+multi-state block, $\mathbf h_b = 0$ and the first pass is final.
+
+**Forces are one kernel contraction.** Every derivative is
+$\tfrac{C}{2}\langle\partial A/\partial\mathbf x, Z\rangle$ with $Z$ the weight-averaged second
+moment of the full solution. For the charges,
+
+$$
+\mathbb E[\mathbf q\mathbf q^{\mathsf T}] \;=\; \bar{\mathbf q}\bar{\mathbf q}^{\mathsf T}
+\;+\; \sum_b R_b\,\mathrm{Cov}_b\,R_b^{\mathsf T},
+\qquad
+R_b = \begin{pmatrix}-G_{b,q}\\ I_b\end{pmatrix},
+$$
+
+$\mathrm{Cov}_b$ the covariance of block $b$'s charges over its states: the
+environment's response rides on each state's fluctuation. The kernel part is a single
+`kernel.contract(W)` with $W = \tfrac12\mathbb E[\mathbf q\mathbf q^{\mathsf T}]$ for the whole
+system; the intramolecular softness and the isolated references are sparse pair sums,
+per state within a block ([acks2.py `evaluate`](forcefield/acks2.py)).
+
+**The hardness is added to the Coulomb diagonal, not written over it.** Under open
+boundaries $K_{ii} = 0$ and the two are the same operation; the periodic kernel carries
+an atom's interaction with its own images there, and it belongs in the equilibration
+alongside $2\eta_i$.
 
 **Parameter names.** The term kwargs are `mu` ($\mu$), `eta` ($\eta$), `soft_amp`
-($\chi$) and `soft_decay` ($\tau$); there are no `chi` or `tau` keys. The kernel
-width $\gamma$ is `params.gamma` $= 2.0$ Å⁻¹, named once and shared by both kernel
-implementations — it was an unnamed literal `2` repeated at five sites in this file
-before `ewald.py` existed.
+($\chi$), `soft_decay` ($\tau$) and the optional `q0` ($q^0$, zero if absent). The
+kernel width $\gamma$ is `params.gamma` $= 2.0$ Å⁻¹, shared by both kernel
+implementations.
 
-The energy added to the system is the damped Coulomb sum only:
-
-$$
-E_{\text{elec}} = \frac{C}{2}\sum_{i,j} S_{ij}\,Q_i Q_j K_{ij},
-\qquad C = 14.4\ \text{eV\,Å},
-$$
-
-with $S$ the exclusion screen of §2.3.2 ($S \equiv 1$ recovers the unscreened sum)
-and the $i = j$ term retained, since $K_{ii}$ is a real self-image interaction under
-periodicity. Everything `compute` returns — energy, forces and virial — is derived
-from this one functional, so the three are consistent with each other whatever $S$
-is, including the fractional screen an EVB ground state produces.
-
-**Charge response.** The charges solve a geometry-dependent system with a
-geometry-free $\mathbf{b}$, and $E_{\text{elec}}$ is *not* stationary in
-$\mathbf{Q}$ — the full ACKS2 functional is, this Coulomb piece alone is not — so
-$d\mathbf{Q}/d\mathbf{x}$ contributes. Differentiating the solve,
-$\partial\mathbf{z}/\partial\mathbf{x} = -A^{-1}(\partial A/\partial\mathbf{x})\mathbf{z}$, gives
-
-$$
-\frac{dE}{d\mathbf{x}} \;=\; \left.\frac{\partial E}{\partial \mathbf{x}}\right|_{\mathbf{Q}}
-\;-\; \boldsymbol{\lambda}^{\mathsf T}\frac{\partial A}{\partial \mathbf{x}}\mathbf{z},
-\qquad
-\boldsymbol{\lambda} = A^{-1}\frac{\partial E}{\partial \mathbf{z}},
-$$
-
-one extra solve rather than one per coordinate (`compute_response_forces`,
-[acks2.py:192](forcefield/acks2.py#L192)). Only $K$ and $X$ depend on geometry;
-anything geometry-dependent added to `build_system` must be differentiated here
-too, or the forces stop being the gradient of the energy. Omitting this term was
-the source of NVE drift for every species with nonzero charges. The response
-carries a strain derivative as well as a position one and needs no separate solve:
-both are the same kernel contraction under the same weight, which is what
-`kernel.contract` returns as a pair.
-
-**The screen enters this expression once, not twice** — see §2.3.2, which is the
-subtlest thing in the module.
-
-**Charges are re-solved, not frozen** — but they are cached. `prepare` keys on the
-positions, the atom indices **and the cell**
-([acks2.py:422](forcefield/acks2.py#L422)); the cell is in the key because a
-barostat step is a different problem at identical fractional coordinates. The bond
-graph is deliberately *absent* from the key: the solve does not depend on it, and a
-key that pretended otherwise would throw the charges away after every reaction for
-nothing. The key still does not cover the `mu` / `eta` / `soft_amp` / `soft_decay`
-values, so the same geometry evaluated with different parameters would reuse stale
-charges; nothing in the current pipeline does that, and fast-forces' `refine` keys
-its own nonbonded cache separately.
+**Point charges are the zero-softness limit.** With $X = 0$, $\mathbf q = \mathbf q^0$
+exactly and $E^{\text{el}}$ is the fixed-charge Coulomb energy less each molecule's own
+— `PointCharge`'s, whenever its exclusions cover every intramolecular pair (true of
+every shipped template). `tests/test_acks2_fragment.py` holds the two to $10^{-10}$
+with $\mu = \eta = 0$, open and periodic.
 
 #### 2.3.1 The charge kernel, open and periodic ([forcefield/ewald.py](forcefield/ewald.py))
 
@@ -800,11 +862,11 @@ forms live behind one interface and `acks2.py` never branches on `pbc`:
 | `kernel.matrix()` | $K$, the $(n,n)$ kernel matrix |
 | `kernel.contract(W)` | $\partial S/\partial r_i$ and $\partial S/\partial\epsilon_{ab}$ for $S = \sum_{ij} W_{ij}K_{ij}$ |
 
-`contract` is the reason the kernel is an object rather than a matrix. Both places
-ACKS2 differentiates the kernel — the explicit Coulomb force and the
-$-\boldsymbol\lambda^{\mathsf T}(\partial A/\partial\mathbf{x})\mathbf{z}$ response —
-are of exactly that form and differ only in the symmetric weight $W$, so the
-periodic derivatives are written once instead of once per caller; and the
+`contract` is the reason the kernel is an object rather than a matrix. Every caller
+that differentiates the kernel — ACKS2 against $\tfrac12\mathbb E[\mathbf q\mathbf q^{\mathsf T}]$,
+`PointCharge` against its own weights, the admission gate against the difference of
+two states — is of exactly that form and differs only in the symmetric weight $W$,
+so the periodic derivatives are written once instead of once per caller; and the
 reciprocal-space part of each is not a sum over pair separations at all.
 
 `MinimumImage` is the open-boundary kernel, $\operatorname{erf}(\gamma r)/r$ at the
@@ -829,23 +891,26 @@ but it does interact with its own images.
 Three things about the periodic kernel have no open-boundary analogue.
 
 **$K_{ii} \ne 0$.** That self-image term is 80% of the rock-salt energy in
-`tests/test_ewald.py`, not a rounding correction, and it is why `build_system` adds
+`tests/test_ewald.py`, not a rounding correction, and it is why the solve adds
 the hardness to the Coulomb diagonal instead of overwriting it.
 
 **The $k = 0$ term is dropped and its background put back.** The $k = 0$ term of the
 reciprocal sum is the divergent one; regularizing it against a neutralizing
 background leaves the constant $-\pi/(\kappa^2 V)$ in *every* entry of $K$, diagonal
-included. Dropping it is legal only because `build_system` constrains
-$\sum_i q_i = 0$: a constant on every entry of $K$ contributes that constant times
+included. Dropping it was legal while the old solve constrained $\sum_i q_i = 0$: a
+constant on every entry of $K$ contributes that constant times
 $\big(\sum_i q_i\big)^2$ to the energy and that constant times $\sum_i q_i$ to each
-ACKS2 row. That made every **neutral** contraction right and every individual
+ACKS2 row (which the molecules' charge multipliers absorb, so the charges never see
+it). That made every **neutral** contraction right and every individual
 $K_{ij}$ meaningless — an $K_{ij}$ drifted with the splitting parameter by 0.0054 on
 an O–H pair between `accuracy` $10^{-4}$ and $10^{-12}$, while the neutral
 contraction held to ten digits.
 
-The intramolecular exclusion (§2.3.2) is the first thing in this codebase to
-contract $K$ against a **non-neutral** weight — the excluded pairs of a water carry
-$\sum_{\text{excl}} q_iq_j \ne 0$ — so `Ewald.background` is now carried explicitly.
+The Coulomb exclusion (§2.3.2) was the first thing in this codebase to contract $K$
+against a **non-neutral** weight — the excluded pairs of a water carry
+$\sum_{\text{excl}} q_iq_j \ne 0$ — so `Ewald.background` is carried explicitly. It
+is needed more now: a cell holding an H₃O⁺ under per-molecule formal charges is
+charged, and the admission gate contracts against the difference of two states.
 It changes no energy, force, virial or charge that predates it, by the same
 $\big(\sum_i q_i\big)^2$ argument, and every neutral contraction is bit-identical
 across the change. It surfaced first in the **virial**, at 0.5% of a seven-atom box,
@@ -904,9 +969,10 @@ cation's true minimum sat at **1.60 Å** and the symmetric $C_{3v}$ structure wa
 *saddle*. With the intramolecular nonbonded removed, a small template's gas-phase
 minimum is the q-force potential's own minimum and nothing has to cancel anything.
 
-The scale, on one water with the dataset's own parameters: the entire unscreened
-ACKS2 energy of an isolated H₂O is **−4.64419 eV**, every bit of it intramolecular,
-and the screen takes it to exactly 0.
+The scale, on one water with the dataset's own parameters: the old unscreened ACKS2
+energy of an isolated H₂O was **−4.64419 eV**, every bit of it intramolecular. Under
+fragment ACKS2 the isolated-molecule reference takes the electrostatics of any lone
+template to exactly 0 (§2.3).
 
 `exclusions.exclusion_terms` derives one term per pair within `exclusion_depth = 3`
 bonds (GROMACS `nrexcl = 3`), at load time
@@ -916,7 +982,7 @@ bonds (GROMACS `nrexcl = 3`), at load time
 | --- | --- | --- |
 | `exclusion` | `QForce.compute_exclusion` | 12-6; emitted only where both $\sigma$ and $\varepsilon$ are nonzero, since $\sigma_{\mathrm H} = 0$ makes the pair identically zero and a term would be an expensive no-op |
 | `zblexclusion` | `QForce.compute_zblexclusion` | needs atomic numbers, which ZBL reads from the `Atoms` rather than a template, so they are handed in |
-| `coulombexclusion` | `ACKS2`, **not** `QForce` | carries no kwargs at all — the charges are not known at load time |
+| `coulombexclusion` | `PointCharge` only | carries no kwargs — the charges are the state's; ACKS2 ignores it (below) |
 
 **Why the exclusions sit on the EVB diagonal when the sums do not.** Which pairs are
 1-2/1-3/1-4 is exactly what a diabatic state disagrees about. So the whole-system
@@ -941,128 +1007,56 @@ states is a chemical decision; one that moves by 900 eV is the failure mode
 `lj.py`'s docstring enumerates. The switch is what made the same decomposition
 usable again.
 
-**Coulomb is not additive, and that is the whole difficulty.** ACKS2's charges come
-from a linear solve whose matrix *contains* the kernel, so the exclusion cannot
-simply be subtracted from the energy and left out of the equilibration. The obvious
-repair is to mask the kernel inside the solve. It is perfectly consistent — a
-screened kernel is just another kernel in §2.3.1's sense, with energy, forces and
-virial all derived from it — and it is **wrong here for a reason that has nothing to
-do with consistency**: it makes the charges a function of the bond graph.
-`System.calculate` solves them once, outside the Hamiltonian, *precisely because*
-they are the same problem for every diabatic state; topology-dependent charges
-solved once anyway make the total energy depend on which state happened to seed the
-block, measured at **0.88 eV** on `tests/test_evb_invariants.py`. Solving them per
-state instead would be correct, and would multiply the most expensive thing in a
-force call by the basis size.
+**Coulomb is not additive under charge equilibration, and fragment ACKS2 needs no
+exclusion.** ACKS2's charges come from a solve whose matrix *contains* the kernel, so
+an exclusion cannot simply be subtracted from the energy and left out of the
+equilibration. The route this section used to document — charges solved once from the
+unmasked kernel, the exclusion applied afterwards as a per-state scalar and a
+ground-state-weighted screen on the energy — was forced by solving the charges once,
+outside the Hamiltonian. It left an energy that was not the one the charges minimize,
+which needed an adjoint solve for the forces, removed the intramolecular half of the
+polarization response (0.07 eV of the water dimer's hydrogen bond), removed the whole
+periodic $K_{ij}$ of an excluded pair including its image part, and left the
+intermolecular charge transfer of the global softness unopposed at an H₂ + O₂ contact
+(the wall test in `tests/test_collapse.py`).
 
-What is done instead is one quantity applied in two places.
+Solving the charges per state (§2.3) removes the constraint that forced it. The
+isolated-molecule reference $F_m^{*,\text{iso}}$ is exactly a molecule's own gas-phase
+electrostatics, so subtracting it keeps them off the bonded terms — the property the
+exclusion exists for — while the kernel inside the solve stays whole. **ACKS2
+therefore ignores `coulombexclusion`**, an isolated water's charges are the ones the
+`atom` parameters were fitted to ($q_{\mathrm H} = +0.30399$), and nothing is removed
+from a periodic $K_{ij}$.
 
-**(a) A scalar on each state's diagonal** (`ACKS2.exclusion_energy`,
-[acks2.py:310](forcefield/acks2.py#L310)):
+`PointCharge` still reads the terms. With fixed charges the Coulomb energy is
+additive, and each state subtracts its excluded pairs' direct
+$\operatorname{erf}(\gamma r)/r$, leaving their periodic images in place. For every
+shipped template all intramolecular pairs are within `exclusion_depth`, and the two
+routes then give the same energy (§2.3, the zero-softness limit).
 
-$$
-C(T_s) \;=\; -\,C_{\text{coul}}\!\!\!\sum_{(i,j)\,\in\,\text{excl}(T_s)}\!\!\! Q_i\,Q_j\,K_{ij} ,
-$$
+**The water dimer.** Without the screen, and without intermolecular charge transfer,
+the well is **0.088 eV at 2.95 Å** at the shipped `eta` (grid 0.05 Å), against CCSD(T)'s
+0.218 eV. The old unscreened 0.168 eV owed part of its depth to the charge the global
+softness moved between the molecules, and part to scoring
+$\tfrac{C}{2}\mathbf Q^{\mathsf T}K\mathbf Q$ without the self-energy cost of polarizing. `eta`
+remains the lever — measured on the rigid dimer at inference, the scale multiplying the
+shipped value:
 
-at the charges `prepare` has already solved — one lookup per excluded pair into a
-kernel matrix already built and memoized. That is the whole cost, and it is what
-lets the exclusion decide which bonding pattern is lower, which is the point of
-putting anything on a diagonal.
+| `eta` scale | well | $R_{\text{OO}}$ | monomer $q_{\mathrm H}$ | dipole |
+| --- | --- | --- | --- | --- |
+| 1.00 | 0.0884 eV | 2.95 Å | +0.3040 | 1.71 D |
+| 0.90 | 0.1146 eV | 2.95 Å | +0.3408 | 1.92 D |
+| 0.85 | 0.1324 eV | 2.90 Å | +0.3627 | 2.04 D |
+| 0.80 | 0.1546 eV | 2.90 Å | +0.3877 | 2.18 D |
+| 0.75 | 0.1829 eV | 2.85 Å | +0.4164 | 2.34 D |
 
-**(b) One screen on the whole-system energy**, after the diagonalization
-(`ACKS2.screen_matrix`, [acks2.py:330](forcefield/acks2.py#L330)):
+**That retune is outstanding**, and until it is done `tests/test_water_structure.py`'s
+two dimer assertions fail by construction. Applying it needs a coupling refit
+(`fast-forces refit`) and a $\sigma_{\mathrm O}$ pressure recheck; the templates'
+bonded fits are untouched, since a lone template's electrostatics are zero either way.
 
-$$
-S \;=\; 1 \;-\; \sum_{s} w_s\,M_s ,
-$$
-
-$M_s$ the symmetric 0/1 mask of state $s$'s excluded pairs and $w_s = c_s^2$ its
-ground-state weight. A pair bonded in every state of its block is removed outright;
-one bonded in only some of them is removed in proportion.
-
-**Fractional entries are the normal case, and they are not an interpolation.**
-$\sum_s w_s\,\partial C(T_s)/\partial\mathbf{x}$ is linear in the masks and
-`kernel.contract` is linear in $W$, so the entire Hellmann–Feynman sum collapses into
-a single weight matrix. **One contraction and one adjoint solve serve the whole
-system**, which is the same cost the unexcluded term always had. Measured on a
-64-water box: 65.9 ms per force call with the Coulomb exclusion on against 67.5 ms
-with it off — within noise — while the exclusion itself is worth 240 eV on that box.
-$S$ is held fixed under the derivative, which is correct and not an omission: the
-weights are eigenvector components, and a Hellmann–Feynman gradient does not
-differentiate those.
-
-**Blocks are atom-disjoint**, which is what makes the subtraction safe.
-`ReactionNetwork.reaction_blocks` yields one entry per reaction group plus one
-$(\varnothing, \{\text{molecule}\})$ entry per untouched molecule, so every atom is
-in exactly one block and a block's weights sum to 1. A pair bonded in every state
-therefore comes out at exactly 0, and the arithmetic never runs past it into
-negative territory.
-
-**The ordering.** `ACKS2.prepare` solves the unmasked system *before* the blocks are
-diagonalized; `ACKS2.compute` evaluates the screened functional *after*. In between,
-`System.calculate` adds $C(T_s)$ to each diagonal, diagonalizes, and then
-**subtracts $\sum_s w_s C(T_s)$ back out of the bonded accumulation**
-([system.py:186](system.py#L186)): $\varepsilon_0$ carries the correction and so does
-the screened electrostatic term, and it must be counted once. The forces need no
-such subtraction — `fham` never had the corrections in it, by design, because their
-gradient is precisely what the single screened `compute` call supplies.
-
-**The one asymmetry in the response, and it is the subtlest thing in the module.**
-Inside `compute_response_forces` the screen goes on $\partial E/\partial\mathbf{z}$
-and **not** on the $-\boldsymbol\lambda^{\mathsf T}(\partial A/\partial\mathbf{x})\mathbf{z}$
-weight. The energy is the screened one, so its derivative with respect to the charges
-carries the screen; $A$ was built from the *unscreened* kernel, so $\partial A/\partial\mathbf{x}$
-is the unscreened kernel derivative and the weight it is contracted against must not
-be masked. Screening both would be the gradient of a functional whose charges were
-also screened, which is not the functional being evaluated; screening neither drops
-the exclusion from the response entirely. **Both mistakes produce plausible forces
-and an NVE trajectory that drifts**, and nothing else
-([acks2.py:219](forcefield/acks2.py#L219)).
-
-**Verification.**
-
-| | |
-| --- | --- |
-| pivot invariance, seeded from every state of a converged basis | $\Delta E = -7.1\times10^{-15}$ eV, $\Delta F = 5.3\times10^{-15}$ eV/Å |
-| `System` forces vs central differences, block genuinely mixed at weights 0.679 / 0.321 | $8.95\times10^{-8}$ eV/Å against $\|F\|_{\max} = 17.9$ |
-| screened `ACKS2` alone — forces / virial / virial asymmetry | $1.0\times10^{-9}$ / $1.4\times10^{-7}$ / $4.4\times10^{-16}$ |
-| NVE spread at $dt = 0.20 / 0.10 / 0.05$ fs, screen live at weights $\approx 0.50/0.50$ | 39.394 / 10.004 / 2.497 meV — ratios 3.94, 4.00, clean $O(dt^2)$ |
-
-`tests/test_evb_invariants.py::TestPivotInvariance::test_nonbonded_is_independent_of_pivot`
-is the standing guard; `tests/test_gradients.py` carries the fractional-screen force
-case (with a deliberately irrational, non-0/1 symmetric screen), a check that the
-screen does not move the charges at `atol = rtol = 0`, and a check that screening a
-pair removes exactly `exclusion_energy` of it.
-
-**What it costs, and it is real.** The charges are exactly what they were before
-exclusions existed — an isolated water still gives $q_{\mathrm H} = +0.30399$ — so no
-molecular dipole moves. What the exclusion does remove is the *intramolecular half of
-the polarization response*, and that is worth 0.07 eV of the hydrogen bond.
-Decomposed on the dimer at $R_{\text{OO}} = 2.85$ Å with the datasets held fixed, so
-this is the mechanism and not a refit:
-
-| | |
-| --- | --- |
-| dimerization gain, unscreened ACKS2 | −0.2063 eV |
-| of which intramolecular self-energy | **−0.0691 eV** ← removed here |
-| $q_{\mathrm H}$, monomer → dimer | +0.30399 → +0.31264 |
-
-The molecules polarize each other, the charges grow, and the intramolecular Coulomb
-energy falls along with the intermolecular one. Booking that gain inside the molecule
-is exactly what the exclusion exists to stop — the bonded terms own the intramolecular
-energy, and a template whose gas-phase minimum depends on its neighbours is the thing
-this module was written to remove — but the binding goes with it: the dimer well runs
-**0.1677 eV at 2.85 Å → 0.1024 eV at 2.91 Å**. `eta` is the lever to recover it, since
-the intermolecular term scales as $q^2$ and softening the hardness buys depth back
-without reintroducing the coupling. **That retune is outstanding**, and until it is
-done `tests/test_water_structure.py`'s dimer assertions fail by construction.
-
-**`exclude_coulomb`** ([params.py](forcefield/params.py)) turns the
-Coulomb exclusion off and keeps the other two. The result is a dataset the whole
-pipeline still evaluates consistently and **cannot fit**: the solve is hard-constrained
-to zero total charge, so ACKS2 scores H₃O⁺ as a neutral H₃O, and the −4.8 eV of
-spurious binding that produces has nothing left to cancel it once ZBL's intramolecular
-+15.45 eV is excluded.
+**`exclude_coulomb`** ([params.py](forcefield/params.py)) still decides whether
+`coulombexclusion` terms are derived, which only `PointCharge` reads.
 
 ### 2.4 The virial, and the stress the calculator publishes
 
@@ -1247,16 +1241,19 @@ For a block with closed basis $\{T_1,\dots,T_n\}$ (`Block.hamiltonian`,
 [basis.py:176](basis.py#L176)):
 
 $$
-H_{ii} \;=\; E^{\text{QForce}}(T_i) \;+\; C(T_i),
+H_{ii} \;=\; E^{\text{QForce}}(T_i) \;+\; E^{\text{el}}(T_i),
 \qquad
 H_{ij} \;=\; w_{ij}\,V_{ij} \quad (i \ne j).
 $$
 
 $E^{\text{QForce}}(T_i)$ is the bonded energy **including** the `exclusion` and
 `zblexclusion` corrections, which are ordinary additive terms and reach the diagonal
-through the same path a bond does. $C(T_i)$ is the Coulomb exclusion of §2.3.2,
-which cannot go through `QForce` because it needs the charges; `System.calculate`
-adds it here and takes it back off the bonded accumulation afterwards (§4.2).
+through the same path a bond does. $E^{\text{el}}(T_i)$ is the state's electrostatic
+energy of §2.3 — under ACKS2 its own charge equilibration, under `PointCharge` its
+template charges — in the potential of the environment and of the other blocks'
+mean charges. It is $\partial E_{\text{elec}}/\partial w_i$, which is what makes the
+diagonalization minimize the total. `System.calculate` adds it here and takes
+$\sum_i w_i E^{\text{el}}(T_i)$ back off the bonded accumulation afterwards (§4.2).
 
 Every admitted pair carries an off-diagonal — this is a **full** matrix, not a
 star. Where several symmetry-equivalent mappings reach the same product topology
@@ -1303,36 +1300,29 @@ whether the surface is inside a ramp), `depth`, `capped`, `basis_size` and
 
 $$
 \boxed{\;
-E_{\text{total}} \;=\; \sum_{B}\Big[\varepsilon_0^{(B)} - \textstyle\sum_{s} w_s\,C(T_s)\Big]
-\;+\; E_{\text{elec}}^{\text{ACKS2}}\big[S\big]
+E_{\text{total}} \;=\; \sum_{B}\Big[\varepsilon_0^{(B)} - \textstyle\sum_{s} w_s\,E^{\text{el}}(T_s)\Big]
+\;+\; E_{\text{elec}}\big[\{w\}\big]
 \;+\; \sum_{i<j} u^{\text{ZBL}}_{ij}
 \;+\; \sum_{i<j} u^{\text{12-6}}_{ij}
 \;}
 $$
 
-with $\mathbf{F}$ and $\mathbf{W}$ summed the same way, term for term. The last
-three are topology-independent and evaluated once on the whole system
-([system.py:227](system.py#L227)–[system.py:257](system.py#L257)), none of them on a
-diagonal. That is legitimate because a constant shift of every diagonal shifts the
+with $\mathbf{F}$ and $\mathbf{W}$ summed the same way, term for term.
+$E_{\text{elec}}$ is the whole electrostatic term at the ground-state weights — the
+environment, every block's states weighted, the block–block Hartree coupling counted
+once — evaluated after the diagonalization (`nonbonded.evaluate()`). The two repulsion
+sums are topology-independent and evaluated once on the whole system, on no
+diagonal; that is legitimate because a constant shift of every diagonal shifts the
 ground eigenvalue by exactly that constant — the couplings here come from
-`EVBCoupling` and do not depend on the diagonal at all — and it requires each of the
-three sums to actually *be* the same number on every state, which §2.2, §2.2.1 and
-§2.3 each argue for their own term.
+`EVBCoupling` and do not depend on the diagonal at all — and it requires each sum to
+actually *be* the same number on every state, which §2.2 and §2.2.1 argue.
 
-**The two correction terms are one quantity, counted once.** $C(T_s)$ went onto
-state $s$'s diagonal before the diagonalization, so $\varepsilon_0^{(B)}$ carries
-$\sum_s w_s C(T_s)$; the screen $S$ puts the same amount into
-$E_{\text{elec}}^{\text{ACKS2}}$. Subtracting it back out of the block sum
-([system.py:186](system.py#L186)) is what keeps `energy_bonded` the bonded energy and
-stops the exclusion being double counted. The **forces carry no such subtraction**:
-`fham` never held the corrections, because their gradient is exactly what the single
-screened `ACKS2.compute` call supplies. Getting that asymmetry backwards is
-energy-conserving and wrong, or force-consistent and double counted, depending on
-which half is changed.
-
-The ZBL and 12-6 exclusions need no counterpart to any of this: they are ordinary
-additive terms inside $E^{\text{QForce}}(T_i)$, and their whole-system sums were
-never screened.
+**The electrostatics are counted once.** $E^{\text{el}}(T_s)$ went onto state $s$'s
+diagonal before the diagonalization, so $\varepsilon_0^{(B)}$ carries
+$\sum_s w_s E^{\text{el}}(T_s)$, and $E_{\text{elec}}$ carries it again. Subtracting it
+back out of the block sum is what keeps `energy_bonded` the bonded energy. The
+**forces carry no such subtraction**: `fham` never held the electrostatics, because
+their gradient at fixed weights is exactly what the single `evaluate()` supplies.
 
 `System.calculate` returns `energy`, `forces`, `virial`, `topology`, and the
 decomposition `energy_bonded` / `energy_nonbonded` / `energy_zbl` / `energy_lj`
@@ -1406,10 +1396,10 @@ by `brentq` over `SCALE_BRACKET` $= (0.05, 20.0)$. Note $E_{\text{FF}}$ here is
 `taper_radius`, `taper_width`, `switch_radius` or `soft_core` forces a refit.
 
 **The exclusions are inside that target too, and adding them was a refit of both
-datasets.** The fit path reaches ACKS2 through `ACKS2.__call__`, which screens by
-`screen_from_terms` — the single-topology case of §2.3.2's screen — so a template is
-scored with its own intramolecular electrostatics removed, and the ZBL and 12-6
-exclusions arrive as ordinary terms in the same term list. That is the point: it is
+datasets.** The fit path reaches ACKS2 through `ACKS2.__call__`, which scores a lone
+template's electrostatics against its own isolated reference — exactly zero, as the
+Coulomb screen made it before fragment ACKS2 — and the ZBL and 12-6 exclusions
+arrive as ordinary terms in the same term list. That is the point: it is
 what makes a small template's fitted minimum its own rather than a cancellation
 against three whole-system sums. `exclude_coulomb` and `exclusion_depth` therefore
 join the list above.
@@ -1514,29 +1504,22 @@ $$
 the sign factor being inert while $H_{ii}$ and $H_{jj}$ share a sign and wrong
 when they do not.
 
-**All three nonbonded terms go outside the Hamiltonian**, added once to the ground
+**The two repulsion sums go outside the Hamiltonian**, added once to the ground
 state, because this coupling is a nonlinear function of the *absolute* diagonal
-and a common shift does not pass through it. `ACKS2`, `ZBL` and the switched 12-6
-are the same number on every state, so leaving them off the diagonal is exact.
-`EVBSystem` finds the term dictionary for the two term-driven ones on the first
-state that carries a non-empty one. Its results are `energy`, `forces`, the same
+and a common shift does not pass through it. `ZBL` and the switched 12-6 are the
+same number on every state, so leaving them off the diagonal is exact.
+`EVBSystem` finds the term dictionary for the 12-6 on the first state that carries
+a non-empty one. Its results are `energy`, `forces`, the same
 `energy_bonded` / `energy_nonbonded` / `energy_zbl` / `energy_lj` decomposition,
 and `statevec` — which holds the *squared* amplitudes.
 
-**The exclusions are where the two schemes now differ, and `EVBSystem` is the weaker
-one.** Its ZBL and 12-6 exclusions are fine — they ride the per-state `term_dict`
-through `bonded_ff` onto the diagonal, exactly as in `System`. The Coulomb screen
-does not: `EVBSystem` calls `self.nonbonded_ff(pos, pbc, cell, state.term_dict)` on
-the **first state carrying terms** ([evb.py:139](evb.py#L139)), so the screen is that
-representative state's exclusions rather than the ground-state-weighted
-$1 - \sum_s w_s M_s$ of §2.3.2. The comment there — "every state carries the same
-`atom` terms, so state 0's term_dict is representative" — is true of the `atom`
-terms and **false of the `coulombexclusion` terms**, which differ between states by
-construction. The consequence is that `EVBSystem`'s total energy depends on the
-order of its authored state list, which is the same class of defect
-`test_nonbonded_is_independent_of_pivot` now rules out for `System`. The fix is to
-build the screen from `statevecsq`; it has not been made, because `EVBSystem` holds
-a fixed state list and is the simple alternative rather than the production path.
+**The electrostatics go on the diagonal**, under either term: each state carries
+its own charges (§2.3), so `EVBSystem` calls `nonbonded(pos, pbc, cell,
+state.term_dict)` per state — the single-topology solve over the whole system —
+and adds it to $H_{ii}$ before the coupling is formed. It is state-dependent in
+exactly the sense the coupling needs, and the old defect of this section — a
+Coulomb screen taken from whichever state came first in the list — is gone with the
+screen.
 
 That placement used to be forced the *other* way for the Lennard-Jones: its
 whole-system sum had to sit **on** the diagonal because the `exclusion` terms
@@ -1545,11 +1528,11 @@ sides left a water diagonal at $-1833$ eV against a bonded energy of $-9.87$,
 with a coupling of $\sqrt{1.95\cdot 1833 \cdot 1829} = 2560$ eV following from
 it. `ZBL` has no second half to be split from, so the question does not arise.
 
-`System` also adds all three outside its Hamiltonian, for a different reason: its
-couplings come from `EVBCoupling` and do not depend on the diagonal at all, so for
-$H = D + V$ with $V$ fixed the placement there is free rather than forced. Here it
-is forced, which is the one structural difference between the two schemes' energy
-assembly.
+`System` also adds both repulsion sums outside its Hamiltonian, for a different
+reason: its couplings come from `EVBCoupling` and do not depend on the diagonal at
+all, so for $H = D + V$ with $V$ fixed the placement there is free rather than
+forced. Here it is forced, which is the one structural difference between the two
+schemes' energy assembly.
 
 ---
 
@@ -1558,13 +1541,14 @@ assembly.
 | Concept | Location |
 | --- | --- |
 | Calculator entry, topology feedback, stress | [ase.py:13](ase.py#L13) |
-| Assembly, pivot, charge solve, screen, nonbonded addition | [system.py:103](system.py#L103) |
+| Assembly, pivot, electrostatics sweep, nonbonded addition | [system.py](system.py) |
 | Basis closure, switching, block Hamiltonian | [basis.py](basis.py) |
 | Global parameters, defaults, manifest activation | [forcefield/params.py](forcefield/params.py) |
 | Bonded terms, `_virial` | [forcefield/qforce.py](forcefield/qforce.py) |
 | Screened-nuclear repulsion (tapered) | [forcefield/zbl.py](forcefield/zbl.py) |
 | Switched 12-6, linear core, wall and dispersion | [forcefield/lj.py](forcefield/lj.py) |
-| Charge equilibration, exclusion screen, `prepare`/`compute` | [forcefield/acks2.py](forcefield/acks2.py) |
+| Fragment ACKS2: per-state solves, Schur blocks, `prepare`/`bind`/`evaluate` | [forcefield/acks2.py](forcefield/acks2.py) |
+| Fixed point charges; the admission gate's electrostatic gap | [forcefield/pointcharge.py](forcefield/pointcharge.py), [forcefield/electrostatics.py](forcefield/electrostatics.py) |
 | Charge kernel, minimum-image and Ewald, `contract` | [forcefield/ewald.py](forcefield/ewald.py) |
 | Intramolecular exclusion derivation, and why Coulomb differs | [forcefield/exclusions.py](forcefield/exclusions.py) |
 | RMSD coupling | [forcefield/coupling.py](forcefield/coupling.py) |
@@ -1574,6 +1558,7 @@ assembly.
 | Gradient verification | `tests/test_gradients.py` |
 | Virial / stress verification, symmetry, sign | `tests/test_stress.py` |
 | Basis invariance, seed independence | `tests/test_evb_invariants.py` |
+| Schur vs full solve, formal charges, point-charge limit, the gate | `tests/test_acks2_fragment.py` |
 | NVE drift, $O(dt^2)$ check | `tests/test_energy_conservation.py` |
 | Intermolecular collapse, the 1.6–2.0 Å gap | `tests/test_collapse.py` |
 | Two halves of the LJ and ZBL decompositions agree | `tests/test_reference_energies.py`, `tests/test_gradients.py` |

@@ -51,7 +51,14 @@ from test_gradients import (
     POS_H2O2,
     POS_CONTACT,
     POS_PC,
+    POS_ZUNDEL,
+    ZUNDEL_A,
+    ZUNDEL_B,
     _pointcharge_term_dict,
+    acks2_at_weights,
+    fake_block,
+    zundel_state,
+    zundel_system,
 )
 from geometry import REACTION, REACTION_PATH_RAMP, reaction_path
 
@@ -291,106 +298,40 @@ class TestLennardJonesStress:
 
 
 class TestACKS2Stress:
-    """The charge response is the part that can go wrong here.
+    """The virial of fragment ACKS2, differenced against the cell.
 
-    `compute_coulomb` alone is not the gradient of its own energy -- the charges
-    solve a geometry-dependent linear system, so straining the cell moves them.
-    `test_call` is the test that covers it: it re-solves the charges at every
-    displaced geometry, exactly as a trajectory does.  `test_coulomb_frozen`
-    checks only the explicit half and by construction cannot see a missing
-    response term, which is the same trap `test_gradients.py` documents for the
-    forces.
+    The same cases `test_gradients.TestACKS2Gradients` differences against the
+    atoms.  The cell reaches the energy through the Ewald sum's reciprocal
+    vectors and volume as well as through every pair, and the isolated-molecule
+    references are open-boundary by construction, so a strain moves the two
+    halves of the energy differently -- which is exactly what this covers.
     """
 
-    acks2 = ACKS2()
-
-    _TERM_DICT = {
-        "atom": {
-            "atoms": np.array([[0], [1], [2], [3]]),
-            "kwargs": {
-                "mu": np.array([8.12, 8.12, 1.88, 1.88]),
-                "eta": np.array([3.74, 3.74, 7.28, 7.28]),
-                "soft_amp": np.array([3.88, 3.88, 2.10, 2.10]),
-                "soft_decay": np.array([0.44, 0.44, 0.27, 0.27]),
-            },
-        }
-    }
-
-    def _vecs(self, pos, cell):
-        vecs = pos[:, None, :] - pos[None, :, :]
-        f = vecs @ np.linalg.inv(cell)
-        vecs = vecs - (PBC * np.floor(f + 0.5)) @ cell
-        return vecs, np.sqrt(np.sum(vecs * vecs, -1))
-
-    def test_coulomb_frozen(self):
-        """The explicit half of the strain derivative, at fixed charges."""
-        vecs_ref, rij_ref = self._vecs(POS_H2O2, CELL)
-        Q = self.acks2.compute_charges(rij_ref, self._TERM_DICT["atom"]["kwargs"])
+    @pytest.mark.parametrize("state", [ZUNDEL_A, ZUNDEL_B], ids=["a", "b"])
+    def test_call(self, state):
+        td = zundel_system(state)
 
         def energy_fn(p, c):
-            v, r = self._vecs(p, c)
-            return self.acks2.compute_coulomb(Q, r, v)[0]
+            return ACKS2()(p, PBC, c, td)[0]
 
-        _, _, w = self.acks2.compute_coulomb(Q, rij_ref, vecs_ref)
-        w_fd = finite_difference_virial(energy_fn, POS_H2O2, CELL)
-        assert_symmetric(w)
-        np.testing.assert_allclose(w, w_fd, atol=1e-6, rtol=1e-5)
-
-    @pytest.mark.parametrize("positions", [POS_H2O2, POS_4], ids=["h2o2", "n4"])
-    def test_call(self, positions):
-        """The whole term, with the charges free to re-solve under the strain."""
-
-        def energy_fn(p, c):
-            return ACKS2()(p, PBC, c, self._TERM_DICT)[0]
-
-        _, _, w = ACKS2()(positions, PBC, CELL, self._TERM_DICT)
-        w_fd = finite_difference_virial(energy_fn, positions, CELL)
+        _, _, w = ACKS2()(POS_ZUNDEL, PBC, CELL, td)
+        w_fd = finite_difference_virial(energy_fn, POS_ZUNDEL, CELL)
         assert_symmetric(w)
         np.testing.assert_allclose(w, w_fd, atol=1e-6, rtol=1e-4)
 
-    @pytest.mark.parametrize("positions", [POS_H2O2, POS_4], ids=["h2o2", "n4"])
-    def test_screened_call(self, positions):
-        """The same, under the fractional exclusion screen.
-
-        The screen breaks charge neutrality of the weight the kernel is
-        contracted against -- the excluded pairs of a molecule carry
-        `sum q_i q_j != 0` -- and that is what first exposed the missing `k = 0`
-        background in `forcefield/ewald.py`.  It surfaced here rather than in
-        the forces because the background reaches the strain through the cell
-        volume and does not depend on position at all, so this is the test that
-        would catch it coming back.
-        """
-        n = len(positions)
-        screen = np.ones((n, n))
-        for k, (i, j) in enumerate((i, j) for i in range(n) for j in range(i + 1, n)):
-            screen[i, j] = screen[j, i] = 1.0 - 0.2 - 0.13 * (k % 5)
+    def test_block(self):
+        """A two-state block at a fractional ground state, in an environment."""
+        block = fake_block([zundel_state(ZUNDEL_A), zundel_state(ZUNDEL_B)])
+        seed = zundel_system(ZUNDEL_A)
+        weights = {0: np.array([0.37, 0.63])}
 
         def energy_fn(p, c):
-            acks2 = ACKS2()
-            acks2.prepare(p, PBC, c, self._TERM_DICT)
-            return acks2.compute(screen)[0]
+            return acks2_at_weights(p, PBC, c, seed, [block], weights)[1][0]
 
-        acks2 = ACKS2()
-        acks2.prepare(positions, PBC, CELL, self._TERM_DICT)
-        _, _, w = acks2.compute(screen)
-        w_fd = finite_difference_virial(energy_fn, positions, CELL)
+        _, (_, _, w) = acks2_at_weights(POS_ZUNDEL, PBC, CELL, seed, [block], weights)
+        w_fd = finite_difference_virial(energy_fn, POS_ZUNDEL, CELL)
         assert_symmetric(w)
         np.testing.assert_allclose(w, w_fd, atol=1e-6, rtol=1e-4)
-
-    def test_response_is_not_negligible(self):
-        """Guard the guard: the frozen-charge virial must be visibly wrong.
-
-        If the response contribution happened to be tiny for this geometry then
-        `test_call` would pass with the response term deleted, and would be
-        testing nothing.  It is not tiny -- this asserts that.
-        """
-        vecs, rij = self._vecs(POS_H2O2, CELL)
-        Q, u, A = self.acks2.solve_charges(rij, self._TERM_DICT["atom"]["kwargs"])
-        _, _, w_explicit = self.acks2.compute_coulomb(Q, rij, vecs)
-        _, w_response = self.acks2.compute_response_forces(
-            Q, u, A, rij, vecs, self._TERM_DICT["atom"]["kwargs"]
-        )
-        assert np.abs(w_response).max() > 0.01 * np.abs(w_explicit).max()
 
 
 # ---------------------------------------------------------------------------

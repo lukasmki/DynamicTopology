@@ -165,14 +165,14 @@ class TestTemplateEnergies:
         in a refactor, say -- every assertion above would start passing for a
         reason that has nothing to do with the fit being right.
 
-        **The reported `energy_nonbonded` is now zero on every one of them, and
-        that is correct.**  It is the Coulomb energy under the intramolecular
-        exclusion screen (`forcefield/exclusions.py`), and a template of at most
-        four atoms has every pair within `exclusion_depth = 3` bonds, so the
-        screen removes all of it.  The energy the test above can still get wrong
-        is the *unscreened* sum -- -1.18 eV on HO, -2.50 on H2O -- which is what
-        would land on top of the bonded term if the screen failed.  So that is
-        what has to be nonzero, and the screen is what has to take it to zero.
+        **The reported `energy_nonbonded` is zero on every one of them, and that
+        is correct.**  ACKS2 reports each state's minimum relative to its
+        molecules' isolated minima (`forcefield/acks2.py`), so a lone template's
+        electrostatics are its own reference and cancel exactly.  The energy the
+        test above can still get wrong is that reference -- the gas-phase ACKS2
+        minimum, several eV on HO and H2O -- which is what would land on top of
+        the bonded term if the subtraction failed.  So that is what has to be
+        nonzero, and the subtraction is what has to take it to zero.
         """
         for stem in _entries("molecules"):
             if stem.name not in HETERONUCLEAR:
@@ -180,17 +180,18 @@ class TestTemplateEnergies:
             frame = io.read(stem.with_suffix(".xyz"))
             atoms = isolate(frame, False)
             _, diagnostics = evaluate(atoms, reaction_set)
-            unscreened, _, _ = atoms.calc.system.nonbonded_ff.compute()
-            assert abs(unscreened) > 0.1, (
+            acks2 = atoms.calc.system.nonbonded_ff
+            reference = acks2.CCOUL * acks2.iso_env[0]
+            assert abs(reference) > 0.1, (
                 f"{stem.name} ({frame.get_chemical_formula()}) carries a "
-                "negligible Coulomb energy, so it can no longer detect the "
+                "negligible gas-phase ACKS2 energy, so it can no longer detect the "
                 "bonded and nonbonded terms disagreeing about the energy zero"
             )
             assert diagnostics["energy_nonbonded"] == pytest.approx(0.0, abs=1e-10), (
                 f"{stem.name} ({frame.get_chemical_formula()}) reports "
-                f"{diagnostics['energy_nonbonded']:+.4f} eV of screened Coulomb "
-                f"against {unscreened:+.4f} unscreened; every pair in it is "
-                "excluded, so the screen is not removing what it should"
+                f"{diagnostics['energy_nonbonded']:+.4f} eV of electrostatics "
+                f"against an isolated reference of {reference:+.4f}; the "
+                "reference is not removing what it should"
             )
 
     def test_the_repulsion_is_not_zero_on_any_template(self, reaction_set):

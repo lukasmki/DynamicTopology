@@ -206,15 +206,14 @@ class TestPivotInvariance:
             ), f"seeding from state {i} changed the switching weight itself"
 
     def test_nonbonded_is_independent_of_pivot(self, reaction_set):
-        """ACKS2 is evaluated once, outside the EVB, from the current topology.
+        """The electrostatics do not depend on which state seeded the block.
 
-        That is only pivot-independent because its `atom` parameters happen to
-        depend on the element alone in this dataset -- every O carries the same
-        mu/eta/soft_*, every H likewise -- so the same nuclei at the same
-        positions give the same charges whichever template they were looked up
-        through.  It is a property of the data, not of the method, and it stops
-        holding the moment a template carries topology-specific charges.  Pinned
-        separately so that if it breaks it is not mistaken for a basis defect.
+        Each state's charges are solved inside the Hamiltonian, and the reported
+        term is evaluated at the ground-state weights, so the seed can reach it
+        only through the environment -- the atoms outside every multi-state
+        block, taken in the seed topology, which is the same for every seed of a
+        converged basis.  Pinned separately so that if it breaks it is not
+        mistaken for a basis defect.
         """
         atoms = reactive()
         reference = calculate(atoms, reaction_set)["energy_nonbonded"]
@@ -223,8 +222,8 @@ class TestPivotInvariance:
             nonbonded = calculate(atoms, reaction_set, seed)["energy_nonbonded"]
             assert nonbonded == pytest.approx(reference, abs=ENERGY_TOL), (
                 f"seeding from state {i} changed the nonbonded energy by "
-                f"{nonbonded - reference:+.4f} eV; ACKS2 atom parameters are no "
-                "longer element-only and must move into the EVB diagonal"
+                f"{nonbonded - reference:+.4f} eV; a per-state charge solve has "
+                "leaked out of the EVB diagonal"
             )
 
 

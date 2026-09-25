@@ -13,7 +13,7 @@ from DynamicTopology.core.reactionset import ReactionSet
 from DynamicTopology.core.topology import Topology
 from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.qforce import QForce
-from DynamicTopology.forcefield.electrostatics import Electrostatics
+from DynamicTopology.forcefield.electrostatics import Electrostatics, ElectrostaticGap
 from DynamicTopology.forcefield.lj import LennardJones
 from DynamicTopology.forcefield.zbl import ZBL
 
@@ -65,6 +65,8 @@ class System:
         self.zbl_ff = ZBL()
         self.lj_ff = LennardJones()
         self.coupling = EVBCoupling()
+        # The electrostatic half of the admission gate's gap; see `basis.py`.
+        self.gap = ElectrostaticGap(reaction_set)
         # `evb` passes `EVBBasis`'s own knobs -- `eps`, `switch_width`,
         # `max_states`, `max_depth` -- straight through, defaults untouched when
         # it is None.  They were reachable only by mutating the basis after
@@ -72,7 +74,7 @@ class System:
         # `config.json` could not record them.  They change the potential energy
         # surface, so anything that varies them has to say so.
         self.basis = EVBBasis(
-            reaction_set, self.bonded_ff, self.coupling, **(evb or {})
+            reaction_set, self.bonded_ff, self.coupling, gap=self.gap, **(evb or {})
         )
 
     @property
@@ -112,6 +114,14 @@ class System:
         pbc = self.atoms.pbc
         cell = self.atoms.cell
 
+        # The electrostatic kernel first: the admission gate screens on the
+        # electrostatic gap as well as the bonded one, so the closure needs it.
+        nonbonded = self.nonbonded_ff
+        terms = self.reaction_set.get_terms(self.topology)
+        self.topology.set_terms(terms)
+        nonbonded.prepare(pos, pbc, cell, self.topology.term_dict)
+        self.gap.bind(nonbonded, self.topology.term_dict)
+
         # Close the diabatic basis around the current geometry.  The result does
         # not depend on which topology is passed as the seed; see basis.py.
         evb_blocks: list[Block] = self.basis.build(
@@ -119,33 +129,25 @@ class System:
         )
         log_debug(logger, f"Closed {len(evb_blocks)} EVB blocks")
 
-        # The electrostatics, before anything is diagonalized.  Both terms
-        # contribute a per-state scalar to every block's diagonal, and need the
-        # geometry and the blocks' states to do it:
+        # The charges of every diabatic state, before anything is diagonalized.
+        # Both electrostatic terms give each state a scalar on its block's
+        # diagonal -- its whole electrostatic energy -- and both are coupled to
+        # the other blocks through their weight-averaged charges:
         #
-        #   - `ACKS2.prepare` solves the *unscreened* equilibration, which
-        #     depends on the coordinates and the elements alone, so it is the
-        #     same problem for every diabatic state and is solved once here.
-        #     The per-state scalar is what each state's exclusions are worth at
-        #     those charges -- one lookup per excluded pair.  See
-        #     `forcefield/exclusions.py`.
-        #   - `PointCharge` carries each state's own template charges, so the
-        #     scalar is that state's whole Coulomb energy, and it depends on the
-        #     charges every *other* block currently holds.  See
+        #   - `ACKS2` solves each state's own equilibration: its reference
+        #     charges, its molecules, its exclusions.  The atoms outside every
+        #     multi-state block are factored once and folded into each state's
+        #     small solve, so the environment's polarization answers each state
+        #     exactly.  See `forcefield/acks2.py`.
+        #   - `PointCharge` carries each state's template charges.  See
         #     `forcefield/pointcharge.py`.
-        nonbonded = self.nonbonded_ff
-        terms = self.reaction_set.get_terms(self.topology)
-        self.topology.set_terms(terms)
-        nonbonded.prepare(pos, pbc, cell, self.topology.term_dict)
         nonbonded.bind(evb_blocks)
 
         # Diagonalize every multi-state block, and repeat until no block's
-        # ground state moves.  For `ACKS2` the corrections are fixed, so one
-        # sweep is final.  For `PointCharge` each block sees the others through
-        # their weight-averaged charges; with one multi-state block its
-        # environment is a set of single-state blocks nothing can move, so one
-        # sweep is final there too, and the loop only iterates when two
-        # multi-state blocks see each other.
+        # ground state moves.  Each block sees the others through their
+        # weight-averaged charges; with one multi-state block its environment is
+        # a set of single-state blocks nothing can move, so one sweep is final,
+        # and the loop only iterates when two multi-state blocks see each other.
         multi = [i for i, block in enumerate(evb_blocks) if block.nstates > 1]
         hamiltonians = {i: evb_blocks[i].hamiltonian() for i in multi}
         solutions: dict[int, tuple] = {}
@@ -252,16 +254,11 @@ class System:
 
         energy_bonded = energy
 
-        # Electrostatics at the ground-state weights just found.  For `ACKS2`
-        # that is the unscreened charges under the screen `1 - sum_s w_s M_s`;
-        # for `PointCharge` it is each block's weight-averaged charges.  Either
-        # way it is `sum_s w_s d(correction_s)/dr` written as one weight matrix,
-        # so the whole term is one kernel contraction.
-        #
-        # The ACKS2 charges themselves are never screened.  Screening them is
-        # what makes them topology-dependent, and a topology-dependent charge
-        # solve outside the EVB Hamiltonian is exactly the pivot dependence
-        # `tests/test_evb_invariants.py` measures.
+        # Electrostatics at the ground-state weights just found: the whole
+        # term, blocks and environment, with `sum_s w_s d(correction_s)/dr`
+        # written as one weight matrix so it is one kernel contraction.  The
+        # per-state charges are solved inside the Hamiltonian, which is what
+        # keeps the result independent of the pivot.
         en_nb, fr_nb, w_nb = nonbonded.evaluate()
         energy += en_nb
         forces += fr_nb

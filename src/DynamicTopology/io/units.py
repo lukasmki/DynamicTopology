@@ -50,6 +50,8 @@ UNIT_POWERS: dict[str, dict[str, tuple[int, int]]] = {
         "eta": (0, 0),
         "soft_amp": (0, 0),
         "soft_decay": (0, 0),
+        # The reference charge fragment ACKS2 equilibrates from; optional.
+        "q0": (0, 0),
     },
     "charge": {"q": (0, 0)},
     # `A`/`B` are q-force's `4 eps sigma**12` and `4 eps sigma**6`, which only

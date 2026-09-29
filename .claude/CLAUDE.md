@@ -48,7 +48,7 @@ Note: `pyproject.toml` declares a `dt` console script pointing at `DynamicTopolo
 
 A separate, older copy of this project lives at `../DynamicTopology` (flat `_molecules.py` /
 `_reactionset.py` layout). It is **not** this repo — verify the working directory is
-`.../DynamicTopo` before editing.
+`.../DynamicTopology` before editing.
 
 ## Architecture
 

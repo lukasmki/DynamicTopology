@@ -39,6 +39,7 @@ or barostat can drive it.
    installation
    usage
    concepts
+   reference
    datasets
    scripts
 

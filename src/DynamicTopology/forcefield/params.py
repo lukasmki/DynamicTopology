@@ -10,8 +10,7 @@ and everything downstream reads them back through `active()` at call time --
 never bound into a default argument, since fast-forces' `refine` imports
 before any manifest is loaded and a bound default would pin the wrong one.
 
-Units, defaults and the measurement behind each value are tabulated in
-`forcefield/README.md`'s "Global parameters at a glance".  Every field is in
+Every field is in
 ASE units -- Angstrom and eV -- like everything else, `.jsonl` files included.
 """
 
@@ -30,10 +29,7 @@ ELECTROSTATICS: frozenset[str] = frozenset({"acks2", "pointcharge"})
 class ForceFieldParams:
     """The constants a dataset is fitted at.  Frozen: see `replace` to derive one.
 
-    Each field's comment gives its unit and what it's for; the measurement
-    behind its default is in `forcefield/README.md`'s "Global parameters at a
-    glance" instead of here, so it can be read in one place rather than beside
-    each field it applies to.
+    Each field's comment gives its unit and what it's for.
     """
 
     # --- the bonded form ---------------------------------------------------
@@ -66,8 +62,8 @@ class ForceFieldParams:
     # Where the 12-6 switches *on*, in Angstrom.  Deliberately **not** `taper_radius`
     # -- a Fermi switch and `r**-12` disagree by orders of magnitude at a bond
     # length, so the two forms are not complementary and leave a gap between
-    # them that `ACKS2` alone carries.  See `forcefield/lj.py` and
-    # `forcefield/README.md` for the measurement.
+    # them that `ACKS2` alone carries.  See `forcefield/lj.py` for the
+    # measurement.
     switch_radius: float = 2.2
 
     # How sharply the 12-6 switches on, in Angstrom.  `None` takes
@@ -81,7 +77,7 @@ class ForceFieldParams:
     # `s = c + (r/sigma)**6`.  Dimensionless.  `c = 0` is the bare 12-6; any
     # `c > 0` makes it finite at contact, `4 eps (1/c**2 - 1/c)`.  See
     # `lj.pair_potential` for what the bound is for; the well depth is `eps`
-    # whatever `c` is (see `forcefield/README.md`).
+    # whatever `c` is.
     soft_core: float = 0.01
 
     # --- the intramolecular exclusions (`exclusions`) ----------------------
@@ -120,8 +116,8 @@ class ForceFieldParams:
     # Target relative error of the truncated lattice sum.  Dimensionless.  Sets
     # `kappa` and the reciprocal cutoff together, so both halves converge to
     # the same level.  Do not loosen this casually: the cost is a cube root in
-    # reciprocal vector count, but the *stress* error pays for it linearly --
-    # see `forcefield/README.md`.  Periodic only, so it invalidates no
+    # reciprocal vector count, but the *stress* error pays for it linearly.
+    # Periodic only, so it invalidates no
     # template (every dataset template carries `pbc="F F F"`).
     accuracy: float = 1e-8
 

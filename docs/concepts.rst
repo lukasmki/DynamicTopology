@@ -2,7 +2,7 @@ Concepts
 ========
 
 This page summarizes how a force call is assembled. The equations each term
-evaluates are documented in ``src/DynamicTopology/forcefield/README.md``.
+evaluates are in :doc:`reference`.
 
 One force call
 --------------

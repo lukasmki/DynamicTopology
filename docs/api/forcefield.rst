@@ -2,8 +2,8 @@ Force field
 ===========
 
 Every force field takes positions in Å and parameters in eV and Å, and returns
-``(energy, forces, virial)``. The equations are tabulated in
-``src/DynamicTopology/forcefield/README.md``.
+``(energy, forces, virial)``. The equations are in
+:doc:`/reference`.
 
 Evaluating one topology
 -----------------------

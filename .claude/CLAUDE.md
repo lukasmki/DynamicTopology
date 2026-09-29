@@ -169,8 +169,7 @@ on a single water molecule. `params.ForceFieldParams.switch_radius` has the meas
 activates it process-wide; every force field reads it through `params.active()` at call time, never
 bound into a default argument, since the fitter imports long before any manifest is read. Two
 datasets whose blocks disagree cannot share a process: `params.activate` refuses the second and
-names the fields that differ. `params.use(...)` is the explicit override. `forcefield/README.md`
-tabulates the full set with units and defaults.
+names the fields that differ. `params.use(...)` is the explicit override.
 
 **Changing a pinned value still invalidates that dataset's `.jsonl` files** —
 fast-forces' `refine` solves against `E_QForce + E_nonbonded` and all three nonbonded terms are
@@ -262,7 +261,7 @@ carries a `smiles` — a molecule SMILES, or a `reactants>>products` reaction SM
 sides match the first and last frames of the `.xyz`. It is documentation only: identity is the
 WL hash of the bond graph, and `from_manifest` never reads the field. The manifest also
 carries `global_params`, the force field constants the dataset was fitted at — see the Architecture
-note above and `forcefield/README.md`.
+note above and `forcefield/params.py`.
 
 ### Tests
 

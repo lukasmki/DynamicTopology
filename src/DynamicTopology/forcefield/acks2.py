@@ -6,7 +6,7 @@ and the Kohn-Sham potentials `u` of every atom in the system,
     F_s(q, u) = mu.q + 1/2 q^T (K + 2 diag(eta)) q
               - u^T (q - q0_s) - 1/2 u^T L_{X_s} u
 
-in the units the bare kernel implies (`E = CCOUL * F`; see `forcefield/README.md`).
+in the units the bare kernel implies (`E = CCOUL * F`).
 Two things make it a function of the bonding, and they are what the
 single-solve ACKS2 this replaced could not express:
 

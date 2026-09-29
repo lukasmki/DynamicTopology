@@ -185,7 +185,7 @@ wall at all above 1.5 Å and no dispersion anywhere, and a 64-water box came out
 as a result; the 12-6 is what supplies both. What makes it usable in a *reactive* model — it was
 retired four times over — is `lj.switch`, a Fermi function that takes it from 500–1400 eV at a bond
 length to 0.03–0.35 eV, small enough that it needs no exclusions and so is identical on every
-diabatic state. See `forcefield/lj.py` and `DYNAMICTOPOLOGY.md` §2.2.1.
+diabatic state. See `forcefield/lj.py`.
 
 Both datasets were refit against it, and **the channel count did not move: 13 of 19, before and
 after, losing exactly the same six.** Most surviving margins improved — `rxn_12`'s pre-fit margin

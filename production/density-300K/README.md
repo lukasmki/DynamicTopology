@@ -227,8 +227,8 @@ differ between diabatic states. `lj.switch` removes the root instead of the symp
 function at `SWITCH_RADIUS = 0.22 nm` takes the term to 0.03–0.35 eV at a bond length, three to four
 orders of magnitude down, at which size **nothing has to be excluded at all** — so the term is
 identical on every diabat, adds a common shift to every EVB diagonal, and sits outside the
-Hamiltonian exactly where `ZBL` and `ACKS2` already do. `DYNAMICTOPOLOGY.md` §2.2.1 has the
-argument; `forcefield/lj.py` has the measurements behind the radius, including why the tidy choice of
+Hamiltonian exactly where `ZBL` and `ACKS2` already do. `forcefield/lj.py` has the
+argument and the measurements behind the radius, including why the tidy choice of
 making the two switches complementary puts **+20.6 eV on a single water molecule**.
 
 Both datasets were refit against it.

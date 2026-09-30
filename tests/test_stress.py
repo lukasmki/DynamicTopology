@@ -671,3 +671,23 @@ class TestSystemStress:
             atoms.calc.system.calculate()["virial"] / atoms.get_volume()
         )
         np.testing.assert_allclose(stress, expected, rtol=1e-8, atol=1e-12)
+
+    def test_a_cell_less_system_has_no_stress(self, reaction_set):
+        """No lattice vectors: energy and forces, and `stress` simply absent.
+
+        ASE's `get_volume()` raises on such a cell rather than returning zero,
+        so this is what catches the calculator dividing by it unguarded.
+        """
+        from ase.calculators.calculator import PropertyNotImplementedError
+
+        from DynamicTopology.ase import DynamicTopology
+
+        atoms = reaction_path(REACTION, REACTION_PATH_RAMP, SYSTEM_CELL)
+        atoms.set_cell(np.zeros((3, 3)))
+        atoms.set_pbc(False)
+        atoms.calc = DynamicTopology(atoms, reaction_set)
+
+        assert np.isfinite(atoms.get_potential_energy())
+        assert np.all(np.isfinite(atoms.get_forces()))
+        with pytest.raises(PropertyNotImplementedError):
+            atoms.get_stress()

@@ -42,6 +42,10 @@
         "soft_core": 0.01,
         "exclusion_depth": 3,
         "exclude_coulomb": true,
-        "gamma": 2.0
+        "gamma": 2.0,
+        "electrostatics": "acks2"
+    },
+    "fit_config": {
+        "electrostatics": "neutral"
     }
 }

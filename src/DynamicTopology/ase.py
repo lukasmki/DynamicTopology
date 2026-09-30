@@ -95,8 +95,9 @@ class DynamicTopology(Calculator):
         # volume to divide by and no stress to report -- offering one would be a
         # divide-by-zero at best and a meaningless number at worst -- so the key
         # is simply absent there, which is what ASE expects of an unavailable
-        # property.
-        volume = float(self.system.atoms.get_volume())
+        # property.  `cell.volume`, not `get_volume()`: the latter raises on a
+        # cell with fewer than three lattice vectors instead of returning zero.
+        volume = float(self.system.atoms.cell.volume)
         if volume > 0.0:
             self.results["stress"] = full_3x3_to_voigt_6_stress(
                 results["virial"] / volume

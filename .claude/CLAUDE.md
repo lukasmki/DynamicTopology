@@ -261,7 +261,12 @@ carries a `smiles` — a molecule SMILES, or a `reactants>>products` reaction SM
 sides match the first and last frames of the `.xyz`. It is documentation only: identity is the
 WL hash of the bond graph, and `from_manifest` never reads the field. The manifest also
 carries `global_params`, the force field constants the dataset was fitted at — see the Architecture
-note above and `forcefield/params.py`.
+note above and `forcefield/params.py`. It may carry `fit_config` too, which is fast-forces' and
+which this package never reads. Both blocks have an `electrostatics`, and they are different
+settings: `global_params.electrostatics` (`acks2` / `pointcharge`) is how inference uses the
+charges, `fit_config.electrostatics` (`mulliken` / `esp` / `neutral`) is where fast-forces got them.
+Under `acks2` they are the `atom` term's `q0`, the only thing that keeps an ion's formal charge on
+it: a charged ACKS2 template with no `q0` runs neutral.
 
 ### Tests
 

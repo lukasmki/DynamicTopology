@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --time=48:00:00
-#SBATCH --mem=4G
+#SBATCH --mem=8G
 #SBATCH --output=production/stoichiometry-3000K/output/slurm-%a.out
 #
 # The only scheduler-specific file in this directory.  Everything it needs to

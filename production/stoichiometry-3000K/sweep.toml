@@ -24,7 +24,7 @@ box = 22.44
 rnet = "datasets/HCombustion/HCombustion.json"
 
 [md]
-temperature = 3000.0  # K
+temperature = 4000.0  # K
 # 0.5 fs, measured on this box against this force field.
 #
 # **The timestep is set by the fastest vibrational mode and by nothing else.**
@@ -112,7 +112,7 @@ temperature = 3000.0  # K
 # that is a compute-budget call, not a correctness one, so it is left explicit
 # here rather than made silently.
 timestep = 0.5        # fs
-friction = 0.01       # 1/fs
+friction = 0.005       # 1/fs
 # 100 ps, unchanged in simulated time.  Ignition is a rare event: a barrier
 # crossing needs a collision that reaches the transition-state region, and a
 # 40 fs probe samples none (the basis stays single-state, correctly -- the

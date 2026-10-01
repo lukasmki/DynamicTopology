@@ -181,10 +181,10 @@ class ReactionSetData:
             # parameters a fit actually produces.  A dataset shipping its own
             # exclusions explicitly is left alone.
             terms = with_exclusions(terms, atoms.get_atomic_numbers(), params=params)
-            # A template that already states its shift keeps it.  Templates
-            # whose Morse depths have been fitted to carry the atomization
-            # energy state it as zero, and synthesizing another one here would
-            # count the same energy twice.
+            # A template that already states its shift keeps it -- fast-forces
+            # writes one for every template it fits, and `refine` states zero
+            # for depths rescaled to the atomization energy -- and
+            # synthesizing another one here would count the same energy twice.
             if not any(term["type"] == "reference" for term in terms):
                 reference = _reference_term(atoms, terms)
                 if reference is not None:

@@ -9,7 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-tmp/
-.DS_Store
 # Sphinx build output
 docs/_build/
+
+# MacOS
+.DS_Store

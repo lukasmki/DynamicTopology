@@ -195,14 +195,18 @@ class QForce:
     def compute_reference(self, vecs, atoms, E0):
         """Constant per-molecule reference energy (the EVB alpha shift).
 
-        Geometry-independent, so it contributes no force.  It exists to put
-        different bonding topologies on a common absolute energy scale: without
-        it the diabatic energies are each measured from their own minimum and
-        are not comparable, which makes every EVB eigenvalue meaningless.
+        A molecule's total energy is the sum of its terms plus `E0`: a fixed
+        scalar that shifts its whole potential energy surface, so it contributes
+        no force.  It exists to preserve the relative energies of molecules --
+        reactant and product states have to carry the right offset at the two
+        ends of a reaction coordinate, so every bonding topology has to be on a
+        common absolute energy scale.  Without it the diabatic energies are
+        each measured from their own minimum and are not comparable, which
+        makes every EVB eigenvalue meaningless.
 
-        Set by ReactionSet at load time as the residual between the template's
-        reference atomization energy and the depth its Morse bonds already
-        supply, so it is small and Morse carries the physics.
+        A template states its own; fast-forces writes one for every template it
+        fits.  One that states none gets `ReactionSet._reference_term`'s at
+        load time, from the template's atomization energy.
         """
         # Geometry-independent, so it is strain-independent too: a constant
         # shift moves no atom and stores no stress.

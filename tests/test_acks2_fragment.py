@@ -60,6 +60,35 @@ def test_the_schur_solve_is_the_full_solve(pbc, cell):
         assert corrections[s] + shared == pytest.approx(full, abs=1e-10)
 
 
+@pytest.mark.parametrize("stretched", [False, True], ids=["eliminated", "mixed"])
+def test_eliminating_the_potentials_is_the_full_solve(stretched):
+    """The reduced system `ACKS2` factors has the full system's minimum.
+
+    `_Piece.system` eliminates each molecule's Kohn-Sham potentials, except
+    for a molecule whose softness is nearly disconnected, which keeps them;
+    stretching one water's O-H to 6 A puts it in the second group.  Charges,
+    potentials and the minimum agree with `full_system` to rounding either way.
+    """
+    positions = POS_ZUNDEL.copy()
+    if stretched:
+        positions[9] += [6.0, 0.0, 0.0]
+    acks2 = ACKS2()
+    acks2.prepare(positions, PBC, CELL, zundel_system(ZUNDEL_A))
+    piece = acks2._piece(np.arange(len(acks2.act)), acks2.seed)
+    n = piece.n
+
+    A, b = piece.full_system(acks2.K)
+    x = np.linalg.solve(A, b)
+    Ar, br, c = piece.system(acks2.K)
+    xr = np.linalg.solve(Ar, br)
+
+    assert len(piece._explicit) == (3 if stretched else 0)
+    assert len(br) < len(b)
+    np.testing.assert_allclose(xr[:n], x[:n], atol=1e-12)
+    np.testing.assert_allclose(piece.potentials(xr), x[n : 2 * n], atol=1e-10)
+    assert -0.5 * (br @ xr + c) == pytest.approx(-0.5 * (b @ x), abs=1e-10)
+
+
 @pytest.mark.parametrize(("pbc", "cell"), BOUNDARIES, ids=BOUNDARY_IDS)
 def test_every_molecule_keeps_its_formal_charge(pbc, cell):
     """Softness acts within a molecule, so no charge crosses between two.

@@ -97,6 +97,15 @@ PLACEHOLDER_AMPLITUDE: float = -10.0
 # blocks that are both fully dissociated -- each has no edges at all.
 StateKey = tuple[frozenset, frozenset]
 
+# Asserts `EVBBasis._local_key`'s fast path against networkx's own iteration.
+# For tests; off in production, where it would cost what the fast path saves.
+_CHECK_KEYS: bool = False
+
+# Compare every state's channel list from `ReactionSet.state_channels` against
+# the `get_network` it replaces, order included.  Off in production; the test
+# that covers the fast path turns it on.
+_CHECK_CHANNELS: bool = False
+
 
 def state_key(topology: Topology) -> StateKey:
     return (
@@ -243,6 +252,19 @@ class EVBBasis:
         self._molecule_cache: dict[tuple, tuple[float, list[int], np.ndarray]] = {}
         self._ensemble_cache: dict[Reaction, np.ndarray] = {}
         self._inv_cell_cache: np.ndarray | None = None
+        # `_local_energy` by (node order, edge set); see there.
+        self._local_cache: dict[tuple, float] = {}
+        # (node set, row of each node, squared distances) for the block being
+        # closed; see `_reactions`.
+        self._block_distances: tuple | None = None
+        # Per force call, keyed on `(id(reaction), id(mapping))`: `(mapping,)`
+        # for a channel that is a no-op or fails the `eps` gate, else
+        # `(mapping, broken, formed, coupling)`.  The mapping is held so that
+        # its id cannot be reused within the call.  See `_close`.
+        self._channel_info: dict[tuple[int, int], tuple | None] = {}
+        # `_channel_weight` by the same key, where it does not depend on the
+        # parent; see `_close`.  The `_channel_info` entry keeps the ids live.
+        self._weight_cache: dict[tuple[int, int], tuple] = {}
 
     # -- pieces the closure needs ------------------------------------------
 
@@ -251,18 +273,45 @@ class EVBBasis:
     ) -> list[tuple[Reaction, dict]]:
         """Every reaction applicable to `state`, with its index mapping.
 
-        `get_network` walks the molecules of the topology it is handed, so
-        passing a block's topology keeps the search inside that block.
+        `ReactionSet.state_channels` lists them as `get_network(state)` would,
+        in the same order, without building the network; molecule separations
+        come from one distance matrix per block (`_block_distances`).  Passing
+        a block's topology keeps the search inside that block.
         """
         key = state_key(state)
         cached = self._reaction_cache.get(key)
         if cached is not None:
             return cached
 
-        network = self.reaction_set.get_network(state, bimol_cutoff)
-        found = [
-            (data["reaction"], data["mapping"]) for _, _, data in network.reactions()
-        ]
+        found = None
+        distances = self._block_distances
+        if distances is None or distances[0] != key[0]:
+            # Every state of a block spans the seed's atoms -- unless a formed
+            # bond reached outside it, which takes the general path below.
+            nodes = sorted(state.graph.nodes())
+            distances = (
+                key[0],
+                {node: i for i, node in enumerate(nodes)},
+                self.reaction_set.squared_separations(
+                    state.atoms.positions[nodes], state.atoms.cell, state.atoms.pbc
+                ),
+            )
+            if self._block_distances is None:
+                self._block_distances = distances
+        found = self.reaction_set.state_channels(
+            state, bimol_cutoff, distances[2], distances[1]
+        )
+        if found is None or _CHECK_CHANNELS:
+            network = self.reaction_set.get_network(state, bimol_cutoff)
+            general = [
+                (data["reaction"], data["mapping"])
+                for _, _, data in network.reactions()
+            ]
+            if found is not None:
+                assert len(found) == len(general) and all(
+                    a is c and b == d for (a, b), (c, d) in zip(found, general)
+                ), "state_channels disagrees with get_network"
+            found = general
         self._reaction_cache[key] = found
         return found
 
@@ -313,11 +362,87 @@ class EVBBasis:
         so they contribute equally to every state of a block and cancel from the
         gap this screens on.  The electrostatics do not -- the charges follow the
         bonding -- and `_channel_weight` adds them through `self.gap`.
+
+        Memoized for this geometry on the node *order* and the edge set, which
+        between them fix everything the sum reads: the components and the order
+        `connected_components` yields them in (by first node in iteration
+        order), and each component's energy, which the molecule cache already
+        keys on the same information.  The same reacting pair is screened again
+        from every state of a block that leaves it alone, and each time used to
+        rebuild its subgraphs and re-sort its signature -- a fifth of a hot
+        force call.  The order is in the key so the float sum is the one the
+        uncached call would have made, bit for bit.
         """
-        return sum(
-            self._molecule_energy(Topology(graph.subgraph(nodes)), atoms)
-            for nodes in nx.connected_components(graph)
+        key = self._local_key(graph)
+        cached = self._local_cache.get(key)
+        if cached is None:
+            cached = sum(
+                self._molecule_energy(Topology(graph.subgraph(nodes)), atoms)
+                for nodes in nx.connected_components(graph)
+            )
+            self._local_cache[key] = cached
+        return cached
+
+    @staticmethod
+    def _local_key(graph: nx.Graph) -> tuple:
+        """`_local_energy`'s memo key: node order and edge set.
+
+        Read off the dicts underneath when `graph` is an induced subgraph view,
+        which is what `_channel_weight` hands it, because going through the
+        view's filters was most of what the key cost.  The node order is the
+        one the view itself iterates in -- the rule `FilterAtlas.__iter__`
+        applies, walking the filter's own set when it is under half the graph
+        and the graph otherwise -- since that is the order the energy sum runs
+        in.  The edge set is order-free.
+        """
+        base = getattr(graph, "_graph", None)
+        node_ok = getattr(graph, "_NODE_OK", None)
+        if (
+            base is None
+            or getattr(graph, "_EDGE_OK", None) is not nx.filters.no_filter
+            or not hasattr(node_ok, "nodes")
+        ):
+            return (
+                tuple(graph.nodes),
+                frozenset(frozenset(edge) for edge in graph.edges()),
+            )
+        members, atlas, adjacency = node_ok.nodes, base._node, base._adj
+        if 2 * len(members) < len(atlas):
+            nodes = tuple(n for n in members if n in atlas)
+        else:
+            nodes = tuple(n for n in atlas if n in members)
+        edges = frozenset(
+            frozenset((u, v)) for u in nodes for v in adjacency[u] if v in members
         )
+        if _CHECK_KEYS:
+            assert nodes == tuple(graph.nodes)
+            assert edges == frozenset(frozenset(e) for e in graph.edges())
+        return nodes, edges
+
+    @staticmethod
+    def _fragment_key(graph: nx.Graph, fragment) -> tuple | None:
+        """`_local_key(graph.subgraph(fragment))`, without building the view.
+
+        `subgraph` filters on a set it fills by iterating `fragment` and
+        keeping the nodes `graph` has (`nbunch_iter` into `show_nodes`), and
+        the view iterates by `FilterAtlas.__iter__`'s rule -- so filling the
+        same set the same way reproduces its node order exactly.  `None` when
+        `graph` is itself a view, whose dicts are not the plain ones read here.
+        """
+        if getattr(graph, "_graph", None) is not None:
+            return None
+        atlas, adjacency = graph._node, graph._adj
+        members = set(n for n in fragment if n in atlas)
+        if 2 * len(members) < len(atlas):
+            nodes = tuple(n for n in members if n in atlas)
+        else:
+            nodes = tuple(n for n in atlas if n in members)
+        edges = frozenset(
+            frozenset((u, v)) for u in nodes for v in adjacency[u] if v in members
+        )
+        if _CHECK_KEYS:
+            assert (nodes, edges) == EVBBasis._local_key(graph.subgraph(fragment))
+        return nodes, edges
 
     def _local_gradients(
         self, graph: nx.Graph, atoms: Atoms
@@ -373,18 +498,64 @@ class EVBBasis:
         rejected, and none of them now costs more than the reaction touches.
         """
         broken, formed = changes
-        before = parent.graph.subgraph(frozenset(mapping.values()))
-        after = before.copy()
-        after.remove_edges_from(broken)
-        after.add_edges_from(formed)
+        fragment = frozenset(mapping.values())
+        # The fragment as a subgraph view, built only when something needs it
+        # as a graph rather than as a memo key -- which, on a hot box, is a
+        # small minority of the channels screened.
+        before = None
 
-        energy_before = self._local_energy(before, atoms)
-        energy_after = self._local_energy(after, atoms)
+        def fragment_view() -> nx.Graph:
+            nonlocal before
+            if before is None:
+                before = parent.graph.subgraph(fragment)
+            return before
+
+        def rewired() -> nx.Graph:
+            after = fragment_view().copy()
+            after.remove_edges_from(broken)
+            after.add_edges_from(formed)
+            return after
+
+        # The rewired fragment is built only when something needs it as a
+        # graph: a memo miss, an electrostatic gap that is not identically zero,
+        # or the ramp's gradient.  Otherwise its memo key is the before key with
+        # the edge difference applied -- `rewired` keeps `before`'s node order
+        # and adds no node while every formed bond is inside the fragment -- and
+        # most channels a hot box screens are pairs already screened from
+        # another state of the block.  Copying it regardless was a sixth of a
+        # hot force call.
+        after = None
+        before_key = self._fragment_key(parent.graph, fragment)
+        energy_before = (
+            None if before_key is None else self._local_cache.get(before_key)
+        )
+        if energy_before is None:
+            energy_before = self._local_energy(fragment_view(), atoms)
+        if all(u in fragment and v in fragment for u, v in formed):
+            nodes, edges = before_key or self._local_key(fragment_view())
+            after_key = (
+                nodes,
+                (edges - {frozenset(e) for e in broken})
+                | {frozenset(e) for e in formed},
+            )
+            energy_after = self._local_cache.get(after_key)
+        else:
+            energy_after = None
+        if energy_after is None:
+            after = rewired()
+            energy_after = self._local_energy(after, atoms)
         if self.gap is not None:
-            energy_after += self.gap.energy(parent, before, after)
+            if self.gap.trivial():
+                energy_after += 0.0  # what `gap.energy` returns, added as it was
+            else:
+                if after is None:
+                    after = rewired()
+                energy_after += self.gap.energy(parent, fragment_view(), after)
         weight = self._switch(energy_before, energy_after, coupling)
         if weight <= 0.0 or weight >= 1.0:
             return weight, None, None
+        if after is None:
+            after = rewired()
 
         # d(weight)/dr = S'(t)/width * d(stab)/dr, with
         #   stab = hypot(h, V) - |h|,  h = (E_after - E_before) / 2
@@ -398,10 +569,10 @@ class EVBBasis:
             / self.switch_width
         )
 
-        forces_before, virial_before = self._local_gradients(before, atoms)
+        forces_before, virial_before = self._local_gradients(fragment_view(), atoms)
         forces_after, virial_after = self._local_gradients(after, atoms)
         if self.gap is not None:
-            gap_forces, gap_virial = self.gap.gradients(parent, before, after)
+            gap_forces, gap_virial = self.gap.gradients(parent, fragment_view(), after)
             forces_after = forces_after + gap_forces
             virial_after = virial_after + gap_virial
         dgap = 0.5 * (forces_before - forces_after)
@@ -422,7 +593,7 @@ class EVBBasis:
         return weight, slope * dstabilization, slope * dstabilization_strain
 
     def _energy(
-        self, state: Topology, atoms: Atoms
+        self, state: Topology, atoms: Atoms, by_molecule: bool = False
     ) -> tuple[float, np.ndarray, np.ndarray]:
         """Diabatic energy and forces of one state at the current geometry.
 
@@ -435,7 +606,9 @@ class EVBBasis:
 
         Called only for states the closure actually admits -- candidates are
         screened with `_local_energy`, which is why this can afford to evaluate
-        the block in one lump.
+        the block in one lump.  For a block of several states, `by_molecule`
+        sums the molecule cache instead: the states share all but a molecule
+        or two, and every bonded term is intramolecular.
 
         Two index spaces meet, as in ACKS2: terms arrive in global indices, the
         sliced positions are in block order, and the forces are scattered back to
@@ -447,20 +620,39 @@ class EVBBasis:
             return cached
 
         if len(state.terms) == 0:
-            state.set_terms(self.reaction_set.get_terms(state))
+            self.reaction_set.assign_terms(state)
+
+        if by_molecule and getattr(state.graph, "_graph", None) is None:
+            # Every bonded term is intramolecular, so the state's energy is
+            # its molecules' -- and each molecule's is in the molecule cache
+            # already, from the screening or from another state of the block,
+            # which differ by a molecule or two.  Evaluating the whole block
+            # for every admitted state was a third of a hot force call.  The
+            # sum runs molecule by molecule rather than term type by term
+            # type, so it agrees with the block-wide call to rounding.  Only
+            # for a block of several states: a lone state's molecules are in
+            # no cache, and building each one's terms costs more than the one
+            # block-wide call.
+            components, _, signatures = self.reaction_set._components(state)
+            energy = 0.0
+            forces = np.zeros_like(atoms.positions)
+            virial = np.zeros((3, 3))
+            for members, signature in zip(components, signatures):
+                cached = self._molecule_cache.get(signature)
+                if cached is None:
+                    cached = self._molecule_terms(
+                        Topology(state.graph.subgraph(members)), atoms
+                    )
+                mol_energy, mol_nodes, mol_forces, mol_virial = cached
+                energy += mol_energy
+                forces[mol_nodes] += mol_forces
+                virial += mol_virial
+            result = (energy, forces, virial)
+            self._energy_cache[key] = result
+            return result
 
         nodes = sorted(state.graph.nodes())
-        local = {node: i for i, node in enumerate(nodes)}
-        term_dict = Topology(nx.Graph()).set_terms(
-            [
-                {
-                    "type": term["type"],
-                    "atoms": {k: local[v] for k, v in term["atoms"].items()},
-                    "kwargs": term["kwargs"],
-                }
-                for term in state.terms
-            ]
-        )
+        term_dict = self._local_term_dict(state, nodes)
 
         energy, local_forces, virial = self.bonded_ff(
             atoms.positions[nodes], atoms.pbc, atoms.cell, term_dict
@@ -474,6 +666,44 @@ class EVBBasis:
         result = (energy, forces, virial)
         self._energy_cache[key] = result
         return result
+
+    @staticmethod
+    def _local_term_dict(state: Topology, nodes: list[int]) -> dict:
+        """`state`'s vectorized terms with its atoms renumbered `0..len(nodes)-1`.
+
+        The same dict `set_terms` builds from the term list remapped one term at
+        a time -- each index array is the state's own pushed through a lookup
+        table, in the same order, and the parameter arrays are the state's own,
+        which nothing downstream writes to -- without re-vectorizing a block's
+        worth of terms per admitted state.  That was two `set_terms` per state,
+        a tenth of a hot force call.  A term on an atom outside `nodes` takes
+        the term-by-term path, which raises for it as it always did.
+        """
+        lookup = np.full(nodes[-1] + 1 if nodes else 0, -1, dtype=int)
+        lookup[nodes] = np.arange(len(nodes))
+        term_dict: dict = {}
+        for term_type, block in state.term_dict.items():
+            atoms = block["atoms"]
+            if atoms.size and (atoms.min() < 0 or atoms.max() >= len(lookup)):
+                break
+            mapped = lookup[atoms]
+            if np.any(mapped < 0):
+                break
+            term_dict[term_type] = {"atoms": mapped, "kwargs": block["kwargs"]}
+        else:
+            return term_dict
+
+        local = {node: i for i, node in enumerate(nodes)}
+        return Topology(nx.Graph()).set_terms(
+            [
+                {
+                    "type": term["type"],
+                    "atoms": {k: local[v] for k, v in term["atoms"].items()},
+                    "kwargs": term["kwargs"],
+                }
+                for term in state.terms
+            ]
+        )
 
     def _ensemble(self, reaction: Reaction) -> np.ndarray:
         """The reaction's stored transition-state frames as one (E, n, 3) array.
@@ -620,6 +850,9 @@ class EVBBasis:
         self._reaction_cache.clear()
         self._coupling_cache.clear()
         self._molecule_cache.clear()
+        self._local_cache.clear()
+        self._channel_info = {}
+        self._weight_cache = {}
         self._inv_cell_cache = None
         self._bimol_cutoff = bimol_cutoff
 
@@ -640,6 +873,7 @@ class EVBBasis:
         return blocks
 
     def _close(self, atoms: Atoms, seed: Topology, bimol_cutoff: float) -> Block:
+        self._block_distances = None
         seed_key = state_key(seed)
         admitted: dict[StateKey, Topology] = {seed_key: seed}
         depths: dict[StateKey, int] = {seed_key: 0}
@@ -652,33 +886,66 @@ class EVBBasis:
         placeholders: dict[str, None] = {}
         capped = False
 
+        # See the weight's memo below.
+        intrinsic = self.gap is None or self.gap.trivial()
+
         frontier: list[tuple[Topology, int]] = [(seed, 0)]
         while frontier:
             parent, depth = frontier.pop(0)
             parent_key = state_key(parent)
+            parent_nodes, parent_edges = parent_key
 
             # Every channel of this parent at once.  The couplings are the
             # dominant cost of the closure and each one is a superposition of a
             # handful of atoms onto a template, so evaluating them one at a time
             # spends nearly all of its time in fixed per-call overhead; see
             # `forcefield.coupling.kabsch`.
-            channels = []
-            for reaction, mapping in self._reactions(parent, bimol_cutoff):
+            #
+            # A channel's bond changes, its coupling and whether it clears the
+            # `eps` gate below are the channel's own, whichever state it is
+            # reached from -- and the states of a block share nearly all of
+            # them: 55k channel visits for a few hundred distinct channels on a
+            # 3000 K frame.  So each is worked out once per force call
+            # (`_channel_info`) and a parent walks only the live ones, in the
+            # order it found them.
+            found = self._reactions(parent, bimol_cutoff)
+            info = self._channel_info
+            new = []
+            for reaction, mapping in found:
+                key = (id(reaction), id(mapping))
+                if key in info:
+                    continue
                 broken, formed = reaction.edge_changes(mapping)
                 if not broken and not formed:
-                    continue  # a no-op template, e.g. H + H -> H + H
-                channels.append((reaction, mapping, broken, formed))
+                    info[key] = (mapping,)  # a no-op template, e.g. H + H -> H + H
+                    continue
+                info[key] = (mapping, broken, formed, None)
+                new.append((reaction, mapping, key))
+            if new:
+                couplings = self._channel_couplings(
+                    atoms, [(reaction, mapping) for reaction, mapping, _ in new]
+                )
+                for (reaction, mapping, key), coupling in zip(new, couplings):
+                    _, broken, formed, _ = info[key]
+                    # `stab <= |V|`: see the gate's own comment below.
+                    info[key] = (
+                        (mapping, broken, formed, coupling)
+                        if abs(coupling[0]) > self.eps
+                        else (mapping,)
+                    )
 
-            couplings = self._channel_couplings(
-                atoms, [(reaction, mapping) for reaction, mapping, _, _ in channels]
-            )
+            channels = []
+            for reaction, mapping in found:
+                live = info[(id(reaction), id(mapping))]
+                if len(live) == 4:
+                    channels.append((reaction, mapping, live[1], live[2], live[3]))
 
-            for (reaction, mapping, broken, formed), (
+            for reaction, mapping, broken, formed, (
                 coupling,
                 local_coupling_forces,
                 order,
                 coupling_virial,
-            ) in zip(channels, couplings):
+            ) in channels:
                 # `stab = hypot(h, V) - |h| <= |V|` for every gap `h`, by the
                 # triangle inequality, so a channel whose raw coupling is
                 # already below `eps` cannot clear the gate whatever the gap
@@ -727,15 +994,29 @@ class EVBBasis:
                 coupling_forces = np.zeros_like(atoms.positions)
                 coupling_forces[order, :] = local_coupling_forces
 
-                weight, dweight, dweight_virial = self._channel_weight(
-                    parent,
-                    mapping,
-                    (broken, formed),
-                    coupling,
-                    coupling_forces,
-                    coupling_virial,
-                    atoms,
+                # The weight is the channel's own too wherever the electrostatic
+                # gap is identically zero: its fragment is whole molecules
+                # matched by signature, so it is bonded the same way from every
+                # parent, and nothing else of the parent enters.  A charged
+                # dataset's gap reads the parent's other charges, so there it
+                # is recomputed from each parent.
+                weight_key = (id(reaction), id(mapping))
+                cached_weight = (
+                    self._weight_cache.get(weight_key) if intrinsic else None
                 )
+                if cached_weight is None:
+                    cached_weight = self._channel_weight(
+                        parent,
+                        mapping,
+                        (broken, formed),
+                        coupling,
+                        coupling_forces,
+                        coupling_virial,
+                        atoms,
+                    )
+                    if intrinsic:
+                        self._weight_cache[weight_key] = cached_weight
+                weight, dweight, dweight_virial = cached_weight
                 if weight <= 0.0:
                     continue
 
@@ -753,10 +1034,24 @@ class EVBBasis:
                     # and a virial is `+dE/de`.
                     virial_gradient = virial_gradient + coupling * dweight_virial
 
-                # Only now is the product worth building: `apply` copies the
-                # whole block graph, and so does deriving its state key.
-                child = reaction.apply(parent, mapping, share_atoms=True)
-                child_key = state_key(child)
+                # The product's state key, without the product.  `apply` copies
+                # the whole block graph, and on a hot box nine in ten of the
+                # channels that get here lead to a state already admitted --
+                # 9710 copies for 680 states on a 3000 K H2/O2 frame, a fifth of
+                # the force call.  `apply` removes `broken` and adds `formed`
+                # and nothing else, so its key is the parent's edge set with
+                # that difference applied; only a formed bond reaching outside
+                # the block, which would add a node, takes the long way.
+                child = None
+                if all(u in parent_nodes and v in parent_nodes for u, v in formed):
+                    child_key = (
+                        parent_nodes,
+                        (parent_edges - {frozenset(e) for e in broken})
+                        | {frozenset(e) for e in formed},
+                    )
+                else:
+                    child = reaction.apply(parent, mapping, share_atoms=True)
+                    child_key = state_key(child)
                 if child_key == parent_key:
                     continue
 
@@ -779,6 +1074,8 @@ class EVBBasis:
                 if len(admitted) >= self.max_states or depth + 1 > self.max_depth:
                     capped = True
                     continue
+                if child is None:
+                    child = reaction.apply(parent, mapping, share_atoms=True)
                 admitted[child_key] = child
                 depths[child_key] = depth + 1
                 frontier.append((child, depth + 1))
@@ -801,7 +1098,9 @@ class EVBBasis:
         forces = np.zeros((nstates,) + atoms.positions.shape)
         virials = np.zeros((nstates, 3, 3))
         for i, state in enumerate(states):
-            energies[i], forces[i], virials[i] = self._energy(state, atoms)
+            energies[i], forces[i], virials[i] = self._energy(
+                state, atoms, by_molecule=nstates > 1
+            )
 
         couplings = np.zeros((nstates, nstates))
         coupling_forces = np.zeros((nstates, nstates) + atoms.positions.shape)

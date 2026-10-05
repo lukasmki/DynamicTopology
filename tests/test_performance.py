@@ -342,19 +342,27 @@ def reaction_set():
     return ReactionSet(RSET_PATH)
 
 
+# How far an optimization may move the reference numbers.  Reordering a
+# floating-point sum, eliminating unknowns from a linear solve or threading a
+# BLAS call each move a 500 eV total in its last digits (1e-12 eV); a change to
+# the physics moves it by millielectronvolts at least.  The tolerance sits in
+# between, so that the first is allowed and the second is caught.
+REFERENCE_TOL: float = 1e-8  # eV
+
+
 @pytest.mark.parametrize("path", sorted(REFERENCE))
 def test_energy_matches_reference(reaction_set, path):
-    """The optimized force call reproduces the original numbers exactly."""
+    """The optimized force call reproduces the original numbers, to rounding."""
     atoms = io.read(path)
     results = System(atoms, Topology.from_atoms(atoms), reaction_set).calculate()
 
     energy, bonded, nonbonded, nblocks = REFERENCE[path]
-    assert results["energy"] == energy, (
+    assert results["energy"] == pytest.approx(energy, abs=REFERENCE_TOL), (
         f"total energy moved by {results['energy'] - energy:+.3e} eV; an "
         "optimization changed the physics"
     )
-    assert results["energy_bonded"] == bonded
-    assert results["energy_nonbonded"] == nonbonded
+    assert results["energy_bonded"] == pytest.approx(bonded, abs=REFERENCE_TOL)
+    assert results["energy_nonbonded"] == pytest.approx(nonbonded, abs=REFERENCE_TOL)
     assert len(results["blocks"]) == nblocks, (
         "the block partition changed, which changes which states can couple"
     )
@@ -507,3 +515,109 @@ def test_screening_agrees_where_a_reaction_is_live(reaction_set):
         "geometry.REACTION_PATH_RAMP -- it moves with every refit."
     )
     assert rejected > 0
+
+
+def _signature_by_networkx(molecule):
+    """`ReactionSet._molecule_signature` as it was written against the views."""
+    return (
+        tuple(
+            sorted(
+                (node, data.get("atomic_number"))
+                for node, data in molecule.graph.nodes(data=True)
+            )
+        ),
+        tuple(sorted(tuple(sorted(edge)) for edge in molecule.graph.edges())),
+    )
+
+
+def test_molecule_signatures_read_off_the_dicts_are_the_views(reaction_set):
+    """The signature's fast path reads the graph under a view; it must agree.
+
+    Exercised on every molecule of a box (views of the whole-system graph), on
+    views of views (which networkx flattens), and on plain graphs.
+    """
+    atoms = io.read("tests/data/mix-n100-d250.xyz")
+    topology = Topology.from_atoms(atoms)
+    molecules = list(topology.molecules())
+    assert molecules and all(hasattr(m.graph, "_NODE_OK") for m in molecules)
+    for molecule in molecules:
+        expected = _signature_by_networkx(molecule)
+        assert reaction_set._molecule_signature(molecule) == expected
+        plain = Topology(molecule.graph.copy())
+        assert reaction_set._molecule_signature(plain) == expected
+        nodes = sorted(molecule.graph.nodes())
+        nested = Topology(molecule.graph.subgraph(nodes[:-1] or nodes))
+        assert reaction_set._molecule_signature(nested) == _signature_by_networkx(
+            nested
+        )
+
+
+def test_the_memo_keys_follow_networkx_iteration(reaction_set, monkeypatch):
+    """`EVBBasis._local_key`'s fast path, asserted against the views it replaces.
+
+    Its node order decides the order a fragment's energy is summed in, so it
+    has to be the order networkx iterates the view in, not merely the same set.
+    `_CHECK_KEYS` asserts that on every key a force call builds; the energy
+    then has to be the reference one as well.
+    """
+    import DynamicTopology.basis as basis
+
+    monkeypatch.setattr(basis, "_CHECK_KEYS", True)
+    atoms = io.read("tests/data/mix-n100-d250.xyz")
+    checked = System(atoms, Topology.from_atoms(atoms), reaction_set).calculate()
+    monkeypatch.setattr(basis, "_CHECK_KEYS", False)
+    plain = System(atoms, Topology.from_atoms(atoms), reaction_set).calculate()
+    assert checked["energy"] == plain["energy"]
+    assert np.array_equal(checked["forces"], plain["forces"])
+
+
+HOT = "examples/nvt-n100-d250.xyz"  # its last frame: a 3000 K box, a capped block
+
+
+def test_state_channels_are_the_network_and_keys_the_views(reaction_set, monkeypatch):
+    """The closure's per-state fast paths, asserted against what they replace.
+
+    `ReactionSet.state_channels` must list every state's channels exactly as
+    `get_network(...).reactions()` does -- the same objects, in the same
+    order, since at the state cap the order decides which states are admitted
+    -- and `EVBBasis._fragment_key` must be the subgraph view's own key.  A
+    capped 128-state block exercises both on every state it reaches.
+    """
+    import DynamicTopology.basis as basis
+
+    atoms = io.read(HOT, index=-1)
+    monkeypatch.setattr(basis, "_CHECK_CHANNELS", True)
+    monkeypatch.setattr(basis, "_CHECK_KEYS", True)
+    checked = System(atoms, Topology.from_atoms(atoms), reaction_set).calculate()
+    monkeypatch.setattr(basis, "_CHECK_CHANNELS", False)
+    monkeypatch.setattr(basis, "_CHECK_KEYS", False)
+    plain = System(atoms, Topology.from_atoms(atoms), reaction_set).calculate()
+    assert max(block["nstates"] for block in plain["blocks"]) > 1
+    assert checked["energy"] == plain["energy"]
+    assert np.array_equal(checked["forces"], plain["forces"])
+
+
+def test_assigned_terms_are_set_terms(reaction_set):
+    """`ReactionSet.assign_terms` builds the arrays `set_terms` would, exactly.
+
+    Same types, keys and columns in the same order and dtype, for every state
+    of the hot box's blocks and for the whole system.
+    """
+    atoms = io.read(HOT, index=-1)
+    system = System(atoms, Topology.from_atoms(atoms), reaction_set)
+    system.calculate()
+    blocks = system.basis.build(atoms, system.topology, system.bimol_cutoff)
+    topologies = [state for block in blocks for state in block.states]
+    assert len(topologies) > len(blocks)
+    for topology in topologies + [system.topology]:
+        fresh = Topology(topology.graph.copy())
+        fresh.attach_atoms(atoms)
+        fast = reaction_set.assign_terms(fresh)
+        slow = Topology(topology.graph.copy()).set_terms(reaction_set.get_terms(fresh))
+        assert list(fast) == list(slow)
+        for term_type in slow:
+            assert np.array_equal(fast[term_type]["atoms"], slow[term_type]["atoms"])
+            assert list(fast[term_type]["kwargs"]) == list(slow[term_type]["kwargs"])
+            for key, values in slow[term_type]["kwargs"].items():
+                assert fast[term_type]["kwargs"][key].dtype == values.dtype
+                assert np.array_equal(fast[term_type]["kwargs"][key], values)

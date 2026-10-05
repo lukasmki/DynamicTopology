@@ -202,6 +202,11 @@ reference atomization energy and the depth its Morse bonds already supply.
 Summed over every pair in the system. It is parameterized by atomic number
 alone and has no free parameters.
 
+In practice the sum stops at :math:`r_\text{taper} + 45\,w_\text{taper}`
+(6.9 Å at the defaults), where the taper is below :math:`e^{-45}`; the pairs
+beyond carry nothing a sum of hundreds of eV can hold, so this is the
+all-pairs sum to rounding.
+
 .. math::
 
    a &= \frac{\text{SCREENING\_LENGTH}}{Z_1^{0.23} + Z_2^{0.23}}, \qquad
@@ -227,7 +232,8 @@ with
 3. Dispersion and contact: switched 12-6
 ----------------------------------------
 
-Summed over every pair. Pair parameters are geometric means of the per-atom
+Summed over every pair (or within ``lj_cutoff``; see *Optional cutoff* below).
+Pair parameters are geometric means of the per-atom
 ones, :math:`\sigma_{ij} = \sqrt{\sigma_i\sigma_j}` and
 :math:`\varepsilon_{ij} = \sqrt{\varepsilon_i\varepsilon_j}`.
 
@@ -250,6 +256,32 @@ bare 12-6. A pair with :math:`\sigma = 0` contributes nothing.
 ``switch_radius`` is deliberately **not** equal to ``taper_radius``. The two
 switches are not complementary: between them is a gap where both terms are
 small and electrostatics alone carries the hydrogen bond.
+
+**Optional cutoff.** By default the sum runs over every minimum-image pair, so
+under periodicity its reach is the cell's own shape and the energy depends on
+the box size: replicating the 64-water box 2×2×2 lowers it by 3.6 meV per
+molecule. Setting ``lj_cutoff`` :math:`r_c` (at most half the cell's shortest
+perpendicular width) multiplies each pair by CHARMM's switch
+:math:`S(r)`, 1 inside :math:`r_\text{on} = r_c - ` ``lj_cutoff_width`` and 0
+at :math:`r_c`,
+
+.. math::
+
+   S(r) = \frac{(r_c^2 - r^2)^2 (r_c^2 + 2r^2 - 3r_\text{on}^2)}{(r_c^2 - r_\text{on}^2)^3},
+   \qquad r_\text{on} < r < r_c,
+
+and, under full periodicity, adds the uniform-density tail of what it removed,
+
+.. math::
+
+   E_\text{tail} = \frac{2\pi}{V} \sum_{a,b} N_a N_b \int_{r_\text{on}}^\infty
+     r^2\, u_{ab}(r) \big[1 - S(r)\big]\, dr,
+   \qquad W_\text{tail} = -E_\text{tail}\, I,
+
+summed over atom types with :math:`u_{ab}` the switched soft-core form above.
+The energy is then independent of the box to 0.2 meV per molecule. It changes
+the model -- by −4.3 meV per molecule on the 64-water box -- so it is off by
+default.
 
 
 4. Electrostatics
@@ -304,6 +336,16 @@ Two properties apply only to the periodic form:
 by :math:`|\mathbf{k}|`, so the set is piecewise constant in the cell. A 3D
 lattice sum is the right sum only under full periodicity, so a slab or wire falls
 back to the nearest-image kernel.
+
+The direct solve uses the smallest :math:`\kappa` the nearest image allows and
+forms :math:`K` as a dense matrix. The iterative solve (``charge_solver =
+"iterative"``) never forms it: the real-space half is cut off at
+``real_space_cutoff`` (or half the cell) with :math:`\kappa` chosen for
+``accuracy`` there, and the reciprocal half is applied by smooth particle-mesh
+Ewald (Essmann et al., 1995) with order-8 B-splines on a mesh resolving
+:math:`k` to :math:`2\kappa\sqrt{-\ln(\text{accuracy})}`. Products with
+:math:`K` and the force and virial contractions agree with the dense form to
+about :math:`10^{-8}` of their size.
 
 4.2 Fragment ACKS2
 ~~~~~~~~~~~~~~~~~~
@@ -368,6 +410,31 @@ molecules only when the bonding changes. The kernel inside the solve is the full
 kernel, with no exclusions. :math:`A` uses the bare kernel while the energy
 carries ``ccoul``, so :math:`\mu` and :math:`\eta` are in the units that
 convention implies rather than in eV directly.
+
+**Solving it.** The Kohn–Sham rows involve only a molecule's own atoms, so
+:math:`\mathbf{u}` and :math:`\boldsymbol\lambda_u` are eliminated molecule by
+molecule: :math:`\mathbf{u} = \Gamma(\mathbf{q} - \mathbf{q}_0)` with
+:math:`\Gamma` the :math:`uu` block of
+:math:`\begin{pmatrix} -L_X & -\mathbf{1} \\ -\mathbf{1}^\mathsf{T} & 0 \end{pmatrix}^{-1}`,
+leaving
+
+.. math::
+
+   \begin{pmatrix} K + 2\,\mathrm{diag}\,\boldsymbol\eta - \Gamma & -M \\
+     -M^\mathsf{T} & 0 \end{pmatrix}
+   \begin{pmatrix} \mathbf{q} \\ \boldsymbol\lambda_q \end{pmatrix}
+   = \begin{pmatrix} -\boldsymbol\mu - \Gamma\mathbf{q}_0 \\
+     -M^\mathsf{T}\mathbf{q}_0 \end{pmatrix},
+   \qquad F^* = -\tfrac12\big(\mathbf{b}^\mathsf{T}\mathbf{x}
+     + \mathbf{q}_0^\mathsf{T}\Gamma\mathbf{q}_0\big),
+
+half the unknowns. A molecule whose softest mode is below
+:math:`10^{-3}` (a bond stretched past 2–4 Å) keeps its :math:`\mathbf{u}`, since
+:math:`\Gamma \sim 1/X` would cancel the precision of its other modes. The
+direct solve LU-factors this system; the iterative one solves it by conjugate
+gradients on charges that keep every molecule's sum, preconditioned molecule by
+molecule, to a relative residual of ``solver_tolerance``, and falls back to the
+direct solve for a call with a molecule kept explicit.
 
 **Energy.** The state's energy is its minimum, less each of its molecules'
 isolated minimum. The isolated minimum is the same functional solved for that
@@ -701,6 +768,26 @@ below apply wherever it does not.
      - 1e-8
      - —
      - Ewald splitting and cutoff (§4.1)
+   * - ``charge_solver``
+     - ``"direct"``
+     - —
+     - dense LU or PME + conjugate gradients (§4.1, §4.2)
+   * - ``real_space_cutoff``
+     - 9.0
+     - Å
+     - iterative solver's real-space cutoff (§4.1)
+   * - ``solver_tolerance``
+     - 1e-10
+     - —
+     - iterative solver's relative residual (§4.2)
+   * - ``lj_cutoff``
+     - ``None``
+     - Å
+     - optional 12-6 cutoff and tail correction (§3)
+   * - ``lj_cutoff_width``
+     - 1.0
+     - Å
+     - 12-6 cutoff switch width (§3)
    * - ``ccoul``
      - 14.4
      - eV·Å
@@ -714,6 +801,9 @@ below apply wherever it does not.
 precision. They are separate fields so that unifying them cannot silently move
 one of the two terms for a parameter set that is already fitted.
 
-Every parameter except ``accuracy`` enters :math:`E_\text{bonded} + E_\text{nonbonded}`,
+Every parameter except ``accuracy``, ``charge_solver``, ``real_space_cutoff``
+and ``solver_tolerance`` enters :math:`E_\text{bonded} + E_\text{nonbonded}`,
 which the templates are fitted against, so changing one invalidates that
-dataset's fitted parameters.
+dataset's fitted parameters. Those four only set how closely the lattice sum
+and the charge solve are converged; the iterative solver moves forces by about
+:math:`10^{-7}` eV/Å.

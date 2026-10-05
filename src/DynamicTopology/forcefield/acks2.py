@@ -44,11 +44,27 @@ masking a periodic kernel (`pointcharge.py`) cannot arise either.
 of whole molecules, and both topology-dependent pieces are intramolecular,
 so the states of a block differ only in their own block's rows.  The atoms
 outside every multi-state block -- the environment -- form one fixed system,
-LU-factored once; its polarization response to each block is `n_b`
-back-substitutions (`G`), and a state's solve is then a small dense system over
-its own block with the environment folded in as a reaction field
-(`Sigma = K_be G`) and a potential (`p = K_be y`).  The environment's response to
-each state is exact: `z_e = y - G q_b`.
+solved once; its polarization response to each block is `n_b` more solves
+(`G`), and a state's solve is then a small dense system over its own block with
+the environment folded in as a reaction field (`Sigma = K_be G`) and a
+potential (`p = K_be y`).  The environment's response to each state is exact:
+`z_e = y - G q_b`.
+
+**The Kohn-Sham potentials are eliminated before anything is factored.**  They
+enter only within a molecule, so each molecule's `u` is solved for its charges
+in closed form (`_Piece._eliminate`) and the system every solve sees is over
+`[q, lambda_q]`: `n + m` unknowns instead of `2n + 2m`, an eighth of the LU.
+A molecule whose softness is nearly disconnected -- a bond stretched past 2-4
+A -- keeps its `u` as unknowns, since eliminating it would add entries of
+order `1/X` to the hardness (`SOFTNESS_FLOOR`).
+
+**The environment's system is LU-factored, or solved iteratively.**  The
+direct solve (`global_params.charge_solver = "direct"`, the default) factors
+it against the dense kernel.  The iterative one keeps the kernel as an
+operator -- a real-space cutoff and particle-mesh Ewald,
+`ewald.EwaldOperator` -- and solves by conjugate gradients projected onto each
+molecule's charge sum (`_EnvironmentSolver`); a call with a molecule kept
+explicit in the environment falls back to the direct solve.
 
 **Two or more multi-state blocks see each other through their means**, exactly
 as `PointCharge` does (a Hartree product), with the environment-screened
@@ -66,24 +82,34 @@ pair sums, per state within a block.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import numpy as np
 from ase import units
 from scipy.linalg import lu_factor, lu_solve
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix
+from scipy.special import erf
 from scipy.sparse.csgraph import connected_components
 
 from DynamicTopology.forcefield.params import active
 from DynamicTopology.forcefield.pointcharge import (
     KernelCache,
     direct_kernel,
-    geometry,
     pair_gradients,
+    subset,
 )
+
+logger = logging.getLogger(__name__)
 
 # The per-atom parameters of an `atom` term; `q0` is optional and zero if absent.
 PARAMETERS: tuple[str, ...] = ("mu", "eta", "soft_amp", "soft_decay")
+
+# A molecule's `u` is eliminated from the charge solve only if its softest mode
+# is at least this stiff, which bounds the entries elimination adds to the
+# hardness at `1 / SOFTNESS_FLOOR`.  A water's is about 0.5; a molecule falls
+# below it once a bond stretches past 2-4 A, by element.  See `_Piece._eliminate`.
+SOFTNESS_FLOOR: float = 1e-3
 
 
 def _rows(indices: np.ndarray, wanted: np.ndarray, what: str) -> np.ndarray:
@@ -140,7 +166,7 @@ class _Piece:
     are the only pairs the softness and the isolated-molecule reference act on.
     """
 
-    def __init__(self, atoms, glob, term_dict, rij, gamma):
+    def __init__(self, atoms, glob, term_dict, rij, gamma, memo=None):
         self.atoms = atoms
         self.n = n = len(atoms)
         params = atom_parameters(term_dict, glob)
@@ -148,6 +174,15 @@ class _Piece:
         self.eta = params["eta"]
         self.q0 = params["q0"]
         amp, decay = params["soft_amp"], params["soft_decay"]
+        # Per-molecule results shared between the pieces of one `bind`, keyed
+        # on what they are a function of: the molecule's atoms and their
+        # parameters, at the one geometry a `bind` sees.  The states of a block
+        # share all but a molecule or two, and each used to redo every one.
+        self.memo = memo
+        if memo is not None:
+            self._record = np.column_stack(
+                [glob.astype(float), self.mu, self.eta, self.q0, amp, decay]
+            )
         self.mol = molecule_labels(term_dict, glob)
         self.nmol = int(self.mol.max()) + 1 if n else 0
 
@@ -158,6 +193,8 @@ class _Piece:
         tau = 0.5 * (decay[self.pi] + decay[self.pj])
         self.x = amp[self.pi] * amp[self.pj] * np.exp(-r / tau)
         self.dx = -self.x / tau
+        self._response = None
+        self._explicit = None
 
     def _softness(self) -> np.ndarray:
         """`X` over this piece, dense, zero off-molecule and on the diagonal."""
@@ -166,8 +203,169 @@ class _Piece:
         X[self.pj, self.pi] = self.x
         return X
 
-    def system(self, K: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """`A x = b` over this piece with `K` its bare kernel block.
+    def _split(self, members: np.ndarray, kind: str):
+        """`members` (G, k) as (keys, the rows the memo does not hold yet).
+
+        Without a memo every row is missing and the keys are `None`.
+        """
+        if self.memo is None:
+            return [None] * len(members), np.arange(len(members))
+        # One byte string per molecule, from one view of the stacked records.
+        records = np.ascontiguousarray(self._record[members]).reshape(len(members), -1)
+        width = records.shape[1] * records.itemsize
+        raw = records.view(np.dtype((np.void, width))).ravel().tolist()
+        keys = [(kind, key) for key in raw]
+        memo = self.memo
+        missing = np.array(
+            [i for i, key in enumerate(keys) if key not in memo], dtype=int
+        )
+        return keys, missing
+
+    def _molecules(self):
+        """The members of each molecule, one `(G, k)` stack per molecule size `k`."""
+        order = np.argsort(self.mol, kind="stable")
+        counts = np.bincount(self.mol, minlength=self.nmol)
+        starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+        for k in np.unique(counts):
+            mols = np.flatnonzero(counts == k)
+            yield order[starts[mols][:, None] + np.arange(k)]
+
+    def _eliminate(self) -> None:
+        """Split the molecules into those whose `u` is eliminated and the rest.
+
+        The Kohn-Sham rows of `full_system` are `L u - lambda_u = q - q0`, with
+        `L = X - diag(X 1)` the softness Laplacian of each molecule, and
+        `sum u = 0` per molecule.  Solved per molecule, `u = Gamma (q - q0)`
+        with `Gamma` the `uu` block of `[[L, -1], [-1^T, 0]]^{-1}`: negative
+        semidefinite, so eliminating `u` adds `-Gamma` to the hardness.
+
+        `Gamma` is `L`'s pseudo-inverse, so a molecule whose softness is nearly
+        disconnected -- a bond the topology still holds stretched to 10 A, its
+        `X` near `e^-40` -- would put entries of `1/X` beside a hardness of
+        order ten and cancel away the precision of every other mode of that
+        molecule.  Those molecules keep `u` and `lambda_u` as unknowns, exactly
+        as `full_system` has them, where `u` stays of order one.  Every other
+        molecule -- every molecule near equilibrium -- is eliminated.
+        """
+        n = self.n
+        dense = {}
+
+        def softness():
+            if "X" not in dense:
+                dense["X"] = self._softness()
+            return dense["X"]
+
+        explicit = np.zeros(n, dtype=bool)
+        rows, cols, values = [np.zeros(0, int)], [np.zeros(0, int)], [np.zeros(0)]
+        for members in self._molecules():
+            k = members.shape[1]
+            if k == 1:
+                continue  # `u = 0`: nothing to eliminate
+            keys, missing = self._split(members, "gamma")
+            if len(missing):
+                fresh = members[missing]
+                Xg = softness()[fresh[:, :, None], fresh[:, None, :]]
+                at = np.arange(k)
+                L = Xg.copy()
+                L[:, at, at] -= Xg.sum(axis=2)
+                # `L` is negative semidefinite with one zero mode; the next is
+                # the softest the molecule has.
+                soft = -np.linalg.eigvalsh(L)[:, -2]
+                ok = soft >= SOFTNESS_FLOOR
+                B = np.zeros((int(np.sum(ok)), k + 1, k + 1))
+                B[:, :k, :k] = L[ok]
+                B[:, k, :k] = B[:, :k, k] = -1.0
+                inverse = np.linalg.inv(B)[:, :k, :k]
+                blocks = iter(inverse)
+                computed = [next(blocks) if good else None for good in ok]
+                if self.memo is not None:
+                    for i, value in zip(missing, computed):
+                        self.memo[keys[i]] = value
+            if self.memo is not None:
+                computed = [self.memo[key] for key in keys]
+            ok = np.array([value is not None for value in computed])
+            explicit[members[~ok].ravel()] = True
+            members = members[ok]
+            block = np.array([value for value in computed if value is not None])
+            block = block.reshape(len(members), k, k)
+            rows.append(np.broadcast_to(members[:, :, None], block.shape).ravel())
+            cols.append(np.broadcast_to(members[:, None, :], block.shape).ravel())
+            values.append(block.ravel())
+        self._response = csr_matrix(
+            (np.concatenate(values), (np.concatenate(rows), np.concatenate(cols))),
+            shape=(n, n),
+        )
+        self._explicit = np.flatnonzero(explicit)
+        mols, self._explicit_mol = np.unique(self.mol[self._explicit], return_inverse=True)
+        self._nexplicit_mol = len(mols)
+        self._softness_explicit = (
+            softness()[np.ix_(self._explicit, self._explicit)]
+            if len(self._explicit)
+            else np.zeros((0, 0))
+        )
+
+    def potentials(self, x: np.ndarray, response: bool = False) -> np.ndarray:
+        """The Kohn-Sham potentials `u` at a solution `x` of `system`.
+
+        With `response`, `x` is instead the response of the solution to a
+        change in `b` (vector or columns), and so is the `u` returned.
+        """
+        if self._response is None:
+            self._eliminate()
+        n, m = self.n, self.nmol
+        u = self._response @ x[:n]
+        u[self._explicit] += x[n + m : n + m + len(self._explicit)]
+        return u if response else u - self._response @ self.q0
+
+    def system(self, K: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+        """`A x = b` over this piece with the Kohn-Sham potentials eliminated.
+
+        `x = [q, lambda_q, u_e, lambda_e]`: `n + m` unknowns plus the `u` and
+        the Kohn-Sham constraint of each molecule kept explicit (`_eliminate`),
+        where `full_system` has `2n + 2m` -- the same minimum, an eighth of the
+        LU.  Returns `(A, b, c)` with the functional's minimum
+        `-1/2 (b.x + c)`.  `A` is symmetric; `potentials` recovers `u`.
+        """
+        if self._response is None:
+            self._eliminate()
+        n, m = self.n, self.nmol
+        G, e = self._response, self._explicit
+        ne, me = len(e), self._nexplicit_mol
+        size = n + m + ne + me
+        A = np.zeros((size, size))
+        b = np.zeros(size)
+        A[:n, :n] = K
+        if n:
+            A[:n, :n] -= G.toarray()
+        at = np.arange(n)
+        A[at, at] += 2.0 * self.eta
+        A[n + self.mol, at] = A[at, n + self.mol] = -1.0
+        Gq0 = G @ self.q0
+        b[:n] = -self.mu - Gq0
+        b[n : n + m] = -np.bincount(self.mol, self.q0, m)
+        if ne:
+            u = n + m + np.arange(ne)
+            lam = n + m + ne + self._explicit_mol
+            Xe = self._softness_explicit
+            A[np.ix_(u, u)] = Xe - np.diag(Xe.sum(axis=1))
+            A[e, u] = A[u, e] = -1.0
+            A[lam, u] = A[u, lam] = -1.0
+            b[u] = -self.q0[e]
+        return A, b, float(self.q0 @ Gq0)
+
+    def rhs(self) -> tuple[np.ndarray, float]:
+        """`system`'s `b` and `c`, for a piece with no molecule kept explicit."""
+        if self._response is None:
+            self._eliminate()
+        n, m = self.n, self.nmol
+        b = np.zeros(n + m)
+        Gq0 = self._response @ self.q0
+        b[:n] = -self.mu - Gq0
+        b[n:] = -np.bincount(self.mol, self.q0, m)
+        return b, float(self.q0 @ Gq0)
+
+    def full_system(self, K: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """`A x = b` over this piece with `K` its bare kernel block, unreduced.
 
         `x = [q, u, lambda_q, lambda_u]`: one charge constraint and one
         Kohn-Sham constraint per molecule.  `A` is symmetric.
@@ -198,20 +396,36 @@ class _Piece:
         q, u = np.zeros(n), np.zeros(n)
         if n == 0:
             return 0.0, q, u
-        K = np.zeros((n, n))
-        K[self.pi, self.pj] = self.g
-        K[self.pj, self.pi] = self.g
-        X = self._softness()
+        dense = {}
 
-        order = np.argsort(self.mol, kind="stable")
-        counts = np.bincount(self.mol, minlength=self.nmol)
-        starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+        def matrices():
+            if not dense:
+                K = np.zeros((n, n))
+                K[self.pi, self.pj] = self.g
+                K[self.pj, self.pi] = self.g
+                dense["K"], dense["X"] = K, self._softness()
+            return dense["K"], dense["X"]
+
         total = 0.0
-        for k in np.unique(counts):
-            mols = np.flatnonzero(counts == k)
-            members = order[starts[mols][:, None] + np.arange(k)]  # (G, k)
+        for members in self._molecules():  # (G, k)
+            if self.memo is not None:
+                keys, missing = self._split(members, "isolated")
+                k = members.shape[1]
+                if len(missing):
+                    F, qs, us = self._isolated_stack(members[missing], *matrices())
+                    for i, f, qm, um in zip(missing, F, qs, us):
+                        self.memo[keys[i]] = (f, qm, um)
+                # Summed molecule by molecule, so that a molecule's share does
+                # not depend on which others it was solved alongside.
+                for row, key in zip(members, keys):
+                    f, qm, um = self.memo[key]
+                    total += f
+                    q[row] = qm
+                    u[row] = um
+                continue
+            G, k = members.shape
+            K, X = matrices()
             sub = (members[:, :, None], members[:, None, :])
-            G = len(mols)
             dim = 2 * k + 2
             A = np.zeros((G, dim, dim))
             b = np.zeros((G, dim))
@@ -233,6 +447,29 @@ class _Piece:
             u[members] = x[:, k : 2 * k]
         return total, q, u
 
+    def _isolated_stack(self, members, K, X):
+        """`isolated`'s solve for one stack of equal-sized molecules, per molecule."""
+        G, k = members.shape
+        sub = (members[:, :, None], members[:, None, :])
+        dim = 2 * k + 2
+        A = np.zeros((G, dim, dim))
+        b = np.zeros((G, dim))
+        at = np.arange(k)
+        A[:, :k, :k] = K[sub]
+        A[:, at, at] += 2.0 * self.eta[members]
+        Xg = X[sub]
+        A[:, k : 2 * k, k : 2 * k] = Xg
+        A[:, k + at, k + at] -= Xg.sum(axis=2)
+        A[:, at, k + at] = A[:, k + at, at] = -1.0
+        A[:, 2 * k, :k] = A[:, :k, 2 * k] = -1.0
+        A[:, 2 * k + 1, k : 2 * k] = A[:, k : 2 * k, 2 * k + 1] = -1.0
+        b[:, :k] = -self.mu[members]
+        b[:, k : 2 * k] = -self.q0[members]
+        b[:, 2 * k] = -self.q0[members].sum(axis=1)
+        x = np.linalg.solve(A, b[:, :, None])[:, :, 0]
+        F = -0.5 * np.sum(b * x, axis=1)
+        return F, x[:, :k], x[:, k : 2 * k]
+
     def pair_derivative(self, du2, q_iso, u_iso) -> np.ndarray:
         """`d(F - F_iso)/dr` on each intramolecular pair, charges held fixed.
 
@@ -246,6 +483,159 @@ class _Piece:
         return -0.5 * du2 * self.dx - iso
 
 
+class _EnvironmentSolver:
+    """The environment's reduced system, solved by projected conjugate gradients.
+
+    The system `system` assembles is `H q - S^T lambda = b_q`, `-S q = b_l`,
+    with `H = K + 2 diag(eta) - Gamma` and `S` the molecules' charge sums.
+    `H` is positive definite on charges that keep every molecule's sum, so
+    writing `q = q_p + z` with `S z = 0` leaves `P H z = P (b_q - H q_p)`, `P`
+    removing each molecule's mean: symmetric positive definite on that
+    subspace, which is what conjugate gradients needs.  `lambda` is the
+    per-molecule mean of the residual `H q - b_q`, which is constant within
+    each molecule at the solution.
+
+    Preconditioned molecule by molecule, with each molecule's own block of `H`
+    solved exactly on its sum-zero subspace: the kernel there is the bare
+    `erf(gamma r) / r` plus the periodic diagonal, near enough for a
+    preconditioner.  The intramolecular coupling is the strongest, so this
+    leaves only the slow intermolecular polarization to the iteration.
+
+    The kernel is only ever applied (`EwaldOperator.matvec`), never formed.
+    """
+
+    MAX_ITERATIONS = 2000
+
+    def __init__(self, acks2, env: np.ndarray, piece: _Piece):
+        self.acks2 = acks2
+        self.kernel = acks2.kernel
+        self.env = env
+        self.piece = piece
+        self.n_all = len(acks2.act)
+        self.full = len(env) == self.n_all
+        self.n, self.m = piece.n, piece.nmol
+        self.mol = piece.mol
+        self.counts = np.bincount(self.mol, minlength=self.m).astype(float)
+        self.sums = csr_matrix(
+            (np.ones(self.n), (self.mol, np.arange(self.n))), shape=(self.m, self.n)
+        )
+        self.gamma_matrix = piece._response
+        self.eta2 = 2.0 * piece.eta
+        self.tolerance = active().solver_tolerance
+        self.iterations = 0
+        self._blocks = self._preconditioner()
+
+    # -- operators --------------------------------------------------------
+
+    def H(self, Z: np.ndarray) -> np.ndarray:
+        if self.full:
+            KZ = self.kernel.matvec(Z)
+        else:
+            X = np.zeros((self.n_all, Z.shape[1]))
+            X[self.env] = Z
+            KZ = self.kernel.matvec(X)[self.env]
+        return KZ + self.eta2[:, None] * Z - self.gamma_matrix @ Z
+
+    def mean(self, V: np.ndarray) -> np.ndarray:
+        return (self.sums @ V) / self.counts[:, None]
+
+    def project(self, V: np.ndarray) -> np.ndarray:
+        return V - self.mean(V)[self.mol]
+
+    def _preconditioner(self):
+        piece, kernel = self.piece, self.kernel
+        diagonal = kernel.setup.diagonal
+        gamma = kernel.setup.gamma
+        blocks = []
+        for members in piece._molecules():
+            G, k = members.shape
+            if k == 1:
+                continue  # a lone atom's charge is fixed by its sum
+            atoms = piece.atoms[members]
+            r = kernel.rij[atoms[:, :, None], atoms[:, None, :]]
+            off = ~np.eye(k, dtype=bool)
+            H = np.where(off, erf(gamma * np.where(off, r, 1.0)) / np.where(off, r, 1.0), 0.0)
+            H = H + diagonal
+            H[:, np.arange(k), np.arange(k)] += self.eta2[members]
+            Gm = np.zeros((G, k, k))
+            for a in range(k):
+                for c in range(k):
+                    Gm[:, a, c] = np.asarray(
+                        self.gamma_matrix[members[:, a], members[:, c]]
+                    ).ravel()
+            H = H - Gm
+            # An orthonormal basis of the sum-zero subspace.
+            values, vectors = np.linalg.eigh(np.eye(k) - 1.0 / k)
+            N = vectors[:, values > 0.5]
+            inner = np.linalg.inv(np.einsum("ai,gab,bj->gij", N, H, N))
+            blocks.append((members, np.einsum("ai,gij,bj->gab", N, inner, N)))
+        return blocks
+
+    def precondition(self, R: np.ndarray) -> np.ndarray:
+        out = np.zeros_like(R)
+        for members, P in self._blocks:
+            out[members] = np.einsum("gab,gbr->gar", P, R[members])
+        return out
+
+    def _cg(self, rhs: np.ndarray, x0: np.ndarray) -> np.ndarray:
+        """`P H z = rhs` on the sum-zero subspace, columnwise."""
+        x = x0.copy()
+        r = rhs - self.project(self.H(x))
+        z = self.precondition(r)
+        p = z.copy()
+        rz = np.sum(r * z, axis=0)
+        target = self.tolerance * np.maximum(np.linalg.norm(rhs, axis=0), 1e-300)
+        for iteration in range(self.MAX_ITERATIONS):
+            if np.all(np.linalg.norm(r, axis=0) <= target):
+                self.iterations += iteration
+                return x
+            Ap = self.project(self.H(p))
+            curvature = np.sum(p * Ap, axis=0)
+            alpha = np.where(curvature > 0, rz / np.where(curvature > 0, curvature, 1.0), 0.0)
+            x += alpha * p
+            r -= alpha * Ap
+            z = self.precondition(r)
+            rz_new = np.sum(r * z, axis=0)
+            beta = np.where(rz > 0, rz_new / np.where(rz > 0, rz, 1.0), 0.0)
+            p = z + beta * p
+            rz = rz_new
+        logger.warning(
+            "ACKS2 iterative solve stopped at %d iterations, residual %.2e of %.2e",
+            self.MAX_ITERATIONS,
+            float(np.max(np.linalg.norm(r, axis=0) / target * self.tolerance)),
+            self.tolerance,
+        )
+        self.iterations += self.MAX_ITERATIONS
+        return x
+
+    def solve(self, b: np.ndarray, columns: np.ndarray | None = None) -> np.ndarray:
+        """`system`'s solution `[q, lambda]`: for its own `b`, or for `columns`.
+
+        `columns` (n, r) are right-hand sides in the charge rows with zero
+        constraint rows -- the environment's response to a block, `G`.
+        """
+        n = self.n
+        if n == 0:
+            return np.zeros(len(b)) if columns is None else np.zeros((len(b), columns.shape[1]))
+        if columns is None:
+            b_q = b[:n, None]
+            # Any charges with the molecules' sums: `S q0` is what `b_l` asks.
+            start = self.piece.q0[:, None]
+            warm = self.acks2._warm.get(self.env.tobytes())
+        else:
+            b_q = columns
+            start = np.zeros_like(columns)
+            warm = None
+        x0 = warm if warm is not None and warm.shape == b_q.shape else np.zeros_like(b_q)
+        z = self._cg(self.project(b_q - self.H(start)), self.project(x0))
+        q = start + z
+        lam = self.mean(self.H(q) - b_q)
+        if columns is None:
+            self.acks2._warm = {self.env.tobytes(): z}
+            return np.concatenate([q[:, 0], lam[:, 0]])
+        return np.vstack([q, lam])
+
+
 @dataclass
 class _Block:
     """A multi-state EVB block as the charge solve sees it.  Solver indices."""
@@ -255,7 +645,9 @@ class _Block:
     iso: list[tuple[float, np.ndarray, np.ndarray]]
     lus: list = field(default_factory=list)
     rhs: list[np.ndarray] = field(default_factory=list)
+    consts: list[float] = field(default_factory=list)  # `c` of each reduced system
     Keb: np.ndarray | None = None  # (ne, nb) bare kernel, environment to block
+    columns: np.ndarray | None = None  # (n, nb) `K[:, atoms]`, iterative solver only
     Gq: np.ndarray | None = None  # (ne, nb) environment charge response
     Gu: np.ndarray | None = None  # (ne, nb) environment potential response
     weights: np.ndarray | None = None
@@ -285,6 +677,8 @@ class ACKS2:
 
     def __init__(self):
         self.kernels = KernelCache()
+        # The iterative solver's last solution, to start the next from.
+        self._warm: dict = {}
         self.Q = None
         self.act = None
         self.local = None
@@ -292,8 +686,12 @@ class ACKS2:
 
     # -- the geometry ---------------------------------------------------------
 
-    def prepare(self, pos, pbc, cell, term_dict: dict) -> None:
-        """Build the kernel at this geometry and hold the seed topology's terms."""
+    def prepare(self, pos, pbc, cell, term_dict: dict, displacements=None) -> None:
+        """Build the kernel at this geometry and hold the seed topology's terms.
+
+        `displacements` is `geometry(pos, pbc, cell)` over every atom, if the
+        caller already has it.
+        """
         block = term_dict.get("atom")
         if block is None:
             raise KeyError("No atom parameters set")
@@ -301,15 +699,29 @@ class ACKS2:
         self.act = np.unique(block["atoms"][:, 0])
         self.local = np.full(len(pos), -1, dtype=int)
         self.local[self.act] = np.arange(len(self.act))
-        self.vecs, self.rij = geometry(pos[self.act], pbc, cell)
-        self.kernel = self.kernels.get(pos[self.act], self.vecs, self.rij, pbc, cell)
-        self.K = self.kernel.matrix()
+        self.vecs, self.rij = subset(displacements, self.act, pos, pbc, cell)
+        # The iterative solver keeps the kernel as an operator and `K` unset;
+        # see `_EnvironmentSolver`.
+        self.operator = bool(np.all(pbc)) and active().charge_solver == "iterative"
+        self._where = (pos[self.act], pbc, cell)
+        self.kernel = self.kernels.get(
+            pos[self.act], self.vecs, self.rij, pbc, cell, operator=self.operator
+        )
+        self.K = None if self.operator else self.kernel.matrix()
         self.seed = term_dict
         self.gamma = active().gamma
         self.blocks: dict[int, _Block] = {}
 
-    def _piece(self, atoms: np.ndarray, term_dict: dict) -> _Piece:
-        return _Piece(atoms, self.act[atoms], term_dict, self.rij, self.gamma)
+    def _direct(self, reason: str) -> None:
+        """Take this call on the dense kernel and the direct solve."""
+        logger.info("ACKS2: direct charge solve for this call: %s", reason)
+        pos, pbc, cell = self._where
+        self.operator = False
+        self.kernel = self.kernels.get(pos, self.vecs, self.rij, pbc, cell)
+        self.K = self.kernel.matrix()
+
+    def _piece(self, atoms: np.ndarray, term_dict: dict, memo=None) -> _Piece:
+        return _Piece(atoms, self.act[atoms], term_dict, self.rij, self.gamma, memo)
 
     # -- the blocks -----------------------------------------------------------
 
@@ -322,6 +734,8 @@ class ACKS2:
         n = len(self.act)
         self.blocks = {}
         in_block = np.zeros(n, dtype=bool)
+        # Per-molecule results for every state of every block; see `_Piece`.
+        memo: dict = {}
         for k, block in enumerate(blocks):
             if block.nstates < 2:
                 continue
@@ -330,7 +744,9 @@ class ACKS2:
             if np.any(atoms < 0):
                 raise KeyError("An EVB block holds an atom with no `atom` term.")
             in_block[atoms] = True
-            pieces = [self._piece(atoms, state.term_dict) for state in block.states]
+            pieces = [
+                self._piece(atoms, state.term_dict, memo) for state in block.states
+            ]
             weights = np.zeros(block.nstates)
             weights[block.seed_index] = 1.0
             self.blocks[k] = _Block(
@@ -341,33 +757,55 @@ class ACKS2:
         ne = len(env)
         self.env = env
         self.env_piece = self._piece(env, self.seed)
-        A, b = self.env_piece.system(self.K[np.ix_(env, env)])
-        self.lu_env = lu_factor(A) if len(b) else None
-        self.y = lu_solve(self.lu_env, b) if len(b) else b
-        self.const_env = -0.5 * float(b @ self.y)
+        if self.operator:
+            if self.env_piece._response is None:
+                self.env_piece._eliminate()  # settles which are kept explicit
+            if len(self.env_piece._explicit):
+                self._direct("a molecule of the environment is kept explicit")
+        if self.operator:
+            b, c = self.env_piece.rhs()
+            self.solver = _EnvironmentSolver(self, env, self.env_piece)
+            self.y = self.solver.solve(b)
+        else:
+            A, b, c = self.env_piece.system(self.K[np.ix_(env, env)])
+            self.lu_env = lu_factor(A) if len(b) else None
+            self.y = lu_solve(self.lu_env, b) if len(b) else b
+        self.y_u = self.env_piece.potentials(self.y)
+        self.const_env = -0.5 * (float(b @ self.y) + c)
         self.iso_env = self.env_piece.isolated()
 
         for block in self.blocks.values():
             nb = len(block.atoms)
-            block.Keb = self.K[np.ix_(env, block.atoms)]
-            if ne:
+            if self.operator:
+                block.columns = self.kernel.columns(block.atoms)
+                block.Keb = block.columns[env]
+            else:
+                block.Keb = self.K[np.ix_(env, block.atoms)]
+            if ne and self.operator:
+                G = self.solver.solve(np.zeros(len(b)), block.Keb)
+            elif ne:
                 C = np.zeros((len(b), nb))
                 C[:ne] = block.Keb
                 G = lu_solve(self.lu_env, C)
             else:
                 G = np.zeros((0, nb))
-            block.Gq, block.Gu = G[:ne], G[ne : 2 * ne]
+            block.Gq = G[:ne]
+            block.Gu = self.env_piece.potentials(G, response=True)
             # The environment as the block sees it: a potential and a reaction
             # field, the same for every state.
             p = block.Keb.T @ self.y[:ne]
             sigma = block.Keb.T @ block.Gq
-            Kbb = self.K[np.ix_(block.atoms, block.atoms)]
+            if self.operator:
+                Kbb = block.columns[block.atoms]
+            else:
+                Kbb = self.K[np.ix_(block.atoms, block.atoms)]
             for piece in block.pieces:
-                A, rhs = piece.system(Kbb)
+                A, rhs, c = piece.system(Kbb)
                 A[:nb, :nb] -= sigma
                 rhs[:nb] -= p
                 block.lus.append(lu_factor(A))
                 block.rhs.append(rhs)
+                block.consts.append(c)
             seed = int(np.argmax(block.weights))
             block.mean = lu_solve(block.lus[seed], block.rhs[seed])[:nb]
             block.z = [None] * len(block.pieces)
@@ -375,6 +813,8 @@ class ACKS2:
 
     def _coupling(self, a: _Block, b: _Block) -> np.ndarray:
         """`K_ab - Sigma_ab`: two blocks' charges, screened by the environment."""
+        if self.K is None:
+            return b.columns[a.atoms] - a.Keb.T @ b.Gq
         return self.K[np.ix_(a.atoms, b.atoms)] - a.Keb.T @ b.Gq
 
     def corrections(self, index: int) -> np.ndarray:
@@ -394,11 +834,12 @@ class ACKS2:
             if other_index != index:
                 h += self._coupling(block, other) @ other.mean
         out = np.empty(len(block.pieces))
-        for s, (lu, rhs, iso) in enumerate(zip(block.lus, block.rhs, block.iso)):
+        states = zip(block.lus, block.rhs, block.consts, block.iso)
+        for s, (lu, rhs, const, iso) in enumerate(states):
             c = rhs.copy()
             c[:nb] -= h
             z = lu_solve(lu, c)
-            value = -0.5 * float(c @ z)
+            value = -0.5 * (float(c @ z) + const)
             block.z[s] = z
             block.ltilde[s] = value - float(h @ z[:nb])
             out[s] = value - iso[0]
@@ -438,12 +879,12 @@ class ACKS2:
 
         # Mean charges and potentials, and each block's charge covariance.
         qbar, ubar = np.zeros(n), np.zeros(n)
-        q_env, u_env = self.y[:ne].copy(), self.y[ne : 2 * ne].copy()
+        q_env, u_env = self.y[:ne].copy(), self.y_u.copy()
         states = []
         for block in blocks:
             nb = len(block.atoms)
             Zq = np.array([z[:nb] for z in block.z])
-            Zu = np.array([z[nb : 2 * nb] for z in block.z])
+            Zu = np.array([p.potentials(z) for p, z in zip(block.pieces, block.z)])
             dq = Zq - block.mean
             cov = dq.T @ (block.weights[:, None] * dq)
             states.append((Zq, Zu, cov))
@@ -453,15 +894,23 @@ class ACKS2:
             ubar[block.atoms] = block.weights @ Zu
         qbar[env], ubar[env] = q_env, u_env
 
-        # The bare kernel over every pair: W = E[q q^T] / 2.
-        W = np.outer(qbar, qbar)
-        for block, (_, _, cov) in zip(blocks, states):
+        # The bare kernel over every pair: W = E[q q^T] / 2.  A covariance is
+        # a weighted sum of outer products, so `W = F F^T` with one column for
+        # the mean and one per state of each block -- which the kernel's
+        # reciprocal half contracts at a cost of `n` per column rather than `n^2`.
+        columns = [qbar[:, None]]
+        for block, (Zq, _, _) in zip(blocks, states):
             R = np.zeros((n, len(block.atoms)))
             R[env] = -block.Gq
             R[block.atoms] = np.eye(len(block.atoms))
-            W += R @ cov @ R.T
-        W *= 0.5
-        dS_dr, dS_de = self.kernel.contract(W)
+            root = np.sqrt(np.maximum(block.weights, 0.0))  # a -1e-17 is a 0
+            columns.append(R @ ((Zq - block.mean).T * root))
+        factor = np.sqrt(0.5) * np.hstack(columns)
+        if self.K is None:
+            dS_dr, dS_de = self.kernel.contract(None, factor)
+        else:
+            W = factor @ factor.T
+            dS_dr, dS_de = self.kernel.contract(W, factor)
         forces = -dS_dr
         virial = dS_de.copy()
 
@@ -509,7 +958,9 @@ class ACKS2:
         -- a polarizability, a response -- rather than the energy.
         """
         self.prepare(pos, pbc, cell, term_dict)
-        return self._piece(np.arange(len(self.act)), term_dict).system(self.K)
+        if self.K is None:
+            self._direct("`linear_system` returns the matrix")
+        return self._piece(np.arange(len(self.act)), term_dict).full_system(self.K)
 
     def __call__(
         self, pos, pbc, cell, term_dict: dict

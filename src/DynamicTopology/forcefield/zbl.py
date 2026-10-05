@@ -168,6 +168,7 @@ between this module and its own literature.
 import numpy as np
 
 from DynamicTopology.forcefield.params import ForceFieldParams, resolve
+from DynamicTopology.forcefield.pointcharge import pair_gradients, subset
 
 
 # Screening length prefactor, `0.8854 * a_0`, in Angstrom.
@@ -177,6 +178,10 @@ SCREENING_LENGTH: float = 0.46850
 PHI_C: tuple[float, ...] = (0.18175, 0.50986, 0.28022, 0.02817)
 PHI_B: tuple[float, ...] = (3.19980, 0.94229, 0.40290, 0.20162)
 
+
+# How many `taper_width`s past `taper_radius` a pair still enters the sum.  The
+# taper is `e^-45 = 3e-20` there; see `ZBL.__call__`.
+TAPER_TAIL: float = 45.0
 
 # `TAPER_RADIUS`, `TAPER_WIDTH` and the Coulomb constant this module used to
 # declare are now fields of `params.ForceFieldParams` -- `taper_radius`,
@@ -198,9 +203,10 @@ def taper(
 
     The exponent is clipped before `np.exp` sees it.  Without that, an r far
     outside the window overflows to `inf` and the `f (1 - f)` product becomes
-    `0 * inf = nan` in the derivative -- at 8 A the exponent is already 54, and
-    `ZBL.__call__` evaluates every pair in the box including ones half a cell
-    apart.  Clipping at 500 is far outside anything the switch resolves and
+    `0 * inf = nan` in the derivative -- at 8 A the exponent is already 54.
+    `ZBL.__call__` stops at `TAPER_TAIL` (45) widths, but other callers --
+    fast-forces' fits among them -- pass any distance.  Clipping at 500 is far
+    outside anything the switch resolves and
     keeps `f` exactly 0 or 1 there, which is what the analytic limit is anyway.
     """
     ff = resolve(params)
@@ -274,37 +280,31 @@ class ZBL:
         numbers: np.ndarray,
         pbc: np.ndarray,
         cell: np.ndarray,
+        displacements=None,
     ) -> tuple[float, np.ndarray, np.ndarray]:
-        vecs = pos[:, None, :] - pos[None, :, :]
-        if np.any(pbc):
-            f = vecs @ np.linalg.inv(cell)
-            vecs = vecs - (pbc * np.floor(f + 0.5)) @ cell
+        """Energy, forces and virial; `displacements` is `pointcharge.geometry`
+        over every atom, if the caller already has it."""
+        vecs, rij = subset(displacements, np.arange(len(pos)), pos, pbc, cell)
 
-        rij = np.sqrt(np.sum(vecs * vecs, -1))
-        diag = np.diag_indices(len(pos))
-        r = rij.copy()
-        r[diag] = 1.0  # excluded below; only keeps the division finite
-
+        # Only the pairs the taper has not yet taken below rounding.  Past
+        # `reach` it is under e^-45 (3e-20) times a bare ZBL already of order
+        # 1e-3 eV, so the pairs dropped carry nothing a sum of hundreds of eV
+        # could hold: the energy is the all-pairs sum to rounding, at a
+        # hundredth of the cost of evaluating every pair in a large box.
+        ff = resolve(None)
+        reach = ff.taper_radius + TAPER_TAIL * ff.taper_width
+        i, j = np.nonzero(np.triu(rij < reach, 1))
         z = np.asarray(numbers, dtype=float)
-        u, du_dr = pair_potential(r, z[:, None], z[None, :])
-        u[diag] = 0.0
-        du_dr[diag] = 0.0
+        u, du_dr = pair_potential(rij[i, j], z[i], z[j])
 
-        # The 0.5 cancels for the forces because both (i, j) and (j, i)
-        # contribute to dE/d(pos_i) -- the convention `ACKS2.compute_coulomb`
-        # and `LennardJones.__call__` both use.
-        energy = 0.5 * float(np.sum(u))
-        nij = vecs / r[:, :, None]
-        forces = -np.sum(du_dr[:, :, None] * nij, axis=1)
-
-        # Virial.  Under a homogeneous strain every minimum-image separation
-        # maps `v -> (I + e) v`, so `dr_ij/de_ab = v_a v_b / r` and
+        # Each pair once, so no 0.5 anywhere: the energy is the sum over
+        # `i < j`, and `pair_gradients` puts each pair's gradient on both atoms.
+        # Under a homogeneous strain every minimum-image separation maps
+        # `v -> (I + e) v`, so `dr_ij/de_ab = v_a v_b / r` and
         #
-        #     W_ab = dE/de_ab = 0.5 * sum_ij du_dr * v_a v_b / r
+        #     W_ab = dE/de_ab = sum_{i<j} du_dr * v_a v_b / r
         #
-        # The 0.5 is the energy's, not the force's: `W` differentiates `energy`
-        # directly, so the (i, j) / (j, i) double counting has to be halved here
-        # exactly as it is two lines above.  It does *not* cancel the way it does
-        # for the forces, because `v_a v_b` is even under swapping i and j.
-        virial = 0.5 * np.einsum("ij,ija,ijb->ab", du_dr / r, vecs, vecs)
+        # which is the virial `pair_gradients` returns.
+        energy = float(np.sum(u))
+        forces, virial = pair_gradients(i, j, du_dr, vecs, rij)
         return energy, forces, virial

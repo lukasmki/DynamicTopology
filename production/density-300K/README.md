@@ -91,6 +91,14 @@ uv run python production/density-300K/density.py production/density-300K/output 
     --equilibration 0
 ```
 
+Both launchers export `OMP_NUM_THREADS=OPENBLAS_NUM_THREADS=1`: each run is single-core work, and
+unpinned runs sharing a machine were 38x slower each.
+
+The 12-6 here is summed over every minimum-image pair, so its reach is the 12.4 A cell: the same
+water replicated 2x2x2 sits 3.6 meV per molecule lower, nearly all of it dispersion this box does not
+see.  `global_params.lj_cutoff` (a switched cutoff with a tail correction) removes that dependence;
+it is a change to the model and off by default -- see the top-level README.
+
 An index is the entire interface to a run, which keeps `submit.slurm` the only scheduler-specific
 file here. A job that hits the wall continues in place with `--restart`, which resumes whichever
 stage was in progress and does not redo a completed NVT stage.

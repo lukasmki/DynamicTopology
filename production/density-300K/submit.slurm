@@ -37,5 +37,11 @@ set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
 source .venv/bin/activate
+# One core per task, so one BLAS thread.  OpenBLAS sizes its pool from the CPU
+# mask Slurm hands it, which is already right here; stating it keeps a task on
+# one thread if `--cpus-per-task` is raised for memory rather than for speed.
+# A box large enough to thread (thousands of atoms) sets both to the core count.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 python production/density-300K/run_one.py \
     "${SLURM_ARRAY_TASK_ID}" "$@"

@@ -77,7 +77,9 @@ and as the `.jsonl` stores them.  q-force states them in nm and kJ/mol, and
 import networkx as nx
 import numpy as np
 
+from DynamicTopology.forcefield.ewald import contract_pairs
 from DynamicTopology.forcefield.params import ForceFieldParams, active, resolve
+from DynamicTopology.forcefield.pointcharge import pair_gradients, subset
 
 
 # `EXCLUSION_DEPTH`, `SWITCH_RADIUS` and `SWITCH_WIDTH` are now fields of
@@ -227,8 +229,15 @@ class LennardJones:
     """
 
     def __call__(
-        self, pos: np.ndarray, pbc: np.ndarray, cell: np.ndarray, term_dict: dict
+        self,
+        pos: np.ndarray,
+        pbc: np.ndarray,
+        cell: np.ndarray,
+        term_dict: dict,
+        displacements=None,
     ) -> tuple[float, np.ndarray, np.ndarray]:
+        """Energy, forces and virial; `displacements` is `pointcharge.geometry`
+        over every atom, if the caller already has it."""
         params = term_dict.get("lennardjones")
         if params is None:
             raise KeyError(
@@ -240,15 +249,12 @@ class LennardJones:
         sigma = params["kwargs"]["sigma"]
         eps = params["kwargs"]["eps"]
 
-        vecs = pos[:, None, :] - pos[None, :, :]
-        if np.any(pbc):
-            F = vecs @ np.linalg.inv(cell)
-            vecs = vecs - (pbc * np.floor(F + 0.5)) @ cell
-
         # Both axes in term order, so the parameter vectors line up with them.
-        sub = np.ix_(indices, indices)
-        vecs = vecs[sub]
-        rij = np.sqrt(np.sum(vecs * vecs, -1))
+        vecs, rij = subset(displacements, indices, pos, pbc, cell)
+
+        ff = active()
+        if ff.lj_cutoff is not None:
+            return self._cut(pos, pbc, cell, indices, sigma, eps, vecs, rij, ff)
 
         diag = np.diag_indices(len(indices))
         r = rij.copy()
@@ -261,17 +267,98 @@ class LennardJones:
         e[diag] = 0.0
         du_dr[diag] = 0.0
         e_tot = 0.5 * float(np.sum(e))
-        # The 0.5 above cancels because both (i, j) and (j, i) contribute to
-        # dE/d(pos_i), which is the same convention `ACKS2.compute_coulomb` uses.
-        nij = vecs / r[:, :, None]
-        f_tot = -np.sum(du_dr[:, :, None] * nij, axis=1)
+        # `E = sum_ij W_ij u(r_ij)` with `W = 1/2`, which is the form
+        # `contract_pairs` differentiates: it doubles the force for the (i, j) /
+        # (j, i) pair, cancelling the 0.5, and leaves the virial's -- even under
+        # the swap -- in place.  Under a homogeneous strain `v -> (I + e) v`,
+        # so `dr/de_ab = v_a v_b / r`, as `ZBL.__call__` has it.
+        dE_dr, virial = contract_pairs(0.5 * du_dr, vecs, r)
 
         forces = np.zeros_like(pos)
-        forces[indices] = f_tot
-
-        # Virial, exactly as `ZBL.__call__` builds it: under a homogeneous
-        # strain `v -> (I + e) v`, so `dr/de_ab = v_a v_b / r`.  The 0.5 is the
-        # energy's and does *not* cancel here -- `v_a v_b` is even under swapping
-        # i and j, unlike the force's `nij`.
-        virial = 0.5 * np.einsum("ij,ija,ijb->ab", du_dr / r, vecs, vecs)
+        forces[indices] = -dE_dr
         return e_tot, forces, virial
+
+    def _cut(self, pos, pbc, cell, indices, sigma, eps, vecs, rij, ff):
+        """The 12-6 within `lj_cutoff`, switched off smoothly, plus its tail."""
+        rc = ff.lj_cutoff
+        ron = rc - ff.lj_cutoff_width
+        periodic = bool(np.all(pbc))
+        if np.any(pbc):
+            widths = 1.0 / np.linalg.norm(np.linalg.inv(np.asarray(cell)), axis=0)
+            if rc > 0.5 * widths[np.asarray(pbc, dtype=bool)].min() + 1e-12:
+                raise ValueError(
+                    f"lj_cutoff {rc} A exceeds half the cell's perpendicular "
+                    f"width ({0.5 * widths.min():.3f} A): the minimum image would "
+                    "miss pairs inside it"
+                )
+        i, j = np.nonzero(np.triu(rij < rc, 1))
+        r = rij[i, j]
+        u, du_dr = pair_potential(
+            r, np.sqrt(sigma[i] * sigma[j]), np.sqrt(eps[i] * eps[j])
+        )
+        s, ds_dr = cutoff_switch(r, ron, rc)
+        energy = float(np.sum(u * s))
+        f_pair, virial = pair_gradients(i, j, du_dr * s + u * ds_dr, vecs, rij)
+        forces = np.zeros_like(pos)
+        forces[indices] = f_pair
+        if periodic:
+            volume = abs(np.linalg.det(np.asarray(cell)))
+            tail = _tail(sigma, eps, ron, rc, ff) / volume
+            # `E_tail = T / V` and a strain scales `V` by `1 + tr e`.
+            energy += tail
+            virial = virial - tail * np.eye(3)
+        return energy, forces, virial
+
+
+def cutoff_switch(r: np.ndarray, ron: float, rc: float):
+    """CHARMM's energy switch, 1 inside `ron`, 0 at `rc`, and its derivative.
+
+    `S = (rc^2 - r^2)^2 (rc^2 + 2 r^2 - 3 ron^2) / (rc^2 - ron^2)^3` between
+    the two: continuous with its first derivative at both ends, so the energy
+    and the forces are.
+    """
+    r2 = r * r
+    denom = (rc * rc - ron * ron) ** 3
+    inner, outer = r <= ron, r >= rc
+    s = (rc * rc - r2) ** 2 * (rc * rc + 2 * r2 - 3 * ron * ron) / denom
+    ds = 12 * r * (rc * rc - r2) * (ron * ron - r2) / denom
+    return (
+        np.where(inner, 1.0, np.where(outer, 0.0, s)),
+        np.where(inner | outer, 0.0, ds),
+    )
+
+
+_TAILS: dict = {}
+
+
+def _tail(sigma, eps, ron, rc, ff) -> float:
+    """`V E_tail = 2 pi sum_ab N_a N_b int r^2 u_ab(r) (1 - S(r)) dr`.
+
+    The 12-6 a uniform fluid puts beyond the switch, over every ordered pair of
+    atoms, by type: the integrand is `pair_potential` itself, soft core and
+    all, so the correction is of the term evaluated rather than of the
+    textbook one.  Cached on the composition and the parameters, since a fixed
+    set of atoms in any cell has the same `T`.
+    """
+    types, counts = np.unique(np.stack([sigma, eps], axis=1), axis=0, return_counts=True)
+    key = (types.tobytes(), counts.tobytes(), ron, rc, ff)
+    if key not in _TAILS:
+        from scipy.integrate import quad
+
+        total = 0.0
+        for a, (sa, ea) in enumerate(types):
+            for b, (sb, eb) in enumerate(types):
+                sig, ep = np.sqrt(sa * sb), np.sqrt(ea * eb)
+                if sig == 0.0 or ep == 0.0:
+                    continue
+
+                def integrand(r, inside):
+                    u = pair_potential(np.array([r]), sig, ep, ff)[0][0]
+                    weight = 1.0 - cutoff_switch(np.array([r]), ron, rc)[0][0]
+                    return r * r * u * (weight if inside else 1.0)
+
+                inner = quad(integrand, ron, rc, args=(True,), epsabs=0, epsrel=1e-12)[0]
+                outer = quad(integrand, rc, np.inf, args=(False,), epsabs=0, epsrel=1e-12)[0]
+                total += counts[a] * counts[b] * (inner + outer)
+        _TAILS[key] = 2.0 * np.pi * total
+    return _TAILS[key]

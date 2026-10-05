@@ -81,7 +81,7 @@ import numpy as np
 from ase import units
 from scipy.special import erf
 
-from DynamicTopology.forcefield.ewald import Ewald, MinimumImage
+from DynamicTopology.forcefield.ewald import Ewald, EwaldOperatorSetup, MinimumImage
 from DynamicTopology.forcefield.params import active
 
 _NO_PAIRS: np.ndarray = np.zeros((0, 2), dtype=int)
@@ -105,7 +105,11 @@ def exclusion_pairs(term_dict: dict) -> np.ndarray:
 
 
 def geometry(pos, pbc, cell) -> tuple[np.ndarray, np.ndarray]:
-    """Minimum-image displacements `r_i - r_j`, `(n, n, 3)`, and their lengths."""
+    """Minimum-image displacements `r_i - r_j`, `(n, n, 3)`, and their lengths.
+
+    `System.calculate` builds this once per force call and hands it to every
+    pair term as `displacements`; at a thousand atoms each copy is 0.2 s.
+    """
     pbc = np.asarray(pbc, dtype=bool)
     vecs = pos[:, None, :] - pos[None, :, :]
     if np.any(pbc):
@@ -113,6 +117,23 @@ def geometry(pos, pbc, cell) -> tuple[np.ndarray, np.ndarray]:
         F = vecs @ np.linalg.inv(cell)
         vecs = vecs - (pbc * np.floor(F + 0.5)) @ cell
     return vecs, np.sqrt(np.sum(vecs * vecs, -1))
+
+
+def subset(displacements, atoms: np.ndarray, pos, pbc, cell):
+    """`geometry` over `atoms`, cut from `displacements` (every atom) if given.
+
+    The cut is skipped when `atoms` is every atom in order, which it is for
+    every dataset so far; otherwise it is a gather, still cheaper than the
+    minimum-image arithmetic it replaces.  Either way the numbers are the ones
+    `geometry(pos[atoms], ...)` computes, bit for bit.
+    """
+    if displacements is None:
+        return geometry(pos[atoms], pbc, cell)
+    vecs, rij = displacements
+    if len(atoms) == len(rij) and np.array_equal(atoms, np.arange(len(rij))):
+        return vecs, rij
+    sub = np.ix_(atoms, atoms)
+    return vecs[sub], rij[sub]
 
 
 class KernelCache:
@@ -128,12 +149,25 @@ class KernelCache:
     def __init__(self):
         self.ewald = None
         self.key = None
+        self.operator = None
+        self.operator_key = None
 
-    def get(self, pos, vecs, rij, pbc, cell):
+    def get(self, pos, vecs, rij, pbc, cell, operator: bool = False):
+        """The kernel at this geometry; `operator` asks for products only.
+
+        `operator` takes `ewald.EwaldOperatorSetup` -- a real-space cutoff and
+        PME, no `N x N` matrix -- under full periodicity, for the iterative
+        charge solve.
+        """
         if not np.all(pbc):
             return MinimumImage(rij, vecs)
         cell = np.asarray(cell, dtype=float)
         key = cell.tobytes()
+        if operator:
+            if self.operator is None or key != self.operator_key:
+                self.operator = EwaldOperatorSetup(cell)
+                self.operator_key = key
+            return self.operator.bind(pos, vecs, rij)
         if self.ewald is None or key != self.key:
             self.ewald = Ewald(cell)
             self.key = key
@@ -220,13 +254,14 @@ class PointCharge:
 
     # -- the geometry ---------------------------------------------------------
 
-    def prepare(self, pos, pbc, cell, term_dict: dict) -> None:
+    def prepare(self, pos, pbc, cell, term_dict: dict, displacements=None) -> None:
         """Build the kernel at this geometry and take the seed topology's charges.
 
         The seed's charges are the starting environment for every block, and
-        remain the charges of any atom no block claims.
+        remain the charges of any atom no block claims.  `displacements` is
+        `geometry(pos, pbc, cell)` if the caller already has it.
         """
-        vecs, rij = geometry(pos, pbc, cell)
+        vecs, rij = displacements or geometry(pos, pbc, cell)
 
         self.natoms = len(pos)
         # Every atom takes part, in global order; `act`/`local` are the index

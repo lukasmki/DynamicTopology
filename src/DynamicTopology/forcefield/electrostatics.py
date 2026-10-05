@@ -122,7 +122,11 @@ class ElectrostaticGap:
             local = ff.local[params["atoms"][:, 0]]
             keep = local >= 0
             self.q_seed[local[keep]] = np.asarray(values, dtype=float)[keep]
-        self.K = ff.kernel.matrix()
+        # `None` under the iterative charge solve, whose kernel is an operator:
+        # `energy` then takes the few columns a fragment needs.
+        self.K = getattr(ff, "K", None)
+        if self.K is None and not hasattr(ff.kernel, "matvec"):
+            self.K = ff.kernel.matrix()
         self.enabled = self._charged()
         self._parents: dict = {}
         self._fragment_cache: dict = {}
@@ -177,9 +181,13 @@ class ElectrostaticGap:
         M = self.ff.local[atoms]
         return M, [self._graph_charges(graph, atoms) for graph in (before, after)]
 
+    def trivial(self) -> bool:
+        """Is the gap zero for every channel, so `energy` need not see the graphs?"""
+        return self.ff is None or not self.enabled
+
     def energy(self, parent, before, after) -> float:
         """`E(child) - E(parent)` in eV; `before`/`after` are the fragment graphs."""
-        if self.ff is None or not self.enabled:
+        if self.trivial():
             return 0.0
         M, sides = self._fragments(before, after)
         if not any(np.any(q) for q, _ in sides):
@@ -187,8 +195,13 @@ class ElectrostaticGap:
         q_parent = self._parent(parent)
         rest = np.ones(len(q_parent), dtype=bool)
         rest[M] = False
-        phi = self.K[np.ix_(M, np.flatnonzero(rest))] @ q_parent[rest]
-        K_MM = self.K[np.ix_(M, M)]
+        if self.K is None:
+            columns = self.ff.kernel.columns(M)
+            phi = columns[rest].T @ q_parent[rest]
+            K_MM = columns[M]
+        else:
+            phi = self.K[np.ix_(M, np.flatnonzero(rest))] @ q_parent[rest]
+            K_MM = self.K[np.ix_(M, M)]
         gamma = active().gamma
         energies = []
         for q, pairs in sides:
@@ -217,8 +230,13 @@ class ElectrostaticGap:
             Q = q_parent.copy()
             Q[M] = q
             full.append(Q)
-        W = 0.5 * (np.outer(full[1], full[1]) - np.outer(full[0], full[0]))
-        dS_dr, dS_de = self.ff.kernel.contract(W)
+        if self.K is None:
+            # `W = 1/2 (Q1 Q1^T - Q0 Q0^T)`, as a signed factor.
+            factor = np.sqrt(0.5) * np.stack([full[1], full[0]], axis=1)
+            dS_dr, dS_de = self.ff.kernel.contract(None, factor, [1.0, -1.0])
+        else:
+            W = 0.5 * (np.outer(full[1], full[1]) - np.outer(full[0], full[0]))
+            dS_dr, dS_de = self.ff.kernel.contract(W)
         f_local, virial = -dS_dr, dS_de.copy()
         gamma = active().gamma
         # E(X) carries `-q_i q_j g` per excluded pair, and dE = E(child) - E(parent).

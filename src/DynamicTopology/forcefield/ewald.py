@@ -13,6 +13,10 @@ nearest-image pair term, so this module puts the two behind one interface and
     kernel.matrix()    -> `K`, the (n, n) kernel matrix
     kernel.contract(W) -> `(dS/dr_i, dS/de_ab)` for `S = sum_ij W_ij K_ij`
 
+`contract` also takes `factor`, an `(n, r)` array with `W = factor factor^T`,
+when the caller has one: the reciprocal half then costs `n r` per k rather
+than `n^2`, and ACKS2's `W` is the mean charges plus one column per state.
+
 `contract` is what makes the abstraction worth having.  Every caller that
 differentiates the kernel -- ACKS2 against the weight-averaged second moment of
 its states' charges, `PointCharge` against its own, the admission gate against
@@ -57,6 +61,8 @@ stays a nearest-image pair term and no periodic treatment is needed.
 """
 
 import numpy as np
+from scipy.linalg.blas import dsyrk
+from scipy.sparse import csr_matrix
 from scipy.special import erf
 
 from DynamicTopology.forcefield.params import ForceFieldParams, resolve
@@ -83,6 +89,12 @@ def _screened(rij, r, alpha):
     return k, dk
 
 
+def _weights(factor, signs=None):
+    """`W = F diag(signs) F^T`, for a kernel that needs the weight itself."""
+    signed = factor if signs is None else factor * np.asarray(signs)
+    return signed @ factor.T
+
+
 def contract_pairs(coeff, vecs, r):
     """`dS/dr_i` and `dS/de_ab` for a pair sum `S = sum_ij W_ij f(r_ij)`.
 
@@ -94,9 +106,12 @@ def contract_pairs(coeff, vecs, r):
     `v_a v_b` is even under the swap and so has nothing to cancel against --
     the same asymmetry `acks2.py` documents at length, kept in one place here.
     """
-    nij = vecs / r[:, :, None]
-    dS_dr = 2.0 * np.sum(coeff[:, :, None] * nij, axis=1)
-    dS_de = np.einsum("ij,ija,ijb->ab", coeff / r, vecs, vecs)
+    c = coeff / r
+    dS_dr = 2.0 * np.einsum("ij,ija->ia", c, vecs)
+    # `sum_ij c_ij v_a v_b` as one (3, n^2) x (n^2, 3) product: a fourth of the
+    # time of the three-operand einsum it replaces.
+    flat = vecs.reshape(-1, 3)
+    dS_de = (c.reshape(-1, 1) * flat).T @ flat
     return dS_dr, dS_de
 
 
@@ -121,7 +136,12 @@ class MinimumImage:
         self.gamma = resolve(params).gamma
 
     def matrix(self):
-        return _screened(self.rij, self.r, self.gamma)[0]
+        # `_screened` forms the derivative on its way to the kernel; keeping it
+        # spares `derivative` a second pass of `erf` and `exp` over every pair.
+        k, dk = _screened(self.rij, self.r, self.gamma)
+        if self._derivative is None:
+            self._derivative = dk
+        return k
 
     def derivative(self):
         """`dK_ij/dr_ij`, memoized for the same reason `matrix` is.
@@ -134,7 +154,13 @@ class MinimumImage:
             self._derivative = _screened(self.rij, self.r, self.gamma)[1]
         return self._derivative
 
-    def contract(self, W):
+    def columns(self, index) -> np.ndarray:
+        """`K[:, index]`."""
+        return self.matrix()[:, index]
+
+    def contract(self, W, factor=None, signs=None):
+        if W is None:
+            W = _weights(factor, signs)
         return contract_pairs(W * self.derivative(), self.vecs, self.r)
 
 
@@ -266,20 +292,42 @@ class EwaldKernel:
         for it once to build its linear system and once more for `dE/dQ`."""
         if self._matrix is None:
             setup = self.setup
-            short = (
-                _screened(self.rij, self.r, setup.gamma)[0]
-                - _screened(self.rij, self.r, setup.kappa)[0]
-            )
-            weighted_cos = self.cos * setup.weight
-            weighted_sin = self.sin * setup.weight
-            K = short + weighted_cos @ self.cos.T + weighted_sin @ self.sin.T
+            # Both screenings' derivatives come out of the same two passes, and
+            # `contract` wants exactly their difference; keeping it here spares
+            # it a second `erf` and `exp` over every pair.
+            k_gamma, dk_gamma = _screened(self.rij, self.r, setup.gamma)
+            k_kappa, dk_kappa = _screened(self.rij, self.r, setup.kappa)
+            short = k_gamma - k_kappa
+            if self._derivative is None:
+                self._derivative = dk_gamma - dk_kappa
+            del k_gamma, k_kappa, dk_gamma, dk_kappa
+            # The reciprocal half is `A A^T` with `A = [c sqrt(w), s sqrt(w)]`:
+            # one symmetric rank-k update, half the flops of the two products
+            # it replaces.  `dsyrk` fills one triangle; `A.T` with `trans=1` is
+            # the Fortran-ordered operand it wants, without a copy.
+            root = np.sqrt(setup.weight)
+            A = np.hstack([self.cos * root, self.sin * root])
+            upper = dsyrk(1.0, A.T, trans=1)
+            K = np.triu(upper)
+            K += np.triu(upper, 1).T
+            K += short
+            del upper, short, A
             K[np.diag_indices_from(K)] += setup.self_term
             K += setup.background
             self._matrix = K
         return self._matrix
 
-    def contract(self, W):
+    def columns(self, index) -> np.ndarray:
+        """`K[:, index]`."""
+        return self.matrix()[:, index]
+
+    def contract(self, W, factor=None, signs=None):
         """`dS/dr_i` and `dS/de_ab` for `S = sum_ij W_ij K_ij`, `W` symmetric.
+
+        `factor`, if given, is `F` with `W = F diag(signs) F^T` (signs all `+1`
+        by default), used for the reciprocal half; the real-space half is a
+        pair sum and needs `W` itself, which is formed from `factor` if `W` is
+        `None`.
 
         The reciprocal half is where this stops being a pair sum.  Its virial
         comes from the two ways a strain reaches it: the `1/V` prefactor, and
@@ -289,6 +337,8 @@ class EwaldKernel:
         no analogue of the real-space `v_a v_b` term appears.
         """
         setup = self.setup
+        if W is None:
+            W = _weights(factor, signs)
 
         if self._derivative is None:
             # Geometry only, and `ACKS2` contracts the kernel twice per force
@@ -301,8 +351,13 @@ class EwaldKernel:
             )
         dS_dr, dS_de = contract_pairs(W * self._derivative, self.vecs, self.r)
 
-        Wc = W @ self.cos
-        Ws = W @ self.sin
+        if factor is None:
+            Wc = W @ self.cos
+            Ws = W @ self.sin
+        else:
+            signed = factor if signs is None else factor * np.asarray(signs)
+            Wc = signed @ (factor.T @ self.cos)
+            Ws = signed @ (factor.T @ self.sin)
         # Per-k contribution to S, from  sum_ij W_ij cos(k . r_ij).
         Sk = setup.weight * (
             np.einsum("ik,ik->k", self.cos, Wc) + np.einsum("ik,ik->k", self.sin, Ws)
@@ -328,3 +383,116 @@ class EwaldKernel:
         # property the background was added to restore.
         dS_de = dS_de - np.eye(3) * (setup.background * W.sum())
         return dS_dr, dS_de
+
+
+class EwaldOperatorSetup:
+    """The periodic kernel as an operator: a real-space cutoff and PME.
+
+    `Ewald` chooses the smallest splitting the nearest image allows and sums
+    the reciprocal half directly, which is right for the dense matrix the
+    direct charge solve factors.  An iterative solve needs only products with
+    the kernel, so the balance moves: the real-space half is cut off at
+    `real_space_cutoff` (or half the cell, if that is shorter) and kept as a
+    sparse matrix over the pairs inside it, and `kappa` is whatever that
+    cutoff needs for `accuracy`; the reciprocal half, which then reaches
+    further, goes to `pme.PME`.  Neither ever forms an `N x N` array.
+    """
+
+    def __init__(self, cell, params: ForceFieldParams | None = None):
+        from DynamicTopology.forcefield.pme import PMESetup
+
+        ff = resolve(params)
+        self.gamma = ff.gamma
+        self.cell = np.asarray(cell, dtype=float)
+        self.volume = abs(np.linalg.det(self.cell))
+        recip = 2 * np.pi * np.linalg.inv(self.cell).T
+        half_width = 0.5 * (2 * np.pi / np.linalg.norm(recip, axis=1)).min()
+        self.cutoff = min(ff.real_space_cutoff, half_width)
+        span = np.sqrt(-np.log(ff.accuracy))
+        self.kappa = min(span / self.cutoff, self.gamma)
+        self.pme = PMESetup(self.cell, self.kappa, ff.accuracy)
+        self.self_term = -2 * self.kappa / np.sqrt(np.pi)
+        self.background = -np.pi / (self.kappa**2 * self.volume)
+        # `K_rec_ii`, the same for every atom: the influence summed over the
+        # whole mesh, B-spline correction removed.  For the preconditioner.
+        self.diagonal = float(
+            np.sum(self.pme.multiplicity * self.pme.G)
+            + self.self_term
+            + self.background
+        )
+
+    def bind(self, pos, vecs, rij):
+        return EwaldOperator(self, pos, vecs, rij)
+
+
+class EwaldOperator:
+    """The kernel at one geometry, as products rather than a matrix."""
+
+    def __init__(self, setup, pos, vecs, rij):
+        self.setup = setup
+        self.vecs = vecs
+        self.rij = rij
+        n = len(rij)
+        self.n = n
+        i, j = np.nonzero(np.triu(rij < setup.cutoff, 1))
+        r = rij[i, j]
+        k_gamma = erf(setup.gamma * r) / r
+        k_kappa = erf(setup.kappa * r) / r
+        self.i, self.j = i, j
+        self.short = k_gamma - k_kappa
+        self.dshort = (
+            (2 * setup.gamma / np.sqrt(np.pi)) * np.exp(-((setup.gamma * r) ** 2)) / r
+            - k_gamma / r
+        ) - (
+            (2 * setup.kappa / np.sqrt(np.pi)) * np.exp(-((setup.kappa * r) ** 2)) / r
+            - k_kappa / r
+        )
+        self.real = csr_matrix(
+            (np.concatenate([self.short, self.short]), (np.concatenate([i, j]), np.concatenate([j, i]))),
+            shape=(n, n),
+        )
+        self.pme = setup.pme.bind(pos)
+
+    def matrix(self):
+        raise RuntimeError(
+            "the iterative charge solver's kernel is an operator; it has no matrix"
+        )
+
+    def matvec(self, X: np.ndarray) -> np.ndarray:
+        """`K @ X`, for `X` a vector or `(n, r)` columns."""
+        setup = self.setup
+        out = self.real @ X + self.pme.potential(X) + setup.self_term * X
+        return out + setup.background * X.sum(axis=0)
+
+    def columns(self, index) -> np.ndarray:
+        """`K[:, index]`, one PME pass per column."""
+        index = np.atleast_1d(index)
+        E = np.zeros((self.n, len(index)))
+        E[index, np.arange(len(index))] = 1.0
+        return self.matvec(E)
+
+    def contract(self, W, factor=None, signs=None):
+        """`dS/dr_i`, `dS/de_ab` for `S = sum_ij W_ij K_ij`, `W = F diag(s) F^T`.
+
+        Needs `factor`: the reciprocal half is one PME pass per column, and the
+        real-space half reads `W` on the pairs inside the cutoff only.
+        """
+        if factor is None:
+            raise ValueError("EwaldOperator.contract needs the weight as a factor")
+        setup = self.setup
+        signs = np.ones(factor.shape[1]) if signs is None else np.asarray(signs)
+        signed = factor * signs
+        i, j = self.i, self.j
+        w_pairs = np.einsum("pc,pc->p", signed[i], factor[j])
+        # Each unordered pair is both (i, j) and (j, i) of the sum.
+        coeff = 2.0 * w_pairs * self.dshort / self.rij[i, j]
+        v = self.vecs[i, j]
+        grad = coeff[:, None] * v
+        dS_dr = np.zeros((self.n, 3))
+        np.add.at(dS_dr, i, grad)
+        np.add.at(dS_dr, j, -grad)
+        dS_de = (coeff[:, None] * v).T @ v
+        _, rec_r, rec_e = self.pme.contract(factor, signs)
+        total_weight = float(np.sum(signs * factor.sum(axis=0) ** 2))
+        dS_de = dS_de + rec_e - np.eye(3) * (setup.background * total_weight)
+        return dS_dr + rec_r, dS_de

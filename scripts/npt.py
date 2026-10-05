@@ -26,6 +26,27 @@ off its output.  `ase.md.npt.NPT` (Melchionna/MTK) is the rigorous alternative
 and would need an upper-triangular cell and its own Nose-Hoover thermostat.
 """
 
+# One BLAS/OpenMP thread per run unless the environment says otherwise, set
+# before numpy loads, which is when OpenBLAS sizes its pool.  A force call on a
+# ~200-atom box is far too small to thread: it is bookkeeping plus a few
+# hundred-square matrices, and OpenBLAS's default is a thread per CPU it can see
+# -- two pools of them, numpy's and scipy's.  Measured on a 64-CPU slice of a
+# Perlmutter Milan node, 192-atom water, s/call:
+#
+#     threads           1      2      4      8      16     32     unset
+#     one run          0.110  0.101  0.095  0.103  0.103  0.126  0.225
+#     four at once     0.111                                      4.2
+#
+# "Four at once" is `run_all_local.sh 4`, or any allocation several runs share:
+# unpinned, each starts 63+63 threads and the four spend their time
+# descheduling one another -- 38x slower.  A large box can still ask for more,
+# e.g. `OPENBLAS_NUM_THREADS=8`; see the README's performance notes.
+import os
+
+for _variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_variable, "1")
+
+
 import json
 from argparse import ArgumentParser
 from pathlib import Path

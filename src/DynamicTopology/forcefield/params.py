@@ -80,6 +80,21 @@ class ForceFieldParams:
     # whatever `c` is.
     soft_core: float = 0.01
 
+    # A spherical cutoff for the 12-6, in Angstrom, or `None` for none.  With
+    # `None` -- the default, and what every dataset was fitted with -- the
+    # 12-6 is summed over every minimum-image pair in the cell, so its reach
+    # is the cell's own shape: half a cell along an axis, more toward a corner.
+    # A cutoff switches each pair smoothly to zero over the last
+    # `lj_cutoff_width` before it and, under full periodicity, adds the
+    # uniform-density tail correction for what lies beyond, so the energy no
+    # longer depends on the cell's shape and costs `O(N)` pairs rather than
+    # `O(N^2)`.  It must not exceed half the cell's shortest perpendicular
+    # width.  Not a rounding change: it moves the energy by the dispersion of
+    # the pairs the minimum image happened to include past the cutoff, less the
+    # tail correction's estimate of them.  See `lj.LennardJones`.
+    lj_cutoff: float | None = None
+    lj_cutoff_width: float = 1.0
+
     # --- the intramolecular exclusions (`exclusions`) ----------------------
 
     # How far along the bond graph the nonbonded interactions are excluded, in
@@ -121,6 +136,23 @@ class ForceFieldParams:
     # template (every dataset template carries `pbc="F F F"`).
     accuracy: float = 1e-8
 
+    # How ACKS2 solves for the charges.  `"direct"` -- the default, and what
+    # every dataset was fitted with -- forms the periodic kernel as a dense
+    # matrix (`ewald.Ewald`) and LU-factors the system: exact, `O(N^2)` memory
+    # and `O(N^3)` time.  `"iterative"` keeps the kernel as an operator -- a
+    # real-space cutoff and particle-mesh Ewald (`ewald.EwaldOperatorSetup`)
+    # -- and solves with preconditioned conjugate gradients to
+    # `solver_tolerance`; it needs full periodicity, and any call it cannot
+    # take (a molecule kept explicit in the solve) falls back to the direct
+    # path.  Not a rounding change: PME and the residual each move the forces
+    # by up to ~1e-6 of their size.  See `acks2.ACKS2`.
+    charge_solver: str = "direct"
+
+    # The iterative solver's real-space cutoff, in Angstrom (shortened to half
+    # the cell where that is less), and its relative residual.
+    real_space_cutoff: float = 9.0
+    solver_tolerance: float = 1e-10
+
     # Coulomb constant in eV*Angstrom, as `ACKS2` carries it.
     ccoul: float = 14.4
 
@@ -144,6 +176,11 @@ class ForceFieldParams:
             )
         object.__setattr__(self, "exclusion_depth", int(self.exclusion_depth))
         object.__setattr__(self, "exclude_coulomb", bool(self.exclude_coulomb))
+        if self.charge_solver not in ("direct", "iterative"):
+            raise ValueError(
+                "charge_solver must be 'direct' or 'iterative', "
+                f"got {self.charge_solver!r}"
+            )
         if self.electrostatics not in ELECTROSTATICS:
             raise ValueError(
                 f"electrostatics must be one of {sorted(ELECTROSTATICS)}, "
@@ -152,12 +189,26 @@ class ForceFieldParams:
         # Every other field is a float; coerce by exclusion rather than an
         # inclusion list, so a new float field needs no update here.
         for f in fields(self):
-            if f.name in ("exclusion_depth", "exclude_coulomb", "electrostatics"):
+            if f.name in (
+                "exclusion_depth",
+                "exclude_coulomb",
+                "electrostatics",
+                "charge_solver",
+            ):
+                continue
+            if f.name == "lj_cutoff" and self.lj_cutoff is None:
                 continue
             object.__setattr__(self, f.name, float(getattr(self, f.name)))
         for name in ("taper_width", "switch_width", "gamma", "accuracy"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be > 0, got {getattr(self, name)}")
+        if self.lj_cutoff is not None and not (
+            0.0 < self.lj_cutoff_width < self.lj_cutoff
+        ):
+            raise ValueError(
+                f"lj_cutoff_width must lie in (0, lj_cutoff), got "
+                f"{self.lj_cutoff_width} with lj_cutoff {self.lj_cutoff}"
+            )
         if self.soft_core < 0.0:
             # A negative `c` puts a pole at `r = (-c)**(1/6) sigma`.
             raise ValueError(f"soft_core must be >= 0, got {self.soft_core}")

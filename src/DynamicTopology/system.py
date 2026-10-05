@@ -15,6 +15,7 @@ from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.electrostatics import Electrostatics, ElectrostaticGap
 from DynamicTopology.forcefield.lj import LennardJones
+from DynamicTopology.forcefield.pointcharge import geometry
 from DynamicTopology.forcefield.zbl import ZBL
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -117,9 +118,12 @@ class System:
         # The electrostatic kernel first: the admission gate screens on the
         # electrostatic gap as well as the bonded one, so the closure needs it.
         nonbonded = self.nonbonded_ff
-        terms = self.reaction_set.get_terms(self.topology)
-        self.topology.set_terms(terms)
-        nonbonded.prepare(pos, pbc, cell, self.topology.term_dict)
+        self.reaction_set.assign_terms(self.topology)
+        # Every pair term's minimum-image displacements, built once.
+        displacements = geometry(pos, pbc, cell)
+        nonbonded.prepare(
+            pos, pbc, cell, self.topology.term_dict, displacements=displacements
+        )
         self.gap.bind(nonbonded, self.topology.term_dict)
 
         # Close the diabatic basis around the current geometry.  The result does
@@ -270,7 +274,9 @@ class System:
         # number for every diabatic state of every block, adding it once here
         # shifts each diagonal equally, which shifts the ground-state eigenvalue
         # by exactly that constant and leaves the eigenvectors alone.
-        en_zbl, fr_zbl, w_zbl = self.zbl_ff(pos, self.atoms.numbers, pbc, cell)
+        en_zbl, fr_zbl, w_zbl = self.zbl_ff(
+            pos, self.atoms.numbers, pbc, cell, displacements=displacements
+        )
         energy += en_zbl
         forces += fr_zbl
         virial += w_zbl
@@ -288,7 +294,9 @@ class System:
         # This is the term that supplies the intermolecular wall and the
         # dispersion.  ZBL's taper removed the first and the model never had the
         # second; see `production/density-300K/README.md`.
-        en_lj, fr_lj, w_lj = self.lj_ff(pos, pbc, cell, self.topology.term_dict)
+        en_lj, fr_lj, w_lj = self.lj_ff(
+            pos, pbc, cell, self.topology.term_dict, displacements=displacements
+        )
         energy += en_lj
         forces += fr_lj
         virial += w_lj

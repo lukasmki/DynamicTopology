@@ -51,6 +51,13 @@ frame of ``--output``), ``--minimize`` and the basis controls
 ``--bimol-cutoff``, ``--eps``, ``--switch-width``, ``--max-states`` and
 ``--max-depth``.
 
+Both MD scripts set ``OMP_NUM_THREADS`` and ``OPENBLAS_NUM_THREADS`` to 1
+unless they are already set. A box of a few hundred atoms is single-core work,
+and left to their defaults numpy's and scipy's OpenBLAS each start a thread per
+visible CPU: four runs sharing 32 cores were 38× slower each. For a box of
+thousands of atoms, set them yourself (``OPENBLAS_NUM_THREADS=8``); see the
+README's *Running on a CPU node*.
+
 ``npt.py``: reactive Berendsen NPT
 ----------------------------------
 

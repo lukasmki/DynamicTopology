@@ -50,7 +50,9 @@ own last frame, which now carries the bonding the run had reached rather than re
 ## Cost
 
 ~202 ms per force call at 200 atoms, so 200,000 steps is **~11 hours per run** and ~280 core-hours for
-the sweep. The 25 runs are independent and single-threaded; parallelism comes from the array, and a
+the sweep. The 25 runs are independent and single-threaded (`submit.slurm` and `run_all_local.sh`
+export `OMP_NUM_THREADS=OPENBLAS_NUM_THREADS=1`, so runs sharing a machine do not fight over its
+cores); parallelism comes from the array, and a
 run now fits inside the 48 h wall on its own.
 
 This used to be ~10 days per run and ~250 days across the sweep. The entire difference is the

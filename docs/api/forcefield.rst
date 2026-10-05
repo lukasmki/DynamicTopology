@@ -36,6 +36,8 @@ Electrostatics
 
 .. automodule:: DynamicTopology.forcefield.ewald
 
+.. automodule:: DynamicTopology.forcefield.pme
+
 Repulsion and dispersion
 ------------------------
 

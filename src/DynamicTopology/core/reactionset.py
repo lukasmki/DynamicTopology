@@ -231,6 +231,9 @@ class ReactionSet:
         dataset would otherwise answer from the previous one's templates.
         """
         self._term_cache: dict[tuple[tuple, tuple], list] = {}
+        # `_term_cache`'s lists, vectorized as `Topology.set_terms` would; see
+        # `assign_terms`.
+        self._vector_cache: dict[tuple[tuple, tuple], dict] = {}
         self._bimol_hash_cache: dict[frozenset, str] = {}
         # Keyed by molecule signature rather than held on the Topology, because
         # `Topology._hash` only ever caches within one object and these objects
@@ -309,6 +312,39 @@ class ReactionSet:
         # Sorted tuples rather than frozensets: the signature is derived
         # thousands of times per force call and tuple construction is markedly
         # cheaper, while sorting makes it just as canonical.
+        #
+        # Nearly every molecule here is an induced subgraph *view* of a block,
+        # and reading one through networkx's filtered views costs a filter test
+        # per node and per adjacency entry -- 1.7 s of a 4.6 s force call on a
+        # hot 3000 K box.  The same two sorted tuples come straight out of the
+        # underlying graph's dicts: the output is sorted, so the order they are
+        # visited in cannot show, and each edge is taken once as `u <= v`,
+        # which is what `tuple(sorted(edge))` makes of it -- a self-loop
+        # included once, as `edges()` lists it.  Anything else -- an
+        # edge-filtered view -- takes the general path below.
+        graph = molecule.graph
+        base = getattr(graph, "_graph", None)
+        if base is None:
+            base, members = graph, graph._node
+        elif getattr(graph, "_EDGE_OK", None) is nx.filters.no_filter and hasattr(
+            graph._NODE_OK, "nodes"
+        ):
+            members = graph._NODE_OK.nodes.intersection(base._node)
+        else:
+            base = None
+        if base is not None:
+            node_data, adjacency = base._node, base._adj
+            return (
+                tuple(sorted((n, node_data[n].get("atomic_number")) for n in members)),
+                tuple(
+                    sorted(
+                        (u, v)
+                        for u in members
+                        for v in adjacency[u]
+                        if u <= v and v in members
+                    )
+                ),
+            )
         return (
             tuple(
                 sorted(
@@ -419,6 +455,7 @@ class ReactionSet:
         """
         self.data.molecules[molecule_hash].terms = terms
         self._term_cache.clear()
+        self._vector_cache.clear()
 
     def get_terms(self, topology: Topology) -> list[Term]:
         """Force field terms for `topology`, remapped onto its global indices."""
@@ -521,6 +558,188 @@ class ReactionSet:
 
         return np.sqrt(out)
 
+    def _pair_channels(self, isig, jsig, imol, jmol) -> list[tuple[Reaction, dict]]:
+        """The channels of two molecules together, by their merged signature.
+
+        `imol` and `jmol` are the molecules, or zero-argument callables that
+        build them: they are needed only on a cache miss.
+        """
+        combined_signature = (
+            tuple(sorted(isig[0] + jsig[0])),
+            tuple(sorted(isig[1] + jsig[1])),
+        )
+        channels = self._channel_cache.get(combined_signature)
+        if channels is None:
+            imol = imol() if callable(imol) else imol
+            jmol = jmol() if callable(jmol) else jmol
+            # cache the combined hash to avoid a repeated WL hash
+            pair_key = frozenset({self.hash_molecule(imol), self.hash_molecule(jmol)})
+            ijmol = Topology.from_molecules([imol, jmol], False)
+            combined_hash = self._bimol_hash_cache.get(pair_key)
+            if combined_hash is None:
+                combined_hash = self.hash_molecule(ijmol)
+                self._bimol_hash_cache[pair_key] = combined_hash
+            channels = self._reaction_channels(ijmol, combined_hash)
+        return channels
+
+    def state_channels(
+        self, topology: Topology, bimol_cutoff: float, distsq: np.ndarray, row: dict
+    ) -> list[tuple[Reaction, dict]] | None:
+        """`get_network(topology, bimol_cutoff).reactions()`, without the network.
+
+        The same `(reaction, mapping)` pairs in the same order, which matters:
+        `EVBBasis._close` admits states in the order their channels are found,
+        and where a block reaches its state cap that order decides which ones.
+        `MultiGraph.edges()` lists, for each molecule `n` in turn, the self-loops
+        `get_network` added for it and then its edges to every later molecule
+        `k > n`, ascending -- the adjacency order `get_network`'s insertion
+        leaves -- so this walks the molecules in that order instead of building
+        the graph, which with its per-molecule subgraph views was most of a
+        state's cost.
+
+        `distsq` holds squared minimum-image distances between atoms, row
+        `row[node]` per atom: the caller builds it once per block, where
+        `get_network` redid the minimum-image arithmetic for every state.
+        Returns `None` for a topology over a graph view, which takes the
+        general path.
+        """
+        graph = topology.graph
+        if getattr(graph, "_graph", None) is not None:
+            return None
+        components, nodes, signatures = self._components(topology)
+
+        def molecule(i):
+            return lambda: Topology(graph=graph.subgraph(components[i]))
+
+        order = [row[n] for group in nodes for n in group]
+        starts = np.cumsum([0] + [len(group) for group in nodes[:-1]])
+        block = distsq[np.ix_(order, order)]
+        reduced = np.minimum.reduceat(np.minimum.reduceat(block, starts, axis=1), starts, axis=0)
+        separation = np.sqrt(reduced)
+
+        # The pairs `get_network` keeps, `(n, k)` with `k > n`, row-major: the
+        # order its adjacency is walked in.  `not (separation > cutoff)` is its
+        # own test, spelled out.
+        close = np.triu(~(separation.T > bimol_cutoff), 1)
+        partners = [[] for _ in nodes]
+        for n, k in zip(*np.nonzero(close)):
+            partners[n].append(int(k))
+
+        found = []
+        for n in range(len(nodes)):
+            single = self._channel_cache.get(signatures[n])
+            if single is None:
+                single = self._reaction_channels(molecule(n)())
+            found.extend(single)
+            for k in partners[n]:
+                found.extend(
+                    self._pair_channels(
+                        signatures[k], signatures[n], molecule(k), molecule(n)
+                    )
+                )
+        return found
+
+    @staticmethod
+    def _components(topology: Topology) -> tuple[list, list, list]:
+        """A plain-graph topology's molecules: node sets, sorted nodes, signatures.
+
+        In `topology.molecules()` order, with each signature the one
+        `_molecule_signature` gives that molecule.  Memoized on the topology
+        against the identity of its `_molecules` list, which `Topology` drops
+        whenever its graph or atoms change.
+        """
+        graph = topology.graph
+        components = topology._molecules
+        if components is None:
+            components = topology._molecules = list(nx.connected_components(graph))
+        memo = getattr(topology, "_signatures", None)
+        if memo is not None and memo[0] is components:
+            return components, memo[1], memo[2]
+        node_data, adjacency = graph._node, graph._adj
+        nodes, signatures = [], []
+        for members in components:
+            ordered = sorted(members)
+            nodes.append(ordered)
+            # `_molecule_signature`'s fast path, on the plain graph.
+            signatures.append(
+                (
+                    tuple((n, node_data[n].get("atomic_number")) for n in ordered),
+                    tuple(
+                        sorted(
+                            (u, v)
+                            for u in members
+                            for v in adjacency[u]
+                            if u <= v and v in members
+                        )
+                    ),
+                )
+            )
+        topology._signatures = (components, nodes, signatures)
+        return components, nodes, signatures
+
+    def assign_terms(self, topology: Topology) -> dict:
+        """`topology.set_terms(self.get_terms(topology))`, assembled per molecule.
+
+        Terms are per molecule and `set_terms` groups them by type in the order
+        they come, so its arrays are each molecule's own, concatenated in
+        molecule order -- and each molecule's are cached by signature, vectorized
+        once, where `set_terms` re-vectorized a whole block term by term for
+        every admitted state.  Every type, key and column comes out in the
+        order `set_terms` gives it, so the arrays are the same.  Anything
+        unusual -- a graph view, molecules that disagree about a type's
+        parameters -- takes `set_terms`, which also raises for the latter.
+        """
+        graph = topology.graph
+        if getattr(graph, "_graph", None) is not None:
+            return topology.set_terms(self.get_terms(topology))
+        components, _, signatures = self._components(topology)
+        terms: list = []
+        pieces: list[dict] = []
+        for members, signature in zip(components, signatures):
+            listed = self._term_cache.get(signature)
+            if listed is None:
+                listed = self.get_terms_topology(
+                    Topology(graph=graph.subgraph(members))
+                )
+            terms.extend(listed)
+            vector = self._vector_cache.get(signature)
+            if vector is None:
+                vector = Topology(nx.Graph()).set_terms(listed)
+                self._vector_cache[signature] = vector
+            pieces.append(vector)
+
+        term_dict: dict = {}
+        for piece in pieces:
+            for term_type, block in piece.items():
+                term_dict.setdefault(term_type, []).append(block)
+        merged = {}
+        for term_type, blocks in term_dict.items():
+            # Keyed by name, as `set_terms` appends them, so only a molecule
+            # stating a different set of parameters is a disagreement.
+            keys = list(blocks[0]["kwargs"])
+            if any(set(block["kwargs"]) != set(keys) for block in blocks[1:]):
+                return topology.set_terms(terms)
+            merged[term_type] = {
+                "atoms": np.concatenate([block["atoms"] for block in blocks]),
+                "kwargs": {
+                    key: np.concatenate([block["kwargs"][key] for block in blocks])
+                    for key in keys
+                },
+            }
+        topology.terms = terms
+        topology.term_dict = merged
+        return merged
+
+    @staticmethod
+    def squared_separations(positions: np.ndarray, cell, pbc) -> np.ndarray:
+        """`(n, n)` squared minimum-image distances, as `_molecule_separations`
+        computes them before reducing over molecules."""
+        cell = np.asarray(cell)
+        dv = positions[:, None, :] - positions[None, :, :]
+        if np.any(pbc):
+            dv = dv - (pbc * np.floor(dv @ np.linalg.inv(cell) + 0.5)) @ cell
+        return np.sum(dv * dv, -1)
+
     def get_network(self, topology: Topology, bimol_cutoff=4.0) -> ReactionNetwork:
         graph = nx.MultiGraph()
 
@@ -560,25 +779,9 @@ class ReactionSet:
                 # it cost an `nx.union_all` and a fresh signature for every
                 # neighbouring pair on every force call, for an answer already
                 # in the cache.
-                isig, jsig = signatures[i], signatures[j]
-                combined_signature = (
-                    tuple(sorted(isig[0] + jsig[0])),
-                    tuple(sorted(isig[1] + jsig[1])),
+                channels = self._pair_channels(
+                    signatures[i], signatures[j], imol, mol_list[j]
                 )
-                channels = self._channel_cache.get(combined_signature)
-
-                if channels is None:
-                    jmol = mol_list[j]
-                    # cache the combined hash to avoid a repeated WL hash
-                    pair_key = frozenset(
-                        {self.hash_molecule(imol), self.hash_molecule(jmol)}
-                    )
-                    ijmol = Topology.from_molecules([imol, jmol], False)
-                    combined_hash = self._bimol_hash_cache.get(pair_key)
-                    if combined_hash is None:
-                        combined_hash = self.hash_molecule(ijmol)
-                        self._bimol_hash_cache[pair_key] = combined_hash
-                    channels = self._reaction_channels(ijmol, combined_hash)
 
                 # reindex reactions to global indices
                 for rxn, mol_map in channels:

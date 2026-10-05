@@ -324,7 +324,7 @@ def test_the_collision_collapses_without_the_repulsion(reaction_set, monkeypatch
     monkeypatch.setattr(
         ZBL,
         "__call__",
-        lambda self, pos, numbers, pbc, cell: (
+        lambda self, pos, numbers, pbc, cell, displacements=None: (
             0.0,
             np.zeros_like(pos),
             np.zeros((3, 3)),
@@ -487,7 +487,7 @@ class TestTheReactiveWall:
         monkeypatch.setattr(
             ZBL,
             "__call__",
-            lambda self, pos, numbers, pbc, cell: (
+            lambda self, pos, numbers, pbc, cell, displacements=None: (
                 0.0,
                 np.zeros_like(pos),
                 np.zeros((3, 3)),

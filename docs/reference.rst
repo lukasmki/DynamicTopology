@@ -232,7 +232,8 @@ with
 3. Dispersion and contact: switched 12-6
 ----------------------------------------
 
-Summed over every pair (or within ``lj_cutoff``; see *Optional cutoff* below).
+Summed over every pair (or within ``lj_cutoff``, over the shared neighbour
+list; see *Optional cutoff* below and ``neighbor_radius`` in §7.2).
 Pair parameters are geometric means of the per-atom
 ones, :math:`\sigma_{ij} = \sqrt{\sigma_i\sigma_j}` and
 :math:`\varepsilon_{ij} = \sqrt{\varepsilon_i\varepsilon_j}`.
@@ -340,7 +341,8 @@ back to the nearest-image kernel.
 The direct solve uses the smallest :math:`\kappa` the nearest image allows and
 forms :math:`K` as a dense matrix. The iterative solve (``charge_solver =
 "iterative"``) never forms it: the real-space half is cut off at
-``real_space_cutoff`` (or half the cell) with :math:`\kappa` chosen for
+``real_space_cutoff`` (or half the cell), over the pairs of the shared neighbour
+list (§7.2), with :math:`\kappa` chosen for
 ``accuracy`` there, and the reciprocal half is applied by smooth particle-mesh
 Ewald (Essmann et al., 1995) with order-8 B-splines on a mesh resolving
 :math:`k` to :math:`2\kappa\sqrt{-\ln(\text{accuracy})}`. Products with
@@ -472,7 +474,10 @@ state :math:`s` are fixed by its bonding:
      - c_\text{coul} \sum_{(i,j) \in \text{excl}(s)} q_{s,i}\, q_{s,j}\, K^\text{direct}_{ij}
 
 The exclusion (§5.2) removes a molecule's own pairs from its bonded terms.
-There is no linear solve, and no response term.
+There is no linear solve, and no response term. Under ``charge_solver =
+"iterative"`` :math:`K` is the operator of §4.1 -- neighbour-list real space and
+PME -- instead of a dense matrix: nothing is solved, so only the kernel's
+lattice sum changes, by about :math:`10^{-8}` of the energy.
 
 4.4 Coupling between blocks
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -771,7 +776,8 @@ below apply wherever it does not.
    * - ``charge_solver``
      - ``"direct"``
      - —
-     - dense LU or PME + conjugate gradients (§4.1, §4.2)
+     - dense LU or PME + conjugate gradients (§4.1, §4.2); dense or PME
+       kernel for point charges (§4.3)
    * - ``real_space_cutoff``
      - 9.0
      - Å
@@ -788,6 +794,17 @@ below apply wherever it does not.
      - 1.0
      - Å
      - 12-6 cutoff switch width (§3)
+   * - ``neighbor_radius``
+     - ``None``
+     - Å
+     - radius of the neighbour list the pair terms share; ``None`` is the
+       widest cutoff in force (ZBL's reach, ``lj_cutoff``, the iterative
+       ``real_space_cutoff``), and a smaller value raises
+   * - ``neighbor_skin``
+     - 0.0
+     - Å
+     - added to ``neighbor_radius``; the list is kept across force calls until
+       an atom could have crossed it
    * - ``ccoul``
      - 14.4
      - eV·Å
@@ -801,9 +818,11 @@ below apply wherever it does not.
 precision. They are separate fields so that unifying them cannot silently move
 one of the two terms for a parameter set that is already fitted.
 
-Every parameter except ``accuracy``, ``charge_solver``, ``real_space_cutoff``
-and ``solver_tolerance`` enters :math:`E_\text{bonded} + E_\text{nonbonded}`,
-which the templates are fitted against, so changing one invalidates that
-dataset's fitted parameters. Those four only set how closely the lattice sum
-and the charge solve are converged; the iterative solver moves forces by about
-:math:`10^{-7}` eV/Å.
+Every parameter except ``accuracy``, ``charge_solver``, ``real_space_cutoff``,
+``solver_tolerance``, ``neighbor_radius`` and ``neighbor_skin`` enters
+:math:`E_\text{bonded} + E_\text{nonbonded}`, which the templates are fitted
+against, so changing one invalidates that dataset's fitted parameters. The first
+four only set how closely the lattice sum and the charge solve are converged;
+the iterative solver moves forces by about :math:`10^{-7}` eV/Å. The last two
+only set how the pairs inside each cutoff are found, never which pairs are
+summed, so they move energies by rounding alone.

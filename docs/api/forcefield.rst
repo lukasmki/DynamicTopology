@@ -25,6 +25,11 @@ EVB couplings
 
 .. automodule:: DynamicTopology.forcefield.coupling
 
+Pair geometry
+-------------
+
+.. automodule:: DynamicTopology.forcefield.neighbors
+
 Electrostatics
 --------------
 

@@ -92,13 +92,9 @@ from scipy.sparse import coo_matrix, csr_matrix
 from scipy.special import erf
 from scipy.sparse.csgraph import connected_components
 
+from DynamicTopology.forcefield.neighbors import as_geometry, pair_gradients
 from DynamicTopology.forcefield.params import active
-from DynamicTopology.forcefield.pointcharge import (
-    KernelCache,
-    direct_kernel,
-    pair_gradients,
-    subset,
-)
+from DynamicTopology.forcefield.pointcharge import KernelCache, direct_kernel
 
 logger = logging.getLogger(__name__)
 
@@ -158,15 +154,45 @@ def molecule_labels(term_dict: dict, atoms: np.ndarray) -> np.ndarray:
     return connected_components(graph, directed=False)[1]
 
 
+def molecule_pairs(mol: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Every pair `i < j` within one molecule, in row-major order.
+
+    The pairs `np.nonzero(np.triu(mol[:, None] == mol[None, :], 1))` lists, in
+    the same order, without the `n x n` comparison: one stack of molecules per
+    size, each its own `triu_indices`.
+    """
+    n = len(mol)
+    if n == 0:
+        return np.zeros(0, dtype=int), np.zeros(0, dtype=int)
+    order = np.argsort(mol, kind="stable")
+    counts = np.bincount(mol)
+    starts = np.cumsum(counts) - counts
+    pi, pj = [np.zeros(0, dtype=int)], [np.zeros(0, dtype=int)]
+    for k in np.unique(counts):
+        if k < 2:
+            continue
+        # Each row a molecule's atoms, ascending: `order` is a stable sort.
+        members = order[starts[np.flatnonzero(counts == k)][:, None] + np.arange(k)]
+        a, b = np.triu_indices(k, 1)
+        pi.append(members[:, a].ravel())
+        pj.append(members[:, b].ravel())
+    pi, pj = np.concatenate(pi), np.concatenate(pj)
+    row_major = np.lexsort((pj, pi))
+    return pi[row_major], pj[row_major]
+
+
 class _Piece:
     """One bonding pattern over a set of atoms: what its functional is built from.
 
     `atoms` are solver indices (ascending), `glob` the same atoms' global
     indices.  Pairs are stored once, `i < j`, and only within a molecule: those
-    are the only pairs the softness and the isolated-molecule reference act on.
+    are the only pairs the softness and the isolated-molecule reference act on,
+    and they are measured on `geometry` (a `neighbors.Geometry` in solver
+    order) pair by pair, so nothing here is `n x n` but the dense systems of
+    the direct solve.
     """
 
-    def __init__(self, atoms, glob, term_dict, rij, gamma, memo=None):
+    def __init__(self, atoms, glob, term_dict, geometry, gamma, memo=None):
         self.atoms = atoms
         self.n = n = len(atoms)
         params = atom_parameters(term_dict, glob)
@@ -186,9 +212,8 @@ class _Piece:
         self.mol = molecule_labels(term_dict, glob)
         self.nmol = int(self.mol.max()) + 1 if n else 0
 
-        same = np.triu(self.mol[:, None] == self.mol[None, :], 1)
-        self.pi, self.pj = np.nonzero(same)
-        r = rij[atoms[self.pi], atoms[self.pj]]
+        self.pi, self.pj = molecule_pairs(self.mol)
+        r = geometry.between(atoms[self.pi], atoms[self.pj])[1]
         self.g, self.dg = direct_kernel(r, gamma)
         tau = 0.5 * (decay[self.pi] + decay[self.pj])
         self.x = amp[self.pi] * amp[self.pj] * np.exp(-r / tau)
@@ -202,6 +227,29 @@ class _Piece:
         X[self.pi, self.pj] = self.x
         X[self.pj, self.pi] = self.x
         return X
+
+    def _stacked(self, members: np.ndarray, values: np.ndarray) -> np.ndarray:
+        """A pair quantity over molecules `members` (G, k), as `(G, k, k)`.
+
+        `values` is per pair (`self.pi`, `self.pj`); the result is what
+        indexing the symmetric `n x n` matrix of them, zero off-molecule and on
+        the diagonal, at `members[:, :, None], members[:, None, :]` gives --
+        without the matrix.
+        """
+        G, k = members.shape
+        out = np.zeros((G, k, k))
+        if G == 0 or k < 2:
+            return out
+        row = np.full(self.nmol, -1)
+        row[self.mol[members[:, 0]]] = np.arange(G)
+        rank = np.zeros(self.n, dtype=int)
+        rank[members] = np.arange(k)
+        g = row[self.mol[self.pi]]
+        mine = g >= 0
+        g, a, c = g[mine], rank[self.pi[mine]], rank[self.pj[mine]]
+        out[g, a, c] = values[mine]
+        out[g, c, a] = values[mine]
+        return out
 
     def _split(self, members: np.ndarray, kind: str):
         """`members` (G, k) as (keys, the rows the memo does not hold yet).
@@ -248,13 +296,6 @@ class _Piece:
         molecule -- every molecule near equilibrium -- is eliminated.
         """
         n = self.n
-        dense = {}
-
-        def softness():
-            if "X" not in dense:
-                dense["X"] = self._softness()
-            return dense["X"]
-
         explicit = np.zeros(n, dtype=bool)
         rows, cols, values = [np.zeros(0, int)], [np.zeros(0, int)], [np.zeros(0)]
         for members in self._molecules():
@@ -264,7 +305,7 @@ class _Piece:
             keys, missing = self._split(members, "gamma")
             if len(missing):
                 fresh = members[missing]
-                Xg = softness()[fresh[:, :, None], fresh[:, None, :]]
+                Xg = self._stacked(fresh, self.x)
                 at = np.arange(k)
                 L = Xg.copy()
                 L[:, at, at] -= Xg.sum(axis=2)
@@ -298,11 +339,14 @@ class _Piece:
         self._explicit = np.flatnonzero(explicit)
         mols, self._explicit_mol = np.unique(self.mol[self._explicit], return_inverse=True)
         self._nexplicit_mol = len(mols)
-        self._softness_explicit = (
-            softness()[np.ix_(self._explicit, self._explicit)]
-            if len(self._explicit)
-            else np.zeros((0, 0))
-        )
+        if len(self._explicit):
+            X = csr_matrix(
+                (np.concatenate([self.x, self.x]), (np.concatenate([self.pi, self.pj]), np.concatenate([self.pj, self.pi]))),
+                shape=(n, n),
+            )
+            self._softness_explicit = X[self._explicit][:, self._explicit].toarray()
+        else:
+            self._softness_explicit = np.zeros((0, 0))
 
     def potentials(self, x: np.ndarray, response: bool = False) -> np.ndarray:
         """The Kohn-Sham potentials `u` at a solution `x` of `system`.
@@ -396,23 +440,13 @@ class _Piece:
         q, u = np.zeros(n), np.zeros(n)
         if n == 0:
             return 0.0, q, u
-        dense = {}
-
-        def matrices():
-            if not dense:
-                K = np.zeros((n, n))
-                K[self.pi, self.pj] = self.g
-                K[self.pj, self.pi] = self.g
-                dense["K"], dense["X"] = K, self._softness()
-            return dense["K"], dense["X"]
-
         total = 0.0
         for members in self._molecules():  # (G, k)
             if self.memo is not None:
                 keys, missing = self._split(members, "isolated")
                 k = members.shape[1]
                 if len(missing):
-                    F, qs, us = self._isolated_stack(members[missing], *matrices())
+                    F, qs, us = self._isolated_stack(members[missing])
                     for i, f, qm, um in zip(missing, F, qs, us):
                         self.memo[keys[i]] = (f, qm, um)
                 # Summed molecule by molecule, so that a molecule's share does
@@ -424,15 +458,13 @@ class _Piece:
                     u[row] = um
                 continue
             G, k = members.shape
-            K, X = matrices()
-            sub = (members[:, :, None], members[:, None, :])
             dim = 2 * k + 2
             A = np.zeros((G, dim, dim))
             b = np.zeros((G, dim))
             at = np.arange(k)
-            A[:, :k, :k] = K[sub]
+            A[:, :k, :k] = self._stacked(members, self.g)
             A[:, at, at] += 2.0 * self.eta[members]
-            Xg = X[sub]
+            Xg = self._stacked(members, self.x)
             A[:, k : 2 * k, k : 2 * k] = Xg
             A[:, k + at, k + at] -= Xg.sum(axis=2)
             A[:, at, k + at] = A[:, k + at, at] = -1.0
@@ -447,17 +479,16 @@ class _Piece:
             u[members] = x[:, k : 2 * k]
         return total, q, u
 
-    def _isolated_stack(self, members, K, X):
+    def _isolated_stack(self, members):
         """`isolated`'s solve for one stack of equal-sized molecules, per molecule."""
         G, k = members.shape
-        sub = (members[:, :, None], members[:, None, :])
         dim = 2 * k + 2
         A = np.zeros((G, dim, dim))
         b = np.zeros((G, dim))
         at = np.arange(k)
-        A[:, :k, :k] = K[sub]
+        A[:, :k, :k] = self._stacked(members, self.g)
         A[:, at, at] += 2.0 * self.eta[members]
-        Xg = X[sub]
+        Xg = self._stacked(members, self.x)
         A[:, k : 2 * k, k : 2 * k] = Xg
         A[:, k + at, k + at] -= Xg.sum(axis=2)
         A[:, at, k + at] = A[:, k + at, at] = -1.0
@@ -552,7 +583,10 @@ class _EnvironmentSolver:
             if k == 1:
                 continue  # a lone atom's charge is fixed by its sum
             atoms = piece.atoms[members]
-            r = kernel.rij[atoms[:, :, None], atoms[:, None, :]]
+            _, r = self.acks2.geometry.between(
+                np.repeat(atoms, k, axis=1), np.tile(atoms, (1, k))
+            )
+            r = r.reshape(G, k, k)
             off = ~np.eye(k, dtype=bool)
             H = np.where(off, erf(gamma * np.where(off, r, 1.0)) / np.where(off, r, 1.0), 0.0)
             H = H + diagonal
@@ -689,8 +723,8 @@ class ACKS2:
     def prepare(self, pos, pbc, cell, term_dict: dict, displacements=None) -> None:
         """Build the kernel at this geometry and hold the seed topology's terms.
 
-        `displacements` is `geometry(pos, pbc, cell)` over every atom, if the
-        caller already has it.
+        `displacements` is the force call's `neighbors.Geometry` over every
+        atom, or `geometry(pos, pbc, cell)`, if the caller already has it.
         """
         block = term_dict.get("atom")
         if block is None:
@@ -699,13 +733,13 @@ class ACKS2:
         self.act = np.unique(block["atoms"][:, 0])
         self.local = np.full(len(pos), -1, dtype=int)
         self.local[self.act] = np.arange(len(self.act))
-        self.vecs, self.rij = subset(displacements, self.act, pos, pbc, cell)
+        self.geometry = as_geometry(displacements, pos, pbc, cell).subset(self.act)
         # The iterative solver keeps the kernel as an operator and `K` unset;
         # see `_EnvironmentSolver`.
         self.operator = bool(np.all(pbc)) and active().charge_solver == "iterative"
         self._where = (pos[self.act], pbc, cell)
         self.kernel = self.kernels.get(
-            pos[self.act], self.vecs, self.rij, pbc, cell, operator=self.operator
+            pos[self.act], self.geometry, pbc, cell, operator=self.operator
         )
         self.K = None if self.operator else self.kernel.matrix()
         self.seed = term_dict
@@ -717,11 +751,11 @@ class ACKS2:
         logger.info("ACKS2: direct charge solve for this call: %s", reason)
         pos, pbc, cell = self._where
         self.operator = False
-        self.kernel = self.kernels.get(pos, self.vecs, self.rij, pbc, cell)
+        self.kernel = self.kernels.get(pos, self.geometry, pbc, cell)
         self.K = self.kernel.matrix()
 
     def _piece(self, atoms: np.ndarray, term_dict: dict, memo=None) -> _Piece:
-        return _Piece(atoms, self.act[atoms], term_dict, self.rij, self.gamma, memo)
+        return _Piece(atoms, self.act[atoms], term_dict, self.geometry, self.gamma, memo)
 
     # -- the blocks -----------------------------------------------------------
 
@@ -935,12 +969,13 @@ class ACKS2:
                 pair_i.append(block.atoms[pi])
                 pair_j.append(block.atoms[pj])
                 pair_c.append(w * piece.pair_derivative(du * du, *iso[1:]))
+        pair_i, pair_j = np.concatenate(pair_i), np.concatenate(pair_j)
         f_pair, w_pair = pair_gradients(
-            np.concatenate(pair_i),
-            np.concatenate(pair_j),
+            pair_i,
+            pair_j,
             np.concatenate(pair_c),
-            self.vecs,
-            self.rij,
+            *self.geometry.between(pair_i, pair_j),
+            n,
         )
         forces += f_pair
         virial += w_pair

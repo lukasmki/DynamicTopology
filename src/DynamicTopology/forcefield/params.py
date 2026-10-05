@@ -87,8 +87,9 @@ class ForceFieldParams:
     # A cutoff switches each pair smoothly to zero over the last
     # `lj_cutoff_width` before it and, under full periodicity, adds the
     # uniform-density tail correction for what lies beyond, so the energy no
-    # longer depends on the cell's shape and costs `O(N)` pairs rather than
-    # `O(N^2)`.  It must not exceed half the cell's shortest perpendicular
+    # longer depends on the cell's shape and costs `O(N)` pairs, found by the
+    # neighbour list (`neighbors.Geometry`), rather than `O(N^2)`.  It must not
+    # exceed half the cell's shortest perpendicular
     # width.  Not a rounding change: it moves the energy by the dispersion of
     # the pairs the minimum image happened to include past the cutoff, less the
     # tail correction's estimate of them.  See `lj.LennardJones`.
@@ -140,18 +141,41 @@ class ForceFieldParams:
     # every dataset was fitted with -- forms the periodic kernel as a dense
     # matrix (`ewald.Ewald`) and LU-factors the system: exact, `O(N^2)` memory
     # and `O(N^3)` time.  `"iterative"` keeps the kernel as an operator -- a
-    # real-space cutoff and particle-mesh Ewald (`ewald.EwaldOperatorSetup`)
-    # -- and solves with preconditioned conjugate gradients to
-    # `solver_tolerance`; it needs full periodicity, and any call it cannot
-    # take (a molecule kept explicit in the solve) falls back to the direct
-    # path.  Not a rounding change: PME and the residual each move the forces
-    # by up to ~1e-6 of their size.  See `acks2.ACKS2`.
+    # real-space cutoff over the neighbour list and particle-mesh Ewald
+    # (`ewald.EwaldOperatorSetup`) -- and solves with preconditioned conjugate
+    # gradients to `solver_tolerance`; it needs full periodicity, and any call
+    # it cannot take (a molecule kept explicit in the solve) falls back to the
+    # direct path.  `PointCharge` has nothing to solve but takes the same
+    # operator under `"iterative"`, which makes it `O(N log N)` as well.  Not a
+    # rounding change: PME and the residual each move the forces by up to
+    # ~1e-6 of their size.  See `acks2.ACKS2` and `pointcharge.PointCharge`.
     charge_solver: str = "direct"
 
     # The iterative solver's real-space cutoff, in Angstrom (shortened to half
     # the cell where that is less), and its relative residual.
     real_space_cutoff: float = 9.0
     solver_tolerance: float = 1e-10
+
+    # --- the neighbour list (`neighbors`) -----------------------------------
+
+    # The radius of the neighbour list the pair terms share, in Angstrom.  It
+    # must cover every cutoff read from the list: ZBL's reach (`taper_radius +
+    # zbl.TAPER_TAIL * taper_width`, 6.9 A), `lj_cutoff`, and under the
+    # iterative solve its real-space cutoff (`real_space_cutoff`, or half the
+    # cell); a term asking for more raises.  `None` -- the default -- takes the
+    # largest of those in force.
+    #
+    # `neighbor_skin` is added to it: the list is searched at `neighbor_radius
+    # + neighbor_skin` and kept across force calls until an atom could have
+    # crossed the skin -- twice the largest displacement since the search, plus
+    # the cell's strain times the list's reach, exceeding the skin -- so most
+    # MD steps measure the listed pairs instead of searching.  Capped where the
+    # radius plus skin would pass half the cell.  Neither changes which pairs a
+    # term sums, only which are measured to find them, so neither is a model
+    # change: energies move by rounding, through the order of the sums.  The
+    # default skin of 0 searches every call.  See `neighbors.NeighborList`.
+    neighbor_radius: float | None = None
+    neighbor_skin: float = 0.0
 
     # Coulomb constant in eV*Angstrom, as `ACKS2` carries it.
     ccoul: float = 14.4
@@ -196,7 +220,7 @@ class ForceFieldParams:
                 "charge_solver",
             ):
                 continue
-            if f.name == "lj_cutoff" and self.lj_cutoff is None:
+            if f.name in ("lj_cutoff", "neighbor_radius") and getattr(self, f.name) is None:
                 continue
             object.__setattr__(self, f.name, float(getattr(self, f.name)))
         for name in ("taper_width", "switch_width", "gamma", "accuracy"):
@@ -209,6 +233,10 @@ class ForceFieldParams:
                 f"lj_cutoff_width must lie in (0, lj_cutoff), got "
                 f"{self.lj_cutoff_width} with lj_cutoff {self.lj_cutoff}"
             )
+        if self.neighbor_radius is not None and self.neighbor_radius <= 0.0:
+            raise ValueError(f"neighbor_radius must be > 0, got {self.neighbor_radius}")
+        if self.neighbor_skin < 0.0:
+            raise ValueError(f"neighbor_skin must be >= 0, got {self.neighbor_skin}")
         if self.soft_core < 0.0:
             # A negative `c` puts a pole at `r = (-c)**(1/6) sigma`.
             raise ValueError(f"soft_core must be >= 0, got {self.soft_core}")

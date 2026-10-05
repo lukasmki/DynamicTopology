@@ -102,4 +102,7 @@ width and the electrostatics model. Fields left out take the defaults in
 these before it reads a single template, and every force field reads them
 through :func:`~DynamicTopology.forcefield.params.active` at call time.
 Changing a value in a manifest invalidates that dataset's fitted ``.jsonl``
-files. Refit them with fast-forces afterwards.
+files. Refit them with fast-forces afterwards. The exceptions are the settings
+that only control how the energy is computed -- the lattice-sum ``accuracy``, the
+charge solver and its cutoff and tolerance, and the neighbour list's radius and
+skin; see :doc:`reference` §7.2.

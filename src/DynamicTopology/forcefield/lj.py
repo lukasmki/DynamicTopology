@@ -1,4 +1,4 @@
-"""Switched Lennard-Jones repulsion and dispersion, summed over every pair.
+"""Switched Lennard-Jones repulsion and dispersion, over every pair or a neighbour list.
 
 **What this term is for.**  `zbl.taper` cuts the screened-nuclear repulsion off
 at 1.5 A, which is what let the water dimer bind at all -- and left the model
@@ -90,9 +90,8 @@ from dataclasses import dataclass
 import networkx as nx
 import numpy as np
 
-from DynamicTopology.forcefield.ewald import contract_pairs
+from DynamicTopology.forcefield.neighbors import Pairs, as_geometry, pair_gradients
 from DynamicTopology.forcefield.params import ForceFieldParams, active, resolve
-from DynamicTopology.forcefield.pointcharge import geometry, pair_gradients, subset
 
 
 # `EXCLUSION_DEPTH`, `SWITCH_RADIUS` and `SWITCH_WIDTH` are now fields of
@@ -241,25 +240,31 @@ def global_params(term_dict: dict, natoms: int) -> tuple[np.ndarray, np.ndarray]
     return sigma, eps
 
 
-def _gradients(
-    e: np.ndarray, du_dr: np.ndarray, vecs: np.ndarray, r: np.ndarray
-) -> tuple[float, np.ndarray, np.ndarray]:
-    """Energy, forces and virial of a symmetric pair matrix.
+def _pair_energies(r, sig_i, eps_i, sig_j, eps_j, ff: ForceFieldParams):
+    """`(u, du/dr)` of pairs at `r`: `pair_potential`, cut off if `lj_cutoff` is set.
 
-    `e` and `du_dr` are over the same index space as `vecs` and `r`, and the
-    forces come back in that space too; `r` has its diagonal set to anything
-    nonzero, since `contract_pairs` divides by it.  `du_dr` has a zero
-    diagonal; `e` may carry an `r`-independent one, which only adds to the
-    energy.
+    Geometric combining of the two atoms' parameters; any shapes that
+    broadcast.  Under `lj_cutoff` the pair is switched off over its last
+    `lj_cutoff_width` by `cutoff_switch`.
     """
-    e_tot = 0.5 * float(np.sum(e))
-    # `E = sum_ij W_ij u(r_ij)` with `W = 1/2`, which is the form
-    # `contract_pairs` differentiates: it doubles the force for the (i, j) /
-    # (j, i) pair, cancelling the 0.5, and leaves the virial's -- even under
-    # the swap -- in place.  Under a homogeneous strain `v -> (I + e) v`,
-    # so `dr/de_ab = v_a v_b / r`, as `ZBL.__call__` has it.
-    dE_dr, virial = contract_pairs(0.5 * du_dr, vecs, r)
-    return e_tot, -dE_dr, virial
+    u, du_dr = pair_potential(r, np.sqrt(sig_i * sig_j), np.sqrt(eps_i * eps_j), ff)
+    if ff.lj_cutoff is not None:
+        rc = ff.lj_cutoff
+        s, ds_dr = cutoff_switch(r, rc - ff.lj_cutoff_width, rc)
+        u, du_dr = u * s, du_dr * s + u * ds_dr
+    return u, du_dr
+
+
+def _pair_list(geometry, ff: ForceFieldParams) -> Pairs:
+    """The pairs the 12-6 sums: inside `lj_cutoff`, or every pair without one."""
+    if ff.lj_cutoff is None:
+        return geometry.pairs(None)
+    _check_cutoff(ff.lj_cutoff, geometry.pbc, geometry.cell)
+    return geometry.pairs(ff.lj_cutoff)
+
+
+def _has_tail(ff: ForceFieldParams, pbc) -> bool:
+    return ff.lj_cutoff is not None and bool(np.all(pbc))
 
 
 @dataclass
@@ -271,18 +276,25 @@ class _Block:
     eps: np.ndarray  # (nstates, nb)
     weights: np.ndarray  # (nstates,)
     varies: bool
-    # Per state, the block's rows against every atom in the system, with the
-    # block's own columns at that state's parameters and every other column at
-    # the static ones; `(nstates, nb, natoms)`.  Computed on first use.
-    rows: tuple[np.ndarray, np.ndarray] | None = None
-    intra: np.ndarray | None = None  # (nstates,), eV
-    static_env: np.ndarray | None = None  # (nstates,), eV
-    # `rows`' share of the tail correction alone, if there is one.
+    # Computed on first use, for a varying block.  `touch` indexes the pairs
+    # with one atom in the block and the other static, `inner` those with both
+    # in the block; each one's `(u, du/dr)` per state, `(nstates, npairs)`,
+    # with the block's atoms at that state's parameters and every other atom
+    # at the static ones.
+    touch: np.ndarray | None = None
+    touch_u: np.ndarray | None = None
+    touch_du: np.ndarray | None = None
+    inner: np.ndarray | None = None
+    inner_u: np.ndarray | None = None
+    inner_du: np.ndarray | None = None
+    intra: np.ndarray | None = None  # (nstates,), eV, tail share included
+    static_env: np.ndarray | None = None  # (nstates,), eV, tail share included
+    # The tail correction's share of `intra + static_env`, if there is one.
     tail: np.ndarray | None = None
 
 
 class LennardJones:
-    """12-6 with geometric combining, over all pairs.
+    """12-6 with geometric combining, over all pairs or the pairs inside `lj_cutoff`.
 
     Two index spaces meet here, as in `ACKS2`, and confusing them is silent:
     the per-atom parameters arrive in *term order* -- the order the
@@ -297,6 +309,15 @@ class LennardJones:
     arithmetic mean for sigma here would silently disagree with
     `compute_exclusion`, and the disagreement would show up only as templates
     no longer reproducing their own energies.
+
+    **Pairs, not matrices.**  Everything here is a sum over a
+    `neighbors.Pairs` list -- the pairs inside `lj_cutoff`, from the force
+    call's neighbour list, or every pair when there is no cutoff.  Under
+    `lj_cutoff` the term is therefore `O(N)` in the atoms; without one it is
+    the all-pairs sum it always was.  The tail correction is a sum over every
+    ordered pair of atoms, inside the cutoff or not, but it depends only on
+    the two atoms' parameters, so it is summed over parameter types (`_tail`,
+    `_Tails`) rather than over pairs.
 
     **Per-state parameters.**  `__call__` is one fixed bonding pattern, which is
     what the fitter and `evaluate.py` want.  `System` drives the same interface
@@ -320,16 +341,21 @@ class LennardJones:
 
     def __init__(self):
         self._seed = None
-        self._displacements = None
+        self.geometry = None
         self.natoms = 0
-        self.vecs = None
-        self.r = None
         self.sigma0 = None
         self.eps0 = None
         self.blocks: list[_Block] = []
-        self._static = None
+        self._reset()
+
+    def _reset(self) -> None:
+        """Forget everything derived from the blocks."""
+        self._list = None
+        self._touched = None
+        self._slot = None
+        self._tails = None
         self._cross: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
-        self._cross_tail: dict[tuple[int, int], np.ndarray | None] = {}
+        self._cross_index: dict[tuple[int, int], np.ndarray] = {}
 
     def __call__(
         self,
@@ -339,55 +365,31 @@ class LennardJones:
         term_dict: dict,
         displacements=None,
     ) -> tuple[float, np.ndarray, np.ndarray]:
-        """Energy, forces and virial; `displacements` is `pointcharge.geometry`
-        over every atom, if the caller already has it."""
+        """Energy, forces and virial; `displacements` is the force call's
+        `neighbors.Geometry`, or `pointcharge.geometry` over every atom, if the
+        caller already has it."""
         params = _require(term_dict)
         indices = params["atoms"][:, 0]
-        sigma = params["kwargs"]["sigma"]
-        eps = params["kwargs"]["eps"]
+        sigma = np.asarray(params["kwargs"]["sigma"], dtype=float)
+        eps = np.asarray(params["kwargs"]["eps"], dtype=float)
 
-        # Both axes in term order, so the parameter vectors line up with them.
-        vecs, rij = subset(displacements, indices, pos, pbc, cell)
-
+        # In term order, so the parameter vectors line up with the pairs.
+        geometry = as_geometry(displacements, pos, pbc, cell).subset(indices)
         ff = active()
-        if ff.lj_cutoff is not None:
-            return self._cut(pos, pbc, cell, indices, sigma, eps, vecs, rij, ff)
-
-        diag = np.diag_indices(len(indices))
-        r = rij.copy()
-        r[diag] = 1.0  # excluded below; only keeps the division finite
-
-        sig = np.sqrt(sigma[:, None] * sigma[None, :])
-        epsilon = np.sqrt(eps[:, None] * eps[None, :])
-
-        e, du_dr = pair_potential(r, sig, epsilon)
-        e[diag] = 0.0
-        du_dr[diag] = 0.0
-        e_tot, f_tot, virial = _gradients(e, du_dr, vecs, r)
-
-        forces = np.zeros_like(pos)
-        forces[indices] = f_tot
-        return e_tot, forces, virial
-
-    def _cut(self, pos, pbc, cell, indices, sigma, eps, vecs, rij, ff):
-        """The 12-6 within `lj_cutoff`, switched off smoothly, plus its tail."""
-        rc = ff.lj_cutoff
-        ron = rc - ff.lj_cutoff_width
-        periodic = bool(np.all(pbc))
-        _check_cutoff(rc, pbc, cell)
-        i, j = np.nonzero(np.triu(rij < rc, 1))
-        r = rij[i, j]
-        u, du_dr = pair_potential(
-            r, np.sqrt(sigma[i] * sigma[j]), np.sqrt(eps[i] * eps[j])
-        )
-        s, ds_dr = cutoff_switch(r, ron, rc)
-        energy = float(np.sum(u * s))
-        f_pair, virial = pair_gradients(i, j, du_dr * s + u * ds_dr, vecs, rij)
+        pairs = _pair_list(geometry, ff)
+        i, j = pairs.i, pairs.j
+        u, du_dr = _pair_energies(pairs.r, sigma[i], eps[i], sigma[j], eps[j], ff)
+        # Each pair once, `i < j`, so no 0.5: `pair_gradients` puts each pair's
+        # gradient on both atoms, and under a homogeneous strain `v -> (I + e)
+        # v`, so `dr/de_ab = v_a v_b / r`, as `ZBL.__call__` has it.
+        energy = float(np.sum(u))
+        f_pair, virial = pair_gradients(i, j, du_dr, pairs.v, pairs.r, len(indices))
         forces = np.zeros_like(pos)
         forces[indices] = f_pair
-        if periodic:
+        if _has_tail(ff, pbc):
+            rc = ff.lj_cutoff
             volume = abs(np.linalg.det(np.asarray(cell)))
-            tail = _tail(sigma, eps, ron, rc, ff) / volume
+            tail = _tail(sigma, eps, rc - ff.lj_cutoff_width, rc, ff) / volume
             # `E_tail = T / V` and a strain scales `V` by `1 + tr e`.
             energy += tail
             virial = virial - tail * np.eye(3)
@@ -401,67 +403,41 @@ class LennardJones:
         The seed's parameters are the static ones: every atom outside a varying
         block keeps them.  Nothing is computed until a varying block needs it,
         so a dataset whose templates agree pays exactly what `__call__` costs.
-        `displacements` is `pointcharge.geometry` over every atom, as
-        `__call__` takes it.
+        `displacements` is as `__call__` takes it.
         """
         _require(term_dict)
         self._seed = (pos, pbc, cell, term_dict)
-        self._displacements = displacements
+        self.geometry = as_geometry(displacements, pos, pbc, cell)
         self.natoms = len(pos)
-        self.vecs = None
-        self.r = None
         self.sigma0, self.eps0 = global_params(term_dict, self.natoms)
         self.blocks = []
-        self._static = None
-        self._cross = {}
-        self._cross_tail = {}
+        self._reset()
 
-    def _pairs(self) -> tuple[np.ndarray, np.ndarray]:
-        if self.vecs is None:
-            pos, pbc, cell, _ = self._seed
-            if self._displacements is None:
-                self._displacements = geometry(pos, pbc, cell)
-            self.vecs, rij = self._displacements
-            self.r = rij.copy()
-            self.r[np.diag_indices(self.natoms)] = 1.0
-            ff = active()
-            if ff.lj_cutoff is not None:
-                _check_cutoff(ff.lj_cutoff, pbc, cell)
-        return self.vecs, self.r
+    def _pairs(self) -> Pairs:
+        """The pair list over every atom, in global order."""
+        if self._list is None:
+            self._list = _pair_list(self.geometry, active())
+        return self._list
 
-    def _pair(self, rows, cols, sig_rows, eps_rows, sig_cols, eps_cols):
-        """`(u, du/dr, tail)` between atoms `rows` and `cols`, self-pairs zeroed.
+    def _layout(self):
+        """The pairs that touch a varying block, and which block each end is in.
 
-        Under `lj_cutoff` the pair is switched off as `_cut` switches it, and
-        under full periodicity `u` also carries the pair's share of `_cut`'s
-        tail, self-pairs included: `_tail` sums over ordered pairs of atoms,
-        so a pair matrix whose `0.5 * sum` is the energy holds `2 T_ij / V`.
-        That share is constant in `r`, so `du/dr` has none, and is returned
-        again on its own as `tail` -- `None` without one -- because the virial
-        needs it apart.
+        Returns `(touched, owner_i, owner_j)`: indices into `_pairs()` and the
+        varying block of each end, `-1` for a static atom.  Every other pair is
+        between static atoms and keeps the static parameters.
         """
-        _, r = self._pairs()
-        rr = r[np.ix_(rows, cols)]
-        sig = np.sqrt(sig_rows[:, None] * sig_cols[None, :])
-        eps = np.sqrt(eps_rows[:, None] * eps_cols[None, :])
-        u, du_dr = pair_potential(rr, sig, eps)
-        ff = active()
-        tail = None
-        if ff.lj_cutoff is not None:
-            rc = ff.lj_cutoff
-            ron = rc - ff.lj_cutoff_width
-            s, ds_dr = cutoff_switch(rr, ron, rc)
-            u, du_dr = u * s, du_dr * s + u * ds_dr
-            pbc, cell = self._seed[1], self._seed[2]
-            if np.all(pbc):
-                volume = abs(np.linalg.det(np.asarray(cell)))
-                tail = 2.0 * _pair_tails(sig, eps, ron, rc, ff) / volume
-        same = rows[:, None] == cols[None, :]
-        u[same] = 0.0
-        du_dr[same] = 0.0
-        if tail is not None:
-            u = u + tail
-        return u, du_dr, tail
+        if self._touched is None:
+            pairs = self._pairs()
+            owner = np.full(self.natoms, -1)
+            self._slot = np.zeros(self.natoms, dtype=int)
+            for k in self._varying():
+                atoms = self.blocks[k].atoms
+                owner[atoms] = k
+                self._slot[atoms] = np.arange(len(atoms))
+            oi, oj = owner[pairs.i], owner[pairs.j]
+            touched = np.flatnonzero((oi >= 0) | (oj >= 0))
+            self._touched = (touched, oi[touched], oj[touched])
+        return self._touched
 
     # -- the blocks -----------------------------------------------------------
 
@@ -496,59 +472,109 @@ class LennardJones:
             self.blocks.append(_Block(atoms, sigma, eps, weights, varies))
             self.sigma0[atoms] = sigma[block.seed_index]
             self.eps0[atoms] = eps[block.seed_index]
+        self._reset()
 
     def _varying(self) -> list[int]:
         return [i for i, block in enumerate(self.blocks) if block.varies]
 
-    def _rows(self, block: _Block) -> tuple[np.ndarray, np.ndarray]:
-        """`block.rows`, and with them its intra-block and static sums."""
-        if block.rows is None:
-            b = block.atoms
-            everything = np.arange(self.natoms)
-            static = np.ones(self.natoms, dtype=bool)
-            for i in self._varying():
-                static[self.blocks[i].atoms] = False
-            nstates = len(block.sigma)
-            u = np.empty((nstates, len(b), self.natoms))
-            du = np.empty_like(u)
-            tails = []
-            for s in range(nstates):
-                sig_cols, eps_cols = self.sigma0.copy(), self.eps0.copy()
-                sig_cols[b], eps_cols[b] = block.sigma[s], block.eps[s]
-                u[s], du[s], tail = self._pair(
-                    b, everything, block.sigma[s], block.eps[s], sig_cols, eps_cols
-                )
-                tails.append(tail)
-            block.rows = (u, du)
-            block.tail = None if tails[0] is None else np.stack(tails)
-            block.intra = 0.5 * np.sum(u[:, :, b], axis=(1, 2))
-            block.static_env = np.sum(u[:, :, static], axis=(1, 2))
-        return block.rows
+    def _rows(self, index: int) -> _Block:
+        """Block `index`'s per-state pair energies, and its intra-block and static sums."""
+        block = self.blocks[index]
+        if block.touch is None:
+            ff = active()
+            pairs = self._pairs()
+            touched, oi, oj = self._layout()
+            slot = self._slot
+            i, j, r = pairs.i[touched], pairs.j[touched], pairs.r[touched]
+
+            inner = (oi == index) & (oj == index)
+            si, sj = slot[i[inner]], slot[j[inner]]
+            block.inner = touched[inner]
+            block.inner_u, block.inner_du = _pair_energies(
+                r[inner][None, :],
+                block.sigma[:, si],
+                block.eps[:, si],
+                block.sigma[:, sj],
+                block.eps[:, sj],
+                ff,
+            )
+
+            first = (oi == index) & (oj < 0)
+            touch = first | ((oj == index) & (oi < 0))
+            mine = np.where(first, i, j)[touch]
+            other = np.where(first, j, i)[touch]
+            sm = slot[mine]
+            block.touch = touched[touch]
+            block.touch_u, block.touch_du = _pair_energies(
+                r[touch][None, :],
+                block.sigma[:, sm],
+                block.eps[:, sm],
+                self.sigma0[other][None, :],
+                self.eps0[other][None, :],
+                ff,
+            )
+
+            block.intra = np.sum(block.inner_u, axis=1)
+            block.static_env = np.sum(block.touch_u, axis=1)
+            tails = self._tail_tables()
+            if tails is not None:
+                intra, static = tails.block(index)
+                block.intra = block.intra + intra
+                block.static_env = block.static_env + static
+                block.tail = intra + static
+        return block
 
     def _cross_pairs(self, a: int, b: int) -> tuple[np.ndarray, np.ndarray]:
-        """`(u, du/dr)` between two varying blocks, `(nstates_a, nstates_b, na, nb)`."""
+        """`(u, du/dr)` between two varying blocks, `(nstates_a, nstates_b, npairs)`.
+
+        Over the pairs `_cross_index[(a, b)]` lists, block `a`'s atom first.
+        """
         cached = self._cross.get((a, b))
         if cached is None:
+            ff = active()
             A, B = self.blocks[a], self.blocks[b]
-            shape = (len(A.sigma), len(B.sigma), len(A.atoms), len(B.atoms))
-            u, du = np.empty(shape), np.empty(shape)
-            tail = None
-            for s in range(len(A.sigma)):
-                for t in range(len(B.sigma)):
-                    u[s, t], du[s, t], tail_st = self._pair(
-                        A.atoms, B.atoms, A.sigma[s], A.eps[s], B.sigma[t], B.eps[t]
-                    )
-                    if tail_st is not None:
-                        if tail is None:
-                            tail = np.empty(shape)
-                        tail[s, t] = tail_st
-            cached = self._cross[(a, b)] = (u, du)
-            self._cross[(b, a)] = (u.transpose(1, 0, 3, 2), du.transpose(1, 0, 3, 2))
-            self._cross_tail[(a, b)] = tail
-            self._cross_tail[(b, a)] = (
-                None if tail is None else tail.transpose(1, 0, 3, 2)
+            pairs = self._pairs()
+            touched, oi, oj = self._layout()
+            first = (oi == a) & (oj == b)
+            between = first | ((oi == b) & (oj == a))
+            i, j = pairs.i[touched], pairs.j[touched]
+            sa = self._slot[np.where(first, i, j)[between]]
+            sb = self._slot[np.where(first, j, i)[between]]
+            r = pairs.r[touched[between]]
+            u, du = _pair_energies(
+                r[None, None, :],
+                A.sigma[:, None, sa],
+                A.eps[:, None, sa],
+                B.sigma[None, :, sb],
+                B.eps[None, :, sb],
+                ff,
             )
+            index = touched[between]
+            cached = self._cross[(a, b)] = (u, du)
+            self._cross[(b, a)] = (u.transpose(1, 0, 2), du.transpose(1, 0, 2))
+            self._cross_index[(a, b)] = self._cross_index[(b, a)] = index
         return cached
+
+    def _tail_tables(self) -> "_Tails | None":
+        """The tail correction by parameter type, if `lj_cutoff` and full periodicity."""
+        pos, pbc, cell, _ = self._seed
+        ff = active()
+        if not _has_tail(ff, pbc):
+            return None
+        if self._tails is None:
+            varying = self._varying()
+            static = np.ones(self.natoms, dtype=bool)
+            for k in varying:
+                static[self.blocks[k].atoms] = False
+            self._tails = _Tails(
+                self.sigma0,
+                self.eps0,
+                static,
+                {k: self.blocks[k] for k in varying},
+                abs(np.linalg.det(np.asarray(cell))),
+                ff,
+            )
+        return self._tails
 
     def corrections(self, index: int) -> np.ndarray:
         """What each state of block `index` adds to its diagonal, in eV.
@@ -561,13 +587,17 @@ class LennardJones:
         block = self.blocks[index]
         if not block.varies:
             return np.zeros(len(block.sigma))
-        self._rows(block)
+        self._rows(index)
         out = block.intra + block.static_env
+        tails = self._tail_tables()
         for other in self._varying():
             if other == index:
                 continue
             u, _ = self._cross_pairs(index, other)
-            out = out + np.einsum("stij,t->s", u, self.blocks[other].weights)
+            cross = np.sum(u, axis=2)
+            if tails is not None:
+                cross = cross + tails.cross(index, other)
+            out = out + cross @ self.blocks[other].weights
         return out
 
     def update(self, index: int, weights: np.ndarray) -> None:
@@ -585,51 +615,98 @@ class LennardJones:
         """
         varying = self._varying()
         if not varying:
-            return self(*self._seed, displacements=self._displacements)
+            return self(*self._seed, displacements=self.geometry)
 
-        vecs, r = self._pairs()
-        everything = np.arange(self.natoms)
-        e, du_dr, tail = self._pair(
-            everything, everything, self.sigma0, self.eps0, self.sigma0, self.eps0
-        )
-        rows = {i: self._rows(self.blocks[i]) for i in varying}
-        e = self._assemble(
-            e, varying, lambda i: rows[i][0], lambda i, j: self._cross_pairs(i, j)[0]
-        )
-        du_dr = self._assemble(
-            du_dr, varying, lambda i: rows[i][1], lambda i, j: self._cross_pairs(i, j)[1]
-        )
-        energy, forces, virial = _gradients(e, du_dr, vecs, r)
-        if tail is not None:
-            tail = self._assemble(
-                tail,
-                varying,
-                lambda i: self.blocks[i].tail,
-                lambda i, j: self._cross_tail[(i, j)],
-            )
-            # `E_tail = T / V` and a strain scales `V` by `1 + tr e`, as in `_cut`.
-            virial = virial - 0.5 * float(np.sum(tail)) * np.eye(3)
+        ff = active()
+        pairs = self._pairs()
+        i, j = pairs.i, pairs.j
+        s0, e0 = self.sigma0, self.eps0
+        u, du_dr = _pair_energies(pairs.r, s0[i], e0[i], s0[j], e0[j], ff)
+        # Every pair touching a varying block goes to its weighted states.
+        for k in varying:
+            block = self._rows(k)
+            w = block.weights
+            u[block.inner], du_dr[block.inner] = w @ block.inner_u, w @ block.inner_du
+            u[block.touch], du_dr[block.touch] = w @ block.touch_u, w @ block.touch_du
+        for n, a in enumerate(varying):
+            for b in varying[n + 1 :]:
+                uc, duc = self._cross_pairs(a, b)
+                wa, wb = self.blocks[a].weights, self.blocks[b].weights
+                index = self._cross_index[(a, b)]
+                u[index] = np.einsum("s,t,stp->p", wa, wb, uc)
+                du_dr[index] = np.einsum("s,t,stp->p", wa, wb, duc)
+        energy = float(np.sum(u))
+        forces, virial = pair_gradients(i, j, du_dr, pairs.v, pairs.r, self.natoms)
+
+        tails = self._tail_tables()
+        if tails is not None:
+            tail = tails.static
+            for k in varying:
+                block = self.blocks[k]
+                tail += float(block.weights @ block.tail)
+            for n, a in enumerate(varying):
+                for b in varying[n + 1 :]:
+                    wa, wb = self.blocks[a].weights, self.blocks[b].weights
+                    tail += float(wa @ tails.cross(a, b) @ wb)
+            # `E_tail = T / V` and a strain scales `V` by `1 + tr e`, as in `__call__`.
+            energy += tail
+            virial = virial - tail * np.eye(3)
         return energy, forces, virial
 
-    def _assemble(self, m, varying, rows, cross) -> np.ndarray:
-        """Pair matrix `m`, at the static parameters, moved to the current weights.
 
-        A varying block's rows and columns go to its weighted states; the
-        columns of the *other* varying blocks are wrong after that and are
-        overwritten by the cross terms, at both blocks' weights.
-        """
-        for i in varying:
-            block = self.blocks[i]
-            b = block.atoms
-            mb = np.einsum("s,sij->ij", block.weights, rows(i))
-            m[b, :], m[:, b] = mb, mb.T
-        for n, i in enumerate(varying):
-            for j in varying[n + 1 :]:
-                wi, wj = self.blocks[i].weights, self.blocks[j].weights
-                mij = np.einsum("s,t,stij->ij", wi, wj, cross(i, j))
-                a, b = self.blocks[i].atoms, self.blocks[j].atoms
-                m[np.ix_(a, b)], m[np.ix_(b, a)] = mij, mij.T
-        return m
+class _Tails:
+    """The tail correction of the per-state path, summed over parameter types.
+
+    `__call__`'s tail is `(1/V) sum_ij t(p_i, p_j)` over every *ordered* pair of
+    atoms, self-pairs included, with `t = 2 pi _pair_tail` -- a function of the
+    two atoms' parameters alone.  So any part of it is a quadratic form in
+    *type counts*: with `T[a, b] = t(type a, type b) / V` and `c_X` the number
+    of atoms of each type in a set `X`, the tail between sets `X` and `Y` is
+    `c_X^T T c_Y`.  The per-state path needs it split as its pair sums are --
+    the static atoms among themselves, each varying block's states within the
+    block and against the static atoms, and two blocks' states against each
+    other -- and each of those is one such product, with no pair list at all.
+    """
+
+    def __init__(self, sigma0, eps0, static, blocks: dict, volume: float, ff):
+        rows = [np.stack([sigma0, eps0], axis=1)]
+        rows += [np.stack([b.sigma.ravel(), b.eps.ravel()], axis=1) for b in blocks.values()]
+        types, inverse = np.unique(np.vstack(rows), axis=0, return_inverse=True)
+        inverse = np.asarray(inverse).ravel()
+        ntypes = len(types)
+        rc = ff.lj_cutoff
+        ron = rc - ff.lj_cutoff_width
+        T = np.empty((ntypes, ntypes))
+        for a, (sa, ea) in enumerate(types):
+            for b, (sb, eb) in enumerate(types):
+                T[a, b] = _pair_tail(np.sqrt(sa * sb), np.sqrt(ea * eb), ron, rc, ff)
+        self.T = 2.0 * np.pi * T / volume
+        natoms = len(sigma0)
+        static_counts = np.bincount(inverse[:natoms][static], minlength=ntypes)
+        self.static_counts = static_counts
+        self.static = float(static_counts @ self.T @ static_counts)
+        # Per varying block, its type counts in each state, `(nstates, ntypes)`.
+        self.counts: dict[int, np.ndarray] = {}
+        start = natoms
+        for k, block in blocks.items():
+            nstates, nb = block.sigma.shape
+            kinds = inverse[start : start + nstates * nb].reshape(nstates, nb)
+            start += nstates * nb
+            counts = np.zeros((nstates, ntypes))
+            for s in range(nstates):
+                counts[s] = np.bincount(kinds[s], minlength=ntypes)
+            self.counts[k] = counts
+
+    def block(self, k: int) -> tuple[np.ndarray, np.ndarray]:
+        """Block `k`'s tail per state: within the block, and against the static atoms."""
+        C = self.counts[k]
+        intra = np.einsum("sa,ab,sb->s", C, self.T, C)
+        static = 2.0 * C @ (self.T @ self.static_counts)
+        return intra, static
+
+    def cross(self, a: int, b: int) -> np.ndarray:
+        """Blocks `a` and `b`'s tail between them, `(nstates_a, nstates_b)`."""
+        return 2.0 * self.counts[a] @ self.T @ self.counts[b].T
 
 
 def _require(term_dict: dict) -> dict:
@@ -716,11 +793,3 @@ def _pair_tail(sig, ep, ron, rc, ff) -> float:
             outer = quad(integrand, rc, np.inf, args=(False,), epsabs=0, epsrel=1e-12)[0]
             _PAIR_TAILS[key] = inner + outer
     return _PAIR_TAILS[key]
-
-
-def _pair_tails(sig: np.ndarray, eps: np.ndarray, ron, rc, ff) -> np.ndarray:
-    """`2 pi _pair_tail` over matrices of combined parameters, `_tail` per pair."""
-    flat = np.stack([sig.ravel(), eps.ravel()], axis=1)
-    types, inverse = np.unique(flat, axis=0, return_inverse=True)
-    values = np.array([_pair_tail(s, e, ron, rc, ff) for s, e in types])
-    return 2.0 * np.pi * values[inverse.ravel()].reshape(sig.shape)

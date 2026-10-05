@@ -298,7 +298,7 @@ class TestTwoVaryingBlocks:
         assert [block["nstates"] for block in results["blocks"]] == [2, 2]
         assert system.lj_ff.self_consistent
         u, _ = system.lj_ff._cross_pairs(0, 1)
-        cross = u.sum(axis=(2, 3))
+        cross = u.sum(axis=2)  # (states of block 0, of block 1, pairs)
         assert np.ptp(cross) > 1e-6, "the cross term does not depend on the states"
 
     def test_forces(self, case):

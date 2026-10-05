@@ -13,6 +13,7 @@ duration of this module so that it cannot collide with the other datasets the
 suite loads into the same process.
 """
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -228,3 +229,70 @@ class TestTheExclusionUnderEwald:
         term_dict = topology.set_terms(reaction_set.get_terms(topology))
         energy, _, _ = PointCharge()(atoms.positions, atoms.pbc, atoms.cell, term_dict)
         assert abs(energy) < 5e-3
+
+
+class TestOperatorKernel:
+    """`charge_solver = "iterative"`: the kernel as a neighbour-list real space and PME.
+
+    Nothing is solved under point charges, so this is the same energy with the
+    lattice sums split differently -- held to the dense kernel within the
+    sums' accuracy, and its forces and virial to its own energy.
+    """
+
+    @staticmethod
+    def operator():
+        return use(dataclasses.replace(PARAMS, charge_solver="iterative"))
+
+    @staticmethod
+    def two_blocks():
+        return box(
+            zundel((2.0, 3.0, 3.0), proton=0.05),
+            zundel((2.0, 10.0, 3.0), proton=-0.03),
+            cell=16.0,
+            pbc=True,
+        )
+
+    def test_it_matches_the_dense_kernel(self, reaction_set):
+        atoms = self.two_blocks()
+        dense = calculate(atoms, reaction_set)
+        with self.operator():
+            system = System(atoms, Topology.from_atoms(atoms), reaction_set)
+            got = system.calculate()
+            assert system.nonbonded_ff.K is None, "the operator path was not taken"
+        assert len(multi_state(got)) == 2
+        assert got["energy"] == pytest.approx(dense["energy"], abs=1e-6)
+        np.testing.assert_allclose(got["forces"], dense["forces"], atol=1e-6)
+        np.testing.assert_allclose(got["virial"], dense["virial"], atol=1e-5)
+        for a, b in zip(multi_state(got), multi_state(dense)):
+            np.testing.assert_allclose(a["weights"], b["weights"], atol=1e-7)
+
+    def test_one_topology_matches_the_dense_kernel(self, reaction_set):
+        atoms = self.two_blocks()
+        topology = Topology.from_atoms(atoms)
+        topology.set_terms(reaction_set.get_terms(topology))
+        args = (atoms.positions, atoms.pbc, atoms.cell.array, topology.term_dict)
+        dense = PointCharge()(*args)
+        with self.operator():
+            got = PointCharge()(*args)
+        assert got[0] == pytest.approx(dense[0], abs=1e-6)
+        np.testing.assert_allclose(got[1], dense[1], atol=1e-6)
+        np.testing.assert_allclose(got[2], dense[2], atol=1e-5)
+
+    def test_forces_and_virial_are_its_own_gradient(self, reaction_set):
+        atoms = self.two_blocks()
+        with self.operator():
+            results = calculate(atoms, reaction_set)
+
+            def energy_fn(positions, cell=None):
+                perturbed = atoms.copy()
+                perturbed.positions = positions
+                if cell is not None:
+                    perturbed.set_cell(cell)
+                return calculate(perturbed, reaction_set)["energy"]
+
+            f_fd = finite_difference_forces(energy_fn, atoms.positions, delta=1e-5)
+            w_fd = finite_difference_virial(
+                energy_fn, atoms.positions, np.asarray(atoms.cell), delta=1e-6
+            )
+        np.testing.assert_allclose(results["forces"], f_fd, atol=1e-6, rtol=1e-5)
+        np.testing.assert_allclose(results["virial"], w_fd, atol=1e-4, rtol=1e-4)

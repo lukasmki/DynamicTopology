@@ -168,7 +168,7 @@ between this module and its own literature.
 import numpy as np
 
 from DynamicTopology.forcefield.params import ForceFieldParams, resolve
-from DynamicTopology.forcefield.pointcharge import pair_gradients, subset
+from DynamicTopology.forcefield.neighbors import as_geometry, pair_gradients
 
 
 # Screening length prefactor, `0.8854 * a_0`, in Angstrom.
@@ -282,20 +282,23 @@ class ZBL:
         cell: np.ndarray,
         displacements=None,
     ) -> tuple[float, np.ndarray, np.ndarray]:
-        """Energy, forces and virial; `displacements` is `pointcharge.geometry`
-        over every atom, if the caller already has it."""
-        vecs, rij = subset(displacements, np.arange(len(pos)), pos, pbc, cell)
+        """Energy, forces and virial; `displacements` is the force call's
+        `neighbors.Geometry`, or `pointcharge.geometry` over every atom, if the
+        caller already has it."""
+        geometry = as_geometry(displacements, pos, pbc, cell)
 
         # Only the pairs the taper has not yet taken below rounding.  Past
         # `reach` it is under e^-45 (3e-20) times a bare ZBL already of order
         # 1e-3 eV, so the pairs dropped carry nothing a sum of hundreds of eV
         # could hold: the energy is the all-pairs sum to rounding, at a
-        # hundredth of the cost of evaluating every pair in a large box.
+        # hundredth of the cost of evaluating every pair in a large box -- and
+        # they come off the neighbour list, not the `N x N` minimum image.
         ff = resolve(None)
         reach = ff.taper_radius + TAPER_TAIL * ff.taper_width
-        i, j = np.nonzero(np.triu(rij < reach, 1))
+        pairs = geometry.pairs(reach)
+        i, j = pairs.i, pairs.j
         z = np.asarray(numbers, dtype=float)
-        u, du_dr = pair_potential(rij[i, j], z[i], z[j])
+        u, du_dr = pair_potential(pairs.r, z[i], z[j])
 
         # Each pair once, so no 0.5 anywhere: the energy is the sum over
         # `i < j`, and `pair_gradients` puts each pair's gradient on both atoms.
@@ -306,5 +309,5 @@ class ZBL:
         #
         # which is the virial `pair_gradients` returns.
         energy = float(np.sum(u))
-        forces, virial = pair_gradients(i, j, du_dr, vecs, rij)
+        forces, virial = pair_gradients(i, j, du_dr, pairs.v, pairs.r, len(pos))
         return energy, forces, virial

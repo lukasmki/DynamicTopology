@@ -15,7 +15,7 @@ from DynamicTopology.forcefield.coupling import EVBCoupling
 from DynamicTopology.forcefield.qforce import QForce
 from DynamicTopology.forcefield.electrostatics import Electrostatics, ElectrostaticGap
 from DynamicTopology.forcefield.lj import LennardJones
-from DynamicTopology.forcefield.pointcharge import geometry
+from DynamicTopology.forcefield.neighbors import Geometry, NeighborList
 from DynamicTopology.forcefield.zbl import ZBL
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -66,6 +66,9 @@ class System:
         self.electrostatics = Electrostatics()
         self.zbl_ff = ZBL()
         self.lj_ff = LennardJones()
+        # The pair terms' neighbour list, kept from one call to the next for
+        # as long as `global_params.neighbor_skin` allows; see `neighbors.py`.
+        self.neighbors = NeighborList()
         self.coupling = EVBCoupling()
         # The electrostatic half of the admission gate's gap; see `basis.py`.
         self.gap = ElectrostaticGap(reaction_set)
@@ -120,8 +123,10 @@ class System:
         # electrostatic gap as well as the bonded one, so the closure needs it.
         nonbonded = self.nonbonded_ff
         self.reaction_set.assign_terms(self.topology)
-        # Every pair term's minimum-image displacements, built once.
-        displacements = geometry(pos, pbc, cell)
+        # Every pair term's minimum-image geometry, shared: one neighbour list,
+        # at `neighbor_radius` plus the skin and cut down for each term, and the
+        # dense `N x N` displacements only if a term with no cutoff asks.
+        displacements = Geometry(pos, pbc, np.asarray(cell), neighbors=self.neighbors)
         nonbonded.prepare(
             pos, pbc, cell, self.topology.term_dict, displacements=displacements
         )

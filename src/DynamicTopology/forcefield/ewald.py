@@ -421,24 +421,30 @@ class EwaldOperatorSetup:
             + self.background
         )
 
-    def bind(self, pos, vecs, rij):
-        return EwaldOperator(self, pos, vecs, rij)
+    def bind(self, pos, geometry):
+        """The operator at `pos`; `geometry` is a `neighbors.Geometry` of `pos`."""
+        return EwaldOperator(self, pos, geometry)
 
 
 class EwaldOperator:
-    """The kernel at one geometry, as products rather than a matrix."""
+    """The kernel at one geometry, as products rather than a matrix.
 
-    def __init__(self, setup, pos, vecs, rij):
+    The real-space half is read off `geometry`'s neighbour list inside
+    `setup.cutoff` -- a cell list, not the `N x N` minimum image -- so building
+    the operator is `O(N)` in the atoms and `O(N log N)` with the PME mesh.
+    """
+
+    def __init__(self, setup, pos, geometry):
         self.setup = setup
-        self.vecs = vecs
-        self.rij = rij
-        n = len(rij)
+        self.geometry = geometry
+        n = geometry.natoms
         self.n = n
-        i, j = np.nonzero(np.triu(rij < setup.cutoff, 1))
-        r = rij[i, j]
+        pairs = geometry.pairs(setup.cutoff)
+        i, j, r = pairs.i, pairs.j, pairs.r
         k_gamma = erf(setup.gamma * r) / r
         k_kappa = erf(setup.kappa * r) / r
         self.i, self.j = i, j
+        self.v, self.r = pairs.v, r
         self.short = k_gamma - k_kappa
         self.dshort = (
             (2 * setup.gamma / np.sqrt(np.pi)) * np.exp(-((setup.gamma * r) ** 2)) / r
@@ -452,6 +458,7 @@ class EwaldOperator:
             shape=(n, n),
         )
         self.pme = setup.pme.bind(pos)
+        self._columns: dict[int, np.ndarray] = {}
 
     def matrix(self):
         raise RuntimeError(
@@ -465,11 +472,19 @@ class EwaldOperator:
         return out + setup.background * X.sum(axis=0)
 
     def columns(self, index) -> np.ndarray:
-        """`K[:, index]`, one PME pass per column."""
+        """`K[:, index]`, one PME pass per column not asked for before.
+
+        Kept for the life of the operator, i.e. one force call: the admission
+        gate asks for the same few atoms' columns channel after channel.
+        """
         index = np.atleast_1d(index)
-        E = np.zeros((self.n, len(index)))
-        E[index, np.arange(len(index))] = 1.0
-        return self.matvec(E)
+        missing = [a for a in dict.fromkeys(index.tolist()) if a not in self._columns]
+        if missing:
+            E = np.zeros((self.n, len(missing)))
+            E[missing, np.arange(len(missing))] = 1.0
+            for a, column in zip(missing, self.matvec(E).T):
+                self._columns[a] = column
+        return np.stack([self._columns[a] for a in index.tolist()], axis=1)
 
     def contract(self, W, factor=None, signs=None):
         """`dS/dr_i`, `dS/de_ab` for `S = sum_ij W_ij K_ij`, `W = F diag(s) F^T`.
@@ -485,13 +500,15 @@ class EwaldOperator:
         i, j = self.i, self.j
         w_pairs = np.einsum("pc,pc->p", signed[i], factor[j])
         # Each unordered pair is both (i, j) and (j, i) of the sum.
-        coeff = 2.0 * w_pairs * self.dshort / self.rij[i, j]
-        v = self.vecs[i, j]
+        coeff = 2.0 * w_pairs * self.dshort / self.r
+        v = self.v
         grad = coeff[:, None] * v
         dS_dr = np.zeros((self.n, 3))
-        np.add.at(dS_dr, i, grad)
-        np.add.at(dS_dr, j, -grad)
-        dS_de = (coeff[:, None] * v).T @ v
+        for a in range(3):
+            dS_dr[:, a] = np.bincount(i, grad[:, a], self.n) - np.bincount(
+                j, grad[:, a], self.n
+            )
+        dS_de = grad.T @ v
         _, rec_r, rec_e = self.pme.contract(factor, signs)
         total_weight = float(np.sum(signs * factor.sum(axis=0) ** 2))
         dS_de = dS_de + rec_e - np.eye(3) * (setup.background * total_weight)

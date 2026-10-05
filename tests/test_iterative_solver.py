@@ -14,6 +14,7 @@ import pytest
 
 from DynamicTopology.forcefield.acks2 import ACKS2
 from DynamicTopology.forcefield.ewald import Ewald, EwaldOperatorSetup
+from DynamicTopology.forcefield.neighbors import Geometry
 from DynamicTopology.forcefield.params import active, use
 from DynamicTopology.forcefield.pme import PMESetup
 from DynamicTopology.forcefield.pointcharge import geometry
@@ -63,7 +64,7 @@ def test_the_operator_is_the_matrix():
     pos = rng.uniform(0.0, 9.0, size=(40, 3))
     vecs, rij = geometry(pos, PBC, CELL)
     dense = Ewald(CELL).bind(pos, vecs, rij)
-    operator = EwaldOperatorSetup(CELL).bind(pos, vecs, rij)
+    operator = EwaldOperatorSetup(CELL).bind(pos, Geometry(pos, PBC, CELL))
     K = dense.matrix()
     q = rng.normal(size=40)
     np.testing.assert_allclose(operator.matvec(q), K @ q, atol=1e-7 * np.abs(K @ q).max())

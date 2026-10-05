@@ -92,7 +92,8 @@ calls on every dataset (`$SCRATCH/hpc-opt-work/tol_check.py`):
     state of each block -- rather than the dense `N x N` weight (0.9 s to
     0.01 s at 1536 atoms).
   - **One minimum-image geometry per force call**, shared by ACKS2, ZBL and
-    the 12-6, which each used to build their own `N x N x 3` copy; and the
+    the 12-6, which each used to build their own `N x N x 3` copy (since
+    replaced by a neighbour list; see *Neighbour lists* below); and the
     pair contractions' virials are one matrix product instead of a
     three-operand `einsum`.
   - **ZBL sums only the pairs within `taper_radius + 45 taper_width`**
@@ -153,7 +154,8 @@ memory and `O(N^3)` time.  The iterative one never forms the kernel:
   - **Any call it cannot take falls back to the direct solve**: a molecule
     whose softness is nearly disconnected (`acks2.SOFTNESS_FLOOR`) keeps its
     Kohn-Sham potentials as unknowns, which the projected solve does not
-    handle; so does a cell that is not fully periodic, and `PointCharge`.
+    handle; so does a cell that is not fully periodic.  (`PointCharge`,
+    which solves nothing, takes the same operator; see below.)
 
 Water boxes, one thread, seconds per call (direct -> iterative):
 
@@ -172,12 +174,97 @@ operator to the matrix, the solve (with and without a multi-state block) to
 the direct solve, its forces to its own energy, and the fallback to the
 direct numbers exactly.
 
-What remains `O(N^2)` at a few thousand atoms is outside the charge solve:
-the minimum-image geometry the pair terms share, the all-pairs 12-6 (which
-`lj_cutoff` reduces only in the evaluation, not the geometry), the molecule
-separations the reaction network screens on, and the per-molecule
-bookkeeping of the closure.  Taking those to `O(N)` is a neighbour list
-through all of them.
+**Neighbour lists for the pair terms (`forcefield/neighbors.py`).**  Every
+pair term used to read one shared minimum-image geometry, the displacement of
+every pair of atoms -- `N x N x 3`, 0.9 GB at 5184 atoms -- even where it cut
+off at a few Angstrom.  Now each force call builds one `Geometry`, and each
+term asks it for what it reads:
+
+  - **pairs inside a cutoff**, from a neighbour search: a periodic k-d tree
+    (`scipy.spatial.cKDTree`) for an orthorhombic cell, a cell list for any
+    other, built once at the widest cutoff asked for and cut down for the
+    rest.  ZBL (6.9 A), the 12-6 under `lj_cutoff`, and the real-space half
+    of the iterative solve's Ewald operator read these;
+  - **given pairs** -- within a molecule, an exclusion, a fragment the gate
+    screens -- measured one by one, for ACKS2's softness and isolated
+    references and the point-charge exclusions;
+  - **the dense arrays**, only for a term that is all-pairs by construction:
+    the direct solve's dense Ewald kernel, open boundaries, and the 12-6
+    without `lj_cutoff`.
+
+**One list, kept between calls: `neighbor_radius` and `neighbor_skin`.**
+`System` keeps a `NeighborList` for its lifetime.  Each call, every term's
+cutoff is cut from one list searched at `global_params.neighbor_radius` -- by
+default the widest cutoff in force (ZBL's 6.9 A, `lj_cutoff`, the iterative
+solve's real-space cutoff); set explicitly, a term asking for more raises --
+plus `neighbor_skin`.  The list is searched again only once an atom could have
+crossed the skin: twice the largest displacement since the search plus the
+cell's strain times the list's reach exceeding the skin, so wrapping an atom
+back into the cell does not count and an NPT step need not either.  The skin
+is shortened where the reach would pass half the cell.  Neither parameter
+changes which pairs a term sums -- energies are identical to the last digit
+printed over 8 MD-sized steps -- so neither is a model change; the default
+skin is 0, which searches every call.  Cutoff 6 A and the iterative solve,
+seconds per call spent finding pairs (of 5.5 and 22.7 s per call):
+
+    neighbor_skin       0       1 A     2 A
+    5184 atoms          0.23    0.15    0.19
+    12288 atoms         0.56    0.38    0.47     (one search in 9 calls)
+
+Small, because the k-d tree an orthorhombic box takes is already cheap, and a
+kept list still measures every listed pair each call, more of them the wider
+the skin.  A triclinic box, whose cell-list search is six times slower,
+stands to gain more.
+
+Every pair's displacement is the same arithmetic the dense geometry did, and
+the search returns exactly the pairs `rij < rc` selected
+(`tests/test_neighbors.py`, triclinic cells included), so this changes the
+order of sums and nothing else.  Against the previous code over the same
+sequential calls, on every dataset under each of default, `lj_cutoff`,
+`iterative` and both: energies agree to 1e-12 eV, forces to 3e-14 eV/A,
+block weights and topologies exactly.  (The one exception is the first call
+of a box replicated exactly, where pairs sit at precisely half the cell: the
+dense contraction gave both atoms of such a pair the same displacement, a net
+force of 2e-3 eV/A on the box, and the pair list gives them opposite ones.)
+
+The 12-6 is now a sum over a pair list in both of its paths -- one topology,
+and the per-state one, where each varying block keeps its states' energies
+for just the pairs that touch it -- and its tail correction, a sum over every
+ordered pair of atoms that depends only on their parameters, is summed over
+parameter *types* instead of spread over an `N x N` matrix.  ACKS2's
+intramolecular pairs and per-molecule systems no longer pass through `n x n`
+arrays either.
+
+**`PointCharge` takes the operator under `charge_solver = "iterative"`.**  It
+used to fall back to the dense kernel.  It solves nothing, and every product
+it takes with `K` is with a charge vector or a multi-state block's few
+columns, so it now uses `ewald.EwaldOperator` as ACKS2 does and contracts its
+weight as a factor.  The same energy to the lattice sums' accuracy (4e-6 eV
+on 619, forces to 5e-7 eV/A); NVE drift -0.09 meV/ps/atom against -0.08 to
+-0.09 dense.  A single-state block's diagonal correction, which `System` only
+reports, is reported as zero under the operator, as ACKS2 reports it: it
+would cost a PME pass per atom.
+
+Water boxes, one thread, `lj_cutoff` 6 A and the iterative solve, seconds per
+call (and peak memory):
+
+    atoms                    192      1536      5184           12288
+    ACKS2, before            0.059    1.17      8.3  (5.0 GB)  38.3 (25 GB)
+    ACKS2, now               0.058    0.90      5.5  (3.4 GB)  22.2 (16 GB)
+    point charges, before    0.092    2.49      22.2 (4.9 GB)
+    point charges, now       0.053    0.89      5.4  (3.3 GB)  22.1 (16 GB)
+
+The nonbonded terms in those calls -- ACKS2's setup, solve and forces, the
+12-6, ZBL and the neighbour search -- now cost 0.53 s at 5184 atoms and 1.3 s
+at 12288, linear in the atoms.  The default settings (direct solve, no
+`lj_cutoff`) are all-pairs by construction and run as before (22 s at 5184).
+
+**What remains `O(N^2)` is the EVB basis**, 23 of the 24 s per call at 12288
+atoms: the molecule separations the reaction network screens on
+(`ReactionSet._molecule_separations`, 8.5 s, and the block-wide
+`squared_separations` `basis.py` builds), and the per-molecule bookkeeping of
+the closure.  The first is a pair search within `bimol_cutoff`, which
+`Geometry.pairs` already provides.
 
 **Hot reactive frames are bookkeeping, and the closure now shares it between
 states.**  On a 3000 K H2/O2 frame a block reaches the 128-state cap, and the

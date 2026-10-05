@@ -11,12 +11,9 @@ import numpy as np
 from ase import units
 
 from DynamicTopology.forcefield.acks2 import ACKS2
+from DynamicTopology.forcefield.neighbors import pair_gradients
 from DynamicTopology.forcefield.params import ForceFieldParams, active, resolve
-from DynamicTopology.forcefield.pointcharge import (
-    PointCharge,
-    direct_kernel,
-    pair_gradients,
-)
+from DynamicTopology.forcefield.pointcharge import PointCharge, direct_kernel
 
 _CLASSES = {"acks2": ACKS2, "pointcharge": PointCharge}
 
@@ -208,7 +205,7 @@ class ElectrostaticGap:
             e = float(q @ phi) + 0.5 * float(q @ K_MM @ q)
             if len(pairs):
                 i, j = pairs[:, 0], pairs[:, 1]
-                g, _ = direct_kernel(self.ff.rij[M[i], M[j]], gamma)
+                g, _ = direct_kernel(self.ff.geometry.between(M[i], M[j])[1], gamma)
                 e -= float(np.sum(q[i] * q[j] * g))
             energies.append(e)
         return active().ccoul * (energies[1] - energies[0]) * units.eV
@@ -244,9 +241,10 @@ class ElectrostaticGap:
             if not len(pairs):
                 continue
             i, j = M[pairs[:, 0]], M[pairs[:, 1]]
-            _, dg = direct_kernel(self.ff.rij[i, j], gamma)
+            v, r = self.ff.geometry.between(i, j)
+            _, dg = direct_kernel(r, gamma)
             f_pair, w_pair = pair_gradients(
-                i, j, -sign * Q[i] * Q[j] * dg, self.ff.vecs, self.ff.rij
+                i, j, -sign * Q[i] * Q[j] * dg, v, r, len(self.ff.act)
             )
             f_local += f_pair
             virial += w_pair

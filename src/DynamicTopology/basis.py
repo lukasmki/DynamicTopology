@@ -313,6 +313,14 @@ class EVBBasis:
         so they contribute equally to every state of a block and cancel from the
         gap this screens on.  The electrostatics do not -- the charges follow the
         bonding -- and `_channel_weight` adds them through `self.gap`.
+
+        The 12-6 stops being a function of the elements alone once templates
+        disagree on an atom's parameters, and its difference is then left out of
+        this screen.  That is an approximation in *which* states are admitted,
+        not in their energies: the gate is a smooth function of the gap it is
+        given, and its gradient is the gradient of that, so nothing is lost
+        from conservation.  The difference is millielectronvolts against a
+        bonded gap of electronvolts.
         """
         return sum(
             self._molecule_energy(Topology(graph.subgraph(nodes)), atoms)

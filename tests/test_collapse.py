@@ -521,6 +521,11 @@ class TestTheNonbondedTermsCancelFromEveryGap:
     The electrostatics used to be part of this claim and no longer are: the
     charges follow the bonding, so they sit on the diagonal and differ between
     states by design (`tests/test_acks2_fragment.py`).
+
+    The 12-6 keeps its part only while the templates agree on every atom's
+    sigma and epsilon, which the shipped per-element values do and which this
+    class holds them to.  Templates that disagree put the switched difference on
+    the diagonal instead (`tests/test_lj_states.py`).
     """
 
     def test_a_broken_bond_moves_only_the_exclusion(self, reaction_set):

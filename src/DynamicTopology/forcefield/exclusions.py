@@ -5,7 +5,9 @@ system with no reference to the bond graph, because a sum that does not depend
 on the topology is the same number on every diabatic state and can therefore be
 evaluated once, outside the EVB Hamiltonian.  That property is the reason those
 three terms are where they are, and nothing here changes it: the whole-system
-sums stay exactly as they were.
+sums stay exactly as they were.  (`LennardJones` keeps it only while the
+templates agree on each atom's sigma and epsilon; where they do not, the part
+that differs goes on the diagonal -- see `forcefield/lj.py`.)
 
 What this module adds is the *correction* -- which pairs should not have been
 counted.  That is the pairs within `params.exclusion_depth` bonds of each other, and

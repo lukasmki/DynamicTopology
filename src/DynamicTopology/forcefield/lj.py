@@ -45,6 +45,17 @@ dependence, or a discontinuity at the bimolecular cutoff -- not "does not",
 cannot.  Each of the four failures lived in the degree of freedom the switch
 removes, which is the same argument `forcefield/zbl.py` makes for itself.
 
+**Per-template parameters.**  That argument holds as long as every template
+gives an atom the same sigma and epsilon, which per-element values do.  Once
+templates are allowed to disagree -- per-molecule fitting -- the sum is no
+longer one number: a state is charged the 12-6 of *its own* templates'
+parameters, as its `exclusion` terms already were.  `LennardJones` then puts the
+state-dependent part on the diagonal of each block whose states disagree and
+keeps the rest outside; see the class docstring.  This is safe now in a way it
+was not before the switch, because it is the topology-dependence of a *switched*
+term: what differs between two states is a pair energy at a non-bonded
+separation, millielectronvolts, and never hundreds of eV at a bond length.
+
 The functions that carried those four attempts -- `reactive_exclusion_weights`,
 `fixed_basis_weights`, `exclusion_correction`, `lost_exclusion_correction` --
 are gone and are not coming back.
@@ -74,12 +85,14 @@ and as the `.jsonl` stores them.  q-force states them in nm and kJ/mol, and
 `io/units.py` converts them once, when fast-forces imports its XML.
 """
 
+from dataclasses import dataclass
+
 import networkx as nx
 import numpy as np
 
 from DynamicTopology.forcefield.ewald import contract_pairs
 from DynamicTopology.forcefield.params import ForceFieldParams, active, resolve
-from DynamicTopology.forcefield.pointcharge import pair_gradients, subset
+from DynamicTopology.forcefield.pointcharge import geometry, pair_gradients, subset
 
 
 # `EXCLUSION_DEPTH`, `SWITCH_RADIUS` and `SWITCH_WIDTH` are now fields of
@@ -211,6 +224,63 @@ def near_pairs(graph: nx.Graph, depth: int | None = None) -> set[tuple[int, int]
     return pairs
 
 
+def global_params(term_dict: dict, natoms: int) -> tuple[np.ndarray, np.ndarray]:
+    """A `term_dict`'s per-atom sigma and epsilon, as system-length vectors.
+
+    In global atom order rather than term order.  An atom with no `lennardjones`
+    row gets zero for both, which is what `LennardJones.__call__` gives it by
+    leaving it out of the sum: a zero sigma is masked in `pair_potential`.
+    """
+    sigma = np.zeros(natoms)
+    eps = np.zeros(natoms)
+    params = term_dict.get("lennardjones")
+    if params is not None:
+        indices = params["atoms"][:, 0]
+        sigma[indices] = params["kwargs"]["sigma"]
+        eps[indices] = params["kwargs"]["eps"]
+    return sigma, eps
+
+
+def _gradients(
+    e: np.ndarray, du_dr: np.ndarray, vecs: np.ndarray, r: np.ndarray
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Energy, forces and virial of a symmetric pair matrix.
+
+    `e` and `du_dr` are over the same index space as `vecs` and `r`, and the
+    forces come back in that space too; `r` has its diagonal set to anything
+    nonzero, since `contract_pairs` divides by it.  `du_dr` has a zero
+    diagonal; `e` may carry an `r`-independent one, which only adds to the
+    energy.
+    """
+    e_tot = 0.5 * float(np.sum(e))
+    # `E = sum_ij W_ij u(r_ij)` with `W = 1/2`, which is the form
+    # `contract_pairs` differentiates: it doubles the force for the (i, j) /
+    # (j, i) pair, cancelling the 0.5, and leaves the virial's -- even under
+    # the swap -- in place.  Under a homogeneous strain `v -> (I + e) v`,
+    # so `dr/de_ab = v_a v_b / r`, as `ZBL.__call__` has it.
+    dE_dr, virial = contract_pairs(0.5 * du_dr, vecs, r)
+    return e_tot, -dE_dr, virial
+
+
+@dataclass
+class _Block:
+    """One EVB block as the 12-6 sees it.  Block-local columns throughout."""
+
+    atoms: np.ndarray  # (nb,) global indices
+    sigma: np.ndarray  # (nstates, nb)
+    eps: np.ndarray  # (nstates, nb)
+    weights: np.ndarray  # (nstates,)
+    varies: bool
+    # Per state, the block's rows against every atom in the system, with the
+    # block's own columns at that state's parameters and every other column at
+    # the static ones; `(nstates, nb, natoms)`.  Computed on first use.
+    rows: tuple[np.ndarray, np.ndarray] | None = None
+    intra: np.ndarray | None = None  # (nstates,), eV
+    static_env: np.ndarray | None = None  # (nstates,), eV
+    # `rows`' share of the tail correction alone, if there is one.
+    tail: np.ndarray | None = None
+
+
 class LennardJones:
     """12-6 with geometric combining, over all pairs.
 
@@ -218,15 +288,48 @@ class LennardJones:
     the per-atom parameters arrive in *term order* -- the order the
     `lennardjones` terms were collected -- while `pos` and the returned forces
     are in *global* atom order.  `indices[k]` is the global index of the k-th
-    term.  Everything is built in term order and the forces are scattered back
-    at the very end.
+    term.  `__call__` builds everything in term order and scatters the forces
+    back at the very end; the EVB path below works in global order throughout,
+    through `global_params`.
 
     Combining is geometric in both parameters, matching q-force's
     `A=sqrt(A1*A2); B=sqrt(B1*B2)` -- *not* Lorentz-Berthelot.  Using the
     arithmetic mean for sigma here would silently disagree with
     `compute_exclusion`, and the disagreement would show up only as templates
     no longer reproducing their own energies.
+
+    **Per-state parameters.**  `__call__` is one fixed bonding pattern, which is
+    what the fitter and `evaluate.py` want.  `System` drives the same interface
+    `PointCharge` exposes instead -- `prepare`, `bind`, `corrections` / `update`
+    per block, then `evaluate` -- because each diabatic state takes its sigma and
+    epsilon from its own templates, and two templates need not agree on an
+    atom.  A block is *varying* if any two of its states disagree on any atom;
+    only varying blocks get nonzero corrections, and with none the result is
+    `__call__` on the seed topology, operation for operation.
+
+    The states of different blocks are combined as a product of the blocks'
+    ground states, the model `PointCharge` uses: a pair inside block A costs
+    `sum_s w_s u(p^s, p^s)`, a pair between A and a static atom `sum_s w_s
+    u(p_i^s, p_j)`, and a pair between two varying blocks `sum_st w_s w_t
+    u(p_i^s, p_j^t)`.  It is the *pair energies* that are averaged and not the
+    parameters, because geometric combining makes `u` nonlinear in them -- where
+    `PointCharge` may average charges only because Coulomb is bilinear in q.
+    The energy is then linear in each block's weights and its derivative with
+    respect to them is `corrections`, which is the Hellmann-Feynman condition.
     """
+
+    def __init__(self):
+        self._seed = None
+        self._displacements = None
+        self.natoms = 0
+        self.vecs = None
+        self.r = None
+        self.sigma0 = None
+        self.eps0 = None
+        self.blocks: list[_Block] = []
+        self._static = None
+        self._cross: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+        self._cross_tail: dict[tuple[int, int], np.ndarray | None] = {}
 
     def __call__(
         self,
@@ -238,13 +341,7 @@ class LennardJones:
     ) -> tuple[float, np.ndarray, np.ndarray]:
         """Energy, forces and virial; `displacements` is `pointcharge.geometry`
         over every atom, if the caller already has it."""
-        params = term_dict.get("lennardjones")
-        if params is None:
-            raise KeyError(
-                "No `lennardjones` parameters set. Every atom needs a sigma and "
-                "an epsilon, or the system has no Pauli repulsion and molecules "
-                "will interpenetrate."
-            )
+        params = _require(term_dict)
         indices = params["atoms"][:, 0]
         sigma = params["kwargs"]["sigma"]
         eps = params["kwargs"]["eps"]
@@ -266,16 +363,10 @@ class LennardJones:
         e, du_dr = pair_potential(r, sig, epsilon)
         e[diag] = 0.0
         du_dr[diag] = 0.0
-        e_tot = 0.5 * float(np.sum(e))
-        # `E = sum_ij W_ij u(r_ij)` with `W = 1/2`, which is the form
-        # `contract_pairs` differentiates: it doubles the force for the (i, j) /
-        # (j, i) pair, cancelling the 0.5, and leaves the virial's -- even under
-        # the swap -- in place.  Under a homogeneous strain `v -> (I + e) v`,
-        # so `dr/de_ab = v_a v_b / r`, as `ZBL.__call__` has it.
-        dE_dr, virial = contract_pairs(0.5 * du_dr, vecs, r)
+        e_tot, f_tot, virial = _gradients(e, du_dr, vecs, r)
 
         forces = np.zeros_like(pos)
-        forces[indices] = -dE_dr
+        forces[indices] = f_tot
         return e_tot, forces, virial
 
     def _cut(self, pos, pbc, cell, indices, sigma, eps, vecs, rij, ff):
@@ -283,14 +374,7 @@ class LennardJones:
         rc = ff.lj_cutoff
         ron = rc - ff.lj_cutoff_width
         periodic = bool(np.all(pbc))
-        if np.any(pbc):
-            widths = 1.0 / np.linalg.norm(np.linalg.inv(np.asarray(cell)), axis=0)
-            if rc > 0.5 * widths[np.asarray(pbc, dtype=bool)].min() + 1e-12:
-                raise ValueError(
-                    f"lj_cutoff {rc} A exceeds half the cell's perpendicular "
-                    f"width ({0.5 * widths.min():.3f} A): the minimum image would "
-                    "miss pairs inside it"
-                )
+        _check_cutoff(rc, pbc, cell)
         i, j = np.nonzero(np.triu(rij < rc, 1))
         r = rij[i, j]
         u, du_dr = pair_potential(
@@ -308,6 +392,267 @@ class LennardJones:
             energy += tail
             virial = virial - tail * np.eye(3)
         return energy, forces, virial
+
+    # -- the geometry ---------------------------------------------------------
+
+    def prepare(self, pos, pbc, cell, term_dict: dict, displacements=None) -> None:
+        """Take the geometry and the seed topology's parameters.
+
+        The seed's parameters are the static ones: every atom outside a varying
+        block keeps them.  Nothing is computed until a varying block needs it,
+        so a dataset whose templates agree pays exactly what `__call__` costs.
+        `displacements` is `pointcharge.geometry` over every atom, as
+        `__call__` takes it.
+        """
+        _require(term_dict)
+        self._seed = (pos, pbc, cell, term_dict)
+        self._displacements = displacements
+        self.natoms = len(pos)
+        self.vecs = None
+        self.r = None
+        self.sigma0, self.eps0 = global_params(term_dict, self.natoms)
+        self.blocks = []
+        self._static = None
+        self._cross = {}
+        self._cross_tail = {}
+
+    def _pairs(self) -> tuple[np.ndarray, np.ndarray]:
+        if self.vecs is None:
+            pos, pbc, cell, _ = self._seed
+            if self._displacements is None:
+                self._displacements = geometry(pos, pbc, cell)
+            self.vecs, rij = self._displacements
+            self.r = rij.copy()
+            self.r[np.diag_indices(self.natoms)] = 1.0
+            ff = active()
+            if ff.lj_cutoff is not None:
+                _check_cutoff(ff.lj_cutoff, pbc, cell)
+        return self.vecs, self.r
+
+    def _pair(self, rows, cols, sig_rows, eps_rows, sig_cols, eps_cols):
+        """`(u, du/dr, tail)` between atoms `rows` and `cols`, self-pairs zeroed.
+
+        Under `lj_cutoff` the pair is switched off as `_cut` switches it, and
+        under full periodicity `u` also carries the pair's share of `_cut`'s
+        tail, self-pairs included: `_tail` sums over ordered pairs of atoms,
+        so a pair matrix whose `0.5 * sum` is the energy holds `2 T_ij / V`.
+        That share is constant in `r`, so `du/dr` has none, and is returned
+        again on its own as `tail` -- `None` without one -- because the virial
+        needs it apart.
+        """
+        _, r = self._pairs()
+        rr = r[np.ix_(rows, cols)]
+        sig = np.sqrt(sig_rows[:, None] * sig_cols[None, :])
+        eps = np.sqrt(eps_rows[:, None] * eps_cols[None, :])
+        u, du_dr = pair_potential(rr, sig, eps)
+        ff = active()
+        tail = None
+        if ff.lj_cutoff is not None:
+            rc = ff.lj_cutoff
+            ron = rc - ff.lj_cutoff_width
+            s, ds_dr = cutoff_switch(rr, ron, rc)
+            u, du_dr = u * s, du_dr * s + u * ds_dr
+            pbc, cell = self._seed[1], self._seed[2]
+            if np.all(pbc):
+                volume = abs(np.linalg.det(np.asarray(cell)))
+                tail = 2.0 * _pair_tails(sig, eps, ron, rc, ff) / volume
+        same = rows[:, None] == cols[None, :]
+        u[same] = 0.0
+        du_dr[same] = 0.0
+        if tail is not None:
+            u = u + tail
+        return u, du_dr, tail
+
+    # -- the blocks -----------------------------------------------------------
+
+    @property
+    def self_consistent(self) -> bool:
+        """Whether one block's corrections depend on another block's weights.
+
+        Only when two blocks vary: a varying block's environment is otherwise
+        static, and a static block has no corrections at all.
+        """
+        return sum(block.varies for block in self.blocks) > 1
+
+    def bind(self, blocks) -> None:
+        """Read each block's per-state parameters off its states' terms.
+
+        `blocks` are `basis.Block`s, and every state of one spans the same
+        atoms.  The static parameters of each block's atoms are restated from
+        its seed state, as `PointCharge.bind` restates its charges.
+        """
+        for block in blocks:
+            atoms = np.array(sorted(block.states[0].graph.nodes()), dtype=int)
+            sigma = np.empty((block.nstates, len(atoms)))
+            eps = np.empty((block.nstates, len(atoms)))
+            for s, state in enumerate(block.states):
+                sig_s, eps_s = global_params(state.term_dict, self.natoms)
+                sigma[s], eps[s] = sig_s[atoms], eps_s[atoms]
+            varies = bool(
+                np.any(sigma != sigma[:1]) or np.any(eps != eps[:1])
+            )
+            weights = np.zeros(block.nstates)
+            weights[block.seed_index] = 1.0
+            self.blocks.append(_Block(atoms, sigma, eps, weights, varies))
+            self.sigma0[atoms] = sigma[block.seed_index]
+            self.eps0[atoms] = eps[block.seed_index]
+
+    def _varying(self) -> list[int]:
+        return [i for i, block in enumerate(self.blocks) if block.varies]
+
+    def _rows(self, block: _Block) -> tuple[np.ndarray, np.ndarray]:
+        """`block.rows`, and with them its intra-block and static sums."""
+        if block.rows is None:
+            b = block.atoms
+            everything = np.arange(self.natoms)
+            static = np.ones(self.natoms, dtype=bool)
+            for i in self._varying():
+                static[self.blocks[i].atoms] = False
+            nstates = len(block.sigma)
+            u = np.empty((nstates, len(b), self.natoms))
+            du = np.empty_like(u)
+            tails = []
+            for s in range(nstates):
+                sig_cols, eps_cols = self.sigma0.copy(), self.eps0.copy()
+                sig_cols[b], eps_cols[b] = block.sigma[s], block.eps[s]
+                u[s], du[s], tail = self._pair(
+                    b, everything, block.sigma[s], block.eps[s], sig_cols, eps_cols
+                )
+                tails.append(tail)
+            block.rows = (u, du)
+            block.tail = None if tails[0] is None else np.stack(tails)
+            block.intra = 0.5 * np.sum(u[:, :, b], axis=(1, 2))
+            block.static_env = np.sum(u[:, :, static], axis=(1, 2))
+        return block.rows
+
+    def _cross_pairs(self, a: int, b: int) -> tuple[np.ndarray, np.ndarray]:
+        """`(u, du/dr)` between two varying blocks, `(nstates_a, nstates_b, na, nb)`."""
+        cached = self._cross.get((a, b))
+        if cached is None:
+            A, B = self.blocks[a], self.blocks[b]
+            shape = (len(A.sigma), len(B.sigma), len(A.atoms), len(B.atoms))
+            u, du = np.empty(shape), np.empty(shape)
+            tail = None
+            for s in range(len(A.sigma)):
+                for t in range(len(B.sigma)):
+                    u[s, t], du[s, t], tail_st = self._pair(
+                        A.atoms, B.atoms, A.sigma[s], A.eps[s], B.sigma[t], B.eps[t]
+                    )
+                    if tail_st is not None:
+                        if tail is None:
+                            tail = np.empty(shape)
+                        tail[s, t] = tail_st
+            cached = self._cross[(a, b)] = (u, du)
+            self._cross[(b, a)] = (u.transpose(1, 0, 3, 2), du.transpose(1, 0, 3, 2))
+            self._cross_tail[(a, b)] = tail
+            self._cross_tail[(b, a)] = (
+                None if tail is None else tail.transpose(1, 0, 3, 2)
+            )
+        return cached
+
+    def corrections(self, index: int) -> np.ndarray:
+        """What each state of block `index` adds to its diagonal, in eV.
+
+        The 12-6 of every pair the block's atoms take part in, at that state's
+        parameters, with every other varying block at its current weights.
+        Zero on a block whose states agree, since the sum is then the same
+        number on all of them and belongs outside the Hamiltonian.
+        """
+        block = self.blocks[index]
+        if not block.varies:
+            return np.zeros(len(block.sigma))
+        self._rows(block)
+        out = block.intra + block.static_env
+        for other in self._varying():
+            if other == index:
+                continue
+            u, _ = self._cross_pairs(index, other)
+            out = out + np.einsum("stij,t->s", u, self.blocks[other].weights)
+        return out
+
+    def update(self, index: int, weights: np.ndarray) -> None:
+        """Adopt block `index`'s new ground-state weights."""
+        self.blocks[index].weights = np.asarray(weights, dtype=float)
+
+    # -- evaluation -----------------------------------------------------------
+
+    def evaluate(self) -> tuple[float, np.ndarray, np.ndarray]:
+        """Energy, forces and virial of the whole system at the current weights.
+
+        The weights are held fixed under the derivative, as in
+        `PointCharge.evaluate`, which is exact once `System` has iterated the
+        blocks to self-consistency.
+        """
+        varying = self._varying()
+        if not varying:
+            return self(*self._seed, displacements=self._displacements)
+
+        vecs, r = self._pairs()
+        everything = np.arange(self.natoms)
+        e, du_dr, tail = self._pair(
+            everything, everything, self.sigma0, self.eps0, self.sigma0, self.eps0
+        )
+        rows = {i: self._rows(self.blocks[i]) for i in varying}
+        e = self._assemble(
+            e, varying, lambda i: rows[i][0], lambda i, j: self._cross_pairs(i, j)[0]
+        )
+        du_dr = self._assemble(
+            du_dr, varying, lambda i: rows[i][1], lambda i, j: self._cross_pairs(i, j)[1]
+        )
+        energy, forces, virial = _gradients(e, du_dr, vecs, r)
+        if tail is not None:
+            tail = self._assemble(
+                tail,
+                varying,
+                lambda i: self.blocks[i].tail,
+                lambda i, j: self._cross_tail[(i, j)],
+            )
+            # `E_tail = T / V` and a strain scales `V` by `1 + tr e`, as in `_cut`.
+            virial = virial - 0.5 * float(np.sum(tail)) * np.eye(3)
+        return energy, forces, virial
+
+    def _assemble(self, m, varying, rows, cross) -> np.ndarray:
+        """Pair matrix `m`, at the static parameters, moved to the current weights.
+
+        A varying block's rows and columns go to its weighted states; the
+        columns of the *other* varying blocks are wrong after that and are
+        overwritten by the cross terms, at both blocks' weights.
+        """
+        for i in varying:
+            block = self.blocks[i]
+            b = block.atoms
+            mb = np.einsum("s,sij->ij", block.weights, rows(i))
+            m[b, :], m[:, b] = mb, mb.T
+        for n, i in enumerate(varying):
+            for j in varying[n + 1 :]:
+                wi, wj = self.blocks[i].weights, self.blocks[j].weights
+                mij = np.einsum("s,t,stij->ij", wi, wj, cross(i, j))
+                a, b = self.blocks[i].atoms, self.blocks[j].atoms
+                m[np.ix_(a, b)], m[np.ix_(b, a)] = mij, mij.T
+        return m
+
+
+def _require(term_dict: dict) -> dict:
+    params = term_dict.get("lennardjones")
+    if params is None:
+        raise KeyError(
+            "No `lennardjones` parameters set. Every atom needs a sigma and "
+            "an epsilon, or the system has no Pauli repulsion and molecules "
+            "will interpenetrate."
+        )
+    return params
+
+
+def _check_cutoff(rc: float, pbc, cell) -> None:
+    """Refuse an `lj_cutoff` the minimum image cannot honour."""
+    if np.any(pbc):
+        widths = 1.0 / np.linalg.norm(np.linalg.inv(np.asarray(cell)), axis=0)
+        if rc > 0.5 * widths[np.asarray(pbc, dtype=bool)].min() + 1e-12:
+            raise ValueError(
+                f"lj_cutoff {rc} A exceeds half the cell's perpendicular "
+                f"width ({0.5 * widths.min():.3f} A): the minimum image would "
+                "miss pairs inside it"
+            )
 
 
 def cutoff_switch(r: np.ndarray, ron: float, rc: float):
@@ -329,6 +674,7 @@ def cutoff_switch(r: np.ndarray, ron: float, rc: float):
 
 
 _TAILS: dict = {}
+_PAIR_TAILS: dict = {}
 
 
 def _tail(sigma, eps, ron, rc, ff) -> float:
@@ -343,22 +689,38 @@ def _tail(sigma, eps, ron, rc, ff) -> float:
     types, counts = np.unique(np.stack([sigma, eps], axis=1), axis=0, return_counts=True)
     key = (types.tobytes(), counts.tobytes(), ron, rc, ff)
     if key not in _TAILS:
-        from scipy.integrate import quad
-
         total = 0.0
         for a, (sa, ea) in enumerate(types):
             for b, (sb, eb) in enumerate(types):
                 sig, ep = np.sqrt(sa * sb), np.sqrt(ea * eb)
-                if sig == 0.0 or ep == 0.0:
-                    continue
-
-                def integrand(r, inside):
-                    u = pair_potential(np.array([r]), sig, ep, ff)[0][0]
-                    weight = 1.0 - cutoff_switch(np.array([r]), ron, rc)[0][0]
-                    return r * r * u * (weight if inside else 1.0)
-
-                inner = quad(integrand, ron, rc, args=(True,), epsabs=0, epsrel=1e-12)[0]
-                outer = quad(integrand, rc, np.inf, args=(False,), epsabs=0, epsrel=1e-12)[0]
-                total += counts[a] * counts[b] * (inner + outer)
+                total += counts[a] * counts[b] * _pair_tail(sig, ep, ron, rc, ff)
         _TAILS[key] = 2.0 * np.pi * total
     return _TAILS[key]
+
+
+def _pair_tail(sig, ep, ron, rc, ff) -> float:
+    """`int r^2 u(r) (1 - S(r)) dr` for one combined pair, zero for a masked one."""
+    key = (float(sig), float(ep), ron, rc, ff)
+    if key not in _PAIR_TAILS:
+        if sig == 0.0 or ep == 0.0:
+            _PAIR_TAILS[key] = 0.0
+        else:
+            from scipy.integrate import quad
+
+            def integrand(r, inside):
+                u = pair_potential(np.array([r]), sig, ep, ff)[0][0]
+                weight = 1.0 - cutoff_switch(np.array([r]), ron, rc)[0][0]
+                return r * r * u * (weight if inside else 1.0)
+
+            inner = quad(integrand, ron, rc, args=(True,), epsabs=0, epsrel=1e-12)[0]
+            outer = quad(integrand, rc, np.inf, args=(False,), epsabs=0, epsrel=1e-12)[0]
+            _PAIR_TAILS[key] = inner + outer
+    return _PAIR_TAILS[key]
+
+
+def _pair_tails(sig: np.ndarray, eps: np.ndarray, ron, rc, ff) -> np.ndarray:
+    """`2 pi _pair_tail` over matrices of combined parameters, `_tail` per pair."""
+    flat = np.stack([sig.ravel(), eps.ravel()], axis=1)
+    types, inverse = np.unique(flat, axis=0, return_inverse=True)
+    values = np.array([_pair_tail(s, e, ron, rc, ff) for s, e in types])
+    return 2.0 * np.pi * values[inverse.ravel()].reshape(sig.shape)

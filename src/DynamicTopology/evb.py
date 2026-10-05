@@ -1,5 +1,5 @@
 from DynamicTopology.forcefield.electrostatics import Electrostatics
-from DynamicTopology.forcefield.lj import LennardJones
+from DynamicTopology.forcefield.lj import LennardJones, global_params
 from DynamicTopology.forcefield.zbl import ZBL
 from DynamicTopology.forcefield.qforce import QForce
 from typing import Any
@@ -7,6 +7,70 @@ from DynamicTopology.core import Topology
 from ase import Atoms
 
 import numpy as np
+
+
+def _lj_terms(indices: np.ndarray, sigma: np.ndarray, eps: np.ndarray) -> dict:
+    """A `term_dict` holding only `lennardjones` rows, one per `indices`."""
+    return {
+        "lennardjones": {
+            "atoms": np.asarray(indices, dtype=int)[:, None],
+            "kwargs": {"sigma": np.asarray(sigma), "eps": np.asarray(eps)},
+        }
+    }
+
+
+def _reference_lj(states: list[Topology], natoms: int) -> dict | None:
+    """Each atom's 12-6 parameters from the first state that states them.
+
+    The states of `EVBSystem` need not span the system: `ase.EVB` enumerates them
+    per subnet, so an H2O + O2 box has H2O's states over three atoms and O2's
+    over the other two.  The reference therefore has to be assembled atom by
+    atom.  When the first state with terms covers every atom any state does,
+    its own `term_dict` is the reference, term order and all.
+    """
+    with_terms = [s.term_dict for s in states if s.term_dict]
+    if not with_terms or "lennardjones" not in with_terms[0]:
+        return None
+    first = with_terms[0]
+    covered = set(first["lennardjones"]["atoms"][:, 0].tolist())
+    sigma, eps = global_params(first, natoms)
+    for term_dict in with_terms[1:]:
+        params = term_dict.get("lennardjones")
+        if params is None:
+            continue
+        for k, i in enumerate(params["atoms"][:, 0].tolist()):
+            if i not in covered:
+                covered.add(i)
+                sigma[i] = params["kwargs"]["sigma"][k]
+                eps[i] = params["kwargs"]["eps"][k]
+    if covered == set(first["lennardjones"]["atoms"][:, 0].tolist()):
+        return first
+    indices = np.array(sorted(covered))
+    return _lj_terms(indices, sigma[indices], eps[indices])
+
+
+def _own_lj(term_dict: dict, reference: dict | None) -> dict | None:
+    """The reference with this state's own parameters on its atoms, if they differ.
+
+    `None` when they agree on every atom the state covers, which is every
+    state while the templates carry per-element values.
+    """
+    params = term_dict.get("lennardjones")
+    if reference is None or params is None:
+        return None
+    ref = reference["lennardjones"]
+    indices = ref["atoms"][:, 0]
+    sigma = np.array(ref["kwargs"]["sigma"], dtype=float)
+    eps = np.array(ref["kwargs"]["eps"], dtype=float)
+    position = {int(i): k for k, i in enumerate(indices)}
+    for k, i in enumerate(params["atoms"][:, 0].tolist()):
+        sigma[position[i]] = params["kwargs"]["sigma"][k]
+        eps[position[i]] = params["kwargs"]["eps"][k]
+    if np.array_equal(sigma, ref["kwargs"]["sigma"]) and np.array_equal(
+        eps, ref["kwargs"]["eps"]
+    ):
+        return None
+    return _lj_terms(indices, sigma, eps)
 
 
 class EVBSystem:
@@ -76,10 +140,26 @@ class EVBSystem:
         # has taken the term to zero at bond lengths there are no exclusions to
         # be split from.
         #
+        # That holds while every state carries the same per-atom parameters.  A
+        # state whose templates give some atom a different sigma or epsilon has
+        # a different 12-6, and only its *difference* from a reference state
+        # goes on the diagonal -- so the common part still stays out of the
+        # nonlinear coupling, and with agreeing templates every difference is
+        # exactly zero and nothing changes.
+        #
         # The electrostatics are not topology-independent under either term --
         # each state carries its own charges -- so they go on the diagonal.
         nonbonded = self.electrostatics.get()
         state_nb = np.zeros(nstates)
+        state_lj = np.zeros(nstates)
+
+        # The switched 12-6 at reference parameters, and each state charged its
+        # difference from it -- only if its parameters differ at all.
+        reference = _reference_lj(self.states, len(pos))
+        en_lj, fr_lj = 0.0, np.zeros_like(pos)
+        if reference is not None:
+            en_lj, fr_lj, _ = self.lj_ff(pos, pbc, cell, reference)
+
         for i, istate in enumerate(self.states):
             if not istate.term_dict:
                 continue
@@ -89,6 +169,11 @@ class EVBSystem:
             en_q, fr_q, _ = nonbonded(pos, pbc, cell, istate.term_dict)
             en, fr = en + en_q, fr + fr_q
             state_nb[i] = en_q
+            own = _own_lj(istate.term_dict, reference)
+            if own is not None:
+                en_s, fr_s, _ = self.lj_ff(pos, pbc, cell, own)
+                state_lj[i] = en_s - en_lj
+                en, fr = en + state_lj[i], fr + (fr_s - fr_lj)
             ham[i, i] = en
             state_forces[i] = fr
 
@@ -127,31 +212,24 @@ class EVBSystem:
         forces = np.einsum("i,ijnd,j->nd", statevec, fham, statevec)
 
         # The electrostatics are already on the diagonal; reported as the
-        # ground state's share.
+        # ground state's share.  So is the 12-6's state-dependent part.
         en_nb = float(statevecsq @ state_nb)
+        en_lj_states = float(statevecsq @ state_lj)
 
         # `EVBSystem` holds a fixed state list and reports no stress; the
         # virials are discarded here rather than threaded through.
         en_zbl, fr_zbl, _ = self.zbl_ff(pos, self.atoms.numbers, pbc, cell)
 
-        # The switched 12-6, found through a representative state: it reads
-        # per-atom parameters out of a `term_dict`, and every state of a given
-        # system carries the same ones because they are per element.
-        en_lj, fr_lj = 0.0, np.zeros_like(pos)
-        for state in self.states:
-            if state.term_dict:
-                en_lj, fr_lj, _ = self.lj_ff(pos, pbc, cell, state.term_dict)
-                break
-
-        # `energy` already contains the electrostatics.
-        energy_bonded = energy - en_nb
+        # `energy` already contains the electrostatics and the 12-6's
+        # differences from the reference state.
+        energy_bonded = energy - en_nb - en_lj_states
         results: dict[str, Any] = {
-            "energy": energy_bonded + en_nb + en_zbl + en_lj,
+            "energy": energy_bonded + en_nb + en_zbl + en_lj + en_lj_states,
             "forces": forces + fr_zbl + fr_lj,
             "energy_bonded": energy_bonded,
             "energy_nonbonded": en_nb,
             "energy_zbl": en_zbl,
-            "energy_lj": en_lj,
+            "energy_lj": en_lj + en_lj_states,
             "statevec": statevecsq,
         }
         return results

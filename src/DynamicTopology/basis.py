@@ -363,6 +363,14 @@ class EVBBasis:
         gap this screens on.  The electrostatics do not -- the charges follow the
         bonding -- and `_channel_weight` adds them through `self.gap`.
 
+        The 12-6 stops being a function of the elements alone once templates
+        disagree on an atom's parameters, and its difference is then left out of
+        this screen.  That is an approximation in *which* states are admitted,
+        not in their energies: the gate is a smooth function of the gap it is
+        given, and its gradient is the gradient of that, so nothing is lost
+        from conservation.  The difference is millielectronvolts against a
+        bonded gap of electronvolts.
+
         Memoized for this geometry on the node *order* and the edge set, which
         between them fix everything the sum reads: the components and the order
         `connected_components` yields them in (by first node in iteration

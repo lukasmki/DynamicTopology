@@ -28,8 +28,9 @@ PIVOT_HYSTERESIS: float = 0.1
 
 # Convergence of the block sweep, on the largest change in any ground-state
 # weight between two sweeps, and the most sweeps before giving up.  Only
-# `pointcharge` electrostatics ever needs more than one, and only when two or
-# more blocks are multi-state at once; see `forcefield/pointcharge.py`.  The
+# `pointcharge` electrostatics, or a 12-6 whose templates disagree on two
+# blocks at once, ever needs more than one, and only when two or more blocks
+# are multi-state at once; see `forcefield/pointcharge.py`.  The
 # Hellmann-Feynman forces are exact at convergence, so the tolerance is an
 # energy-conservation knob and is set well below anything an integrator sees.
 SCF_TOLERANCE: float = 1e-10
@@ -125,6 +126,9 @@ class System:
             pos, pbc, cell, self.topology.term_dict, displacements=displacements
         )
         self.gap.bind(nonbonded, self.topology.term_dict)
+        self.lj_ff.prepare(
+            pos, pbc, cell, self.topology.term_dict, displacements=displacements
+        )
 
         # Close the diabatic basis around the current geometry.  The result does
         # not depend on which topology is passed as the seed; see basis.py.
@@ -146,6 +150,11 @@ class System:
         #   - `PointCharge` carries each state's template charges.  See
         #     `forcefield/pointcharge.py`.
         nonbonded.bind(evb_blocks)
+        # The 12-6 the same way, for the same reason: each state takes its sigma
+        # and epsilon from its own templates.  On a block whose states agree --
+        # every block, while the templates carry per-element values -- its
+        # corrections are zero and it stays off the diagonal entirely.
+        self.lj_ff.bind(evb_blocks)
 
         # Diagonalize every multi-state block, and repeat until no block's
         # ground state moves.  Each block sees the others through their
@@ -163,7 +172,7 @@ class System:
             for i in multi:
                 block = evb_blocks[i]
                 ham0, _, _ = hamiltonians[i]
-                corrections = nonbonded.corrections(i)
+                corrections = nonbonded.corrections(i) + self.lj_ff.corrections(i)
                 # The correction goes on the diagonal and nowhere else, so it
                 # does what it is here to do -- decide which bonding pattern is
                 # lower -- while its *gradient* stays out of `fham`.  The
@@ -180,13 +189,15 @@ class System:
                     change = max(change, float(np.max(np.abs(weights - previous[3]))))
                 solutions[i] = (ham, eigval, statevec, weights, corrections)
                 nonbonded.update(i, weights)
-            if not nonbonded.self_consistent or len(multi) <= 1:
+                self.lj_ff.update(i, weights)
+            self_consistent = nonbonded.self_consistent or self.lj_ff.self_consistent
+            if not self_consistent or len(multi) <= 1:
                 break
             if change < SCF_TOLERANCE:
                 break
             if sweeps >= SCF_MAX_SWEEPS:
                 logger.warning(
-                    "EVB electrostatics not self-consistent after %d sweeps "
+                    "EVB nonbonded terms not self-consistent after %d sweeps "
                     "(largest weight change %.2e); forces are not exact",
                     sweeps,
                     change,
@@ -206,7 +217,7 @@ class System:
             log_debug(logger, f"block {i}, nstates = {block.nstates}")
 
             if block.nstates == 1:
-                corrections = nonbonded.corrections(i)
+                corrections = nonbonded.corrections(i) + self.lj_ff.corrections(i)
                 energy += block.energies[0]
                 forces += block.forces[0]
                 virial += block.virials[0]
@@ -287,16 +298,17 @@ class System:
         # already taken it to zero there, which is the whole reason the four
         # failure modes in `forcefield/lj.py`'s docstring cannot recur: they all
         # descended from a broken bond paying hundreds of eV for a pair at the
-        # bond length, and the term is worth ~1e-3 eV there now.  Being the same
-        # number for every diabatic state, it shifts every EVB diagonal equally
-        # and leaves the eigenvectors alone, exactly as ZBL does.
+        # bond length, and the term is worth ~1e-3 eV there now.  While the
+        # templates agree on every atom's parameters it is the same number for
+        # every diabatic state, so it shifts every EVB diagonal equally and
+        # leaves the eigenvectors alone, exactly as ZBL does.  Where they do not,
+        # the state-dependent part went on the diagonal above, and this is the
+        # whole sum at the ground-state weights.
         #
         # This is the term that supplies the intermolecular wall and the
         # dispersion.  ZBL's taper removed the first and the model never had the
         # second; see `production/density-300K/README.md`.
-        en_lj, fr_lj, w_lj = self.lj_ff(
-            pos, pbc, cell, self.topology.term_dict, displacements=displacements
-        )
+        en_lj, fr_lj, w_lj = self.lj_ff.evaluate()
         energy += en_lj
         forces += fr_lj
         virial += w_lj

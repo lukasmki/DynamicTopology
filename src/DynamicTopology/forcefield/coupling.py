@@ -181,7 +181,9 @@ class EVBCoupling:
         The two diabats of a fission differ by exactly one bond term: every
         nonbonded contribution -- `ZBL`, `LennardJones`, `ACKS2` -- is on the
         whole system and identical on both states, and for a fission there is no
-        second bonded difference either.  So the gap is a function of the
+        second bonded difference either.  (`LennardJones` is identical only while
+        the fragments' templates give each atom the parent's sigma and epsilon;
+        per-molecule parameters add their difference to the gap and move `r0`.)  So the gap is a function of the
         breaking bond's length alone, it is monotone in it, and it crosses zero at
         one separation.  `r0` is that crossing, which is what "centred on the
         dissociation point" means here and why this form needs no ensemble: the

@@ -1,0 +1,14 @@
+{
+  "run_id": "d250_s5",
+  "density": 250,
+  "seed": 5,
+  "input": "/pscratch/sd/l/lkim/dt/DynamicTopology/production/density-hc/inputs/d250.xyz",
+  "temperature": 4000.0,
+  "timestep": 0.5,
+  "friction": 0.005,
+  "steps": 200000,
+  "interval": 50,
+  "rnet": "datasets/HCombustion/HCombustion.json",
+  "ratio": "2:1",
+  "molecules": 100
+}

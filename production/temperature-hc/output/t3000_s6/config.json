@@ -1,0 +1,14 @@
+{
+  "run_id": "t3000_s6",
+  "temperature": 3000.0,
+  "seed": 6,
+  "input": "/pscratch/sd/l/lkim/dt/DynamicTopology/production/temperature-hc/inputs/2_1_d175.xyz",
+  "timestep": 0.5,
+  "friction": 0.005,
+  "steps": 200000,
+  "interval": 50,
+  "rnet": "datasets/HCombustion/HCombustion.json",
+  "ratio": "2:1",
+  "density": 175.0,
+  "molecules": 100
+}

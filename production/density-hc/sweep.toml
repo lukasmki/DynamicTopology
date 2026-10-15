@@ -1,0 +1,48 @@
+# Stoichiometric H2/O2 density sweep at fixed temperature.
+#
+# The one variable is mass density.  Everything else is pinned here so that a
+# run is fully described by its index into this file, and `run_one.py` writes
+# the resolved parameters into each output directory as `config.json`.
+
+[sweep]
+name = "density-hc"
+# kg/m^3, roughly geometric (successive ratios 1.8, 1.8, 1.75, 1.4): collision
+# rates scale with density, so even spacing in the logarithm puts the same
+# resolution at the dilute end as at the dense one.  175 is the anchor -- the
+# stoichiometry sweep's 2:1 box is 174.7 kg/m^3 (99 molecules in 22.44 A), and
+# `../temperature-hc` runs at 175, so this column is the state point all three
+# sweeps share.
+densities = [30, 55, 100, 175, 250]
+# Replicates.  Reaction onset is stochastic, so a single trajectory per density
+# would not distinguish a density effect from a lucky start.
+seeds = [1, 2, 3, 4, 5]
+
+[system]
+# Stoichiometric for 2 H2 + O2 -> 2 H2O.  `scripts/mixture.py` rounds each
+# species down, so 100 molecules at 2:1 is 66 H2 + 33 O2 = 198 atoms -- the same
+# count as `../stoichiometry-3000K/inputs/2_1.xyz`.
+ratio = "2:1"
+# Fixed molecule count, so the box edge carries the density: 40.4 A at 30 kg/m^3
+# down to 19.9 A at 250.  The dense end still has a 10 A half-box, well outside
+# the 4 A bimolecular cutoff that minimum image needs.
+molecules = 100
+rnet = "datasets/HCombustion/HCombustion.json"
+
+[md]
+# The top of the 3000-4000 K range, deliberately.  At 175 kg/m^3 and 4000 K the
+# stoichiometry sweep's 2:1 runs formed their first H2O at 8-45 ps.  Collision
+# rates fall ~6x from there to 30 kg/m^3, so the dilute end is already marginal
+# for ignition inside 100 ps at this temperature and would be hopeless at 3000.
+temperature = 4000.0  # K
+# 0.5 fs, as `../stoichiometry-3000K/sweep.toml` measured on this force field
+# for a 198-atom H2/O2 box.  The step is set by the fastest bond stretch, which
+# density does not move; see that file for the NVE ladder and the open item on
+# the Langevin temperature bias at this step.
+timestep = 0.5        # fs
+friction = 0.005      # 1/fs
+# 100 ps, matching the stoichiometry sweep.  `steps` is a run's *total* length:
+# `run_one.py --restart` integrates only what is left, and
+# `run_one.py <i> --restart --steps 400000` extends a run to 200 ps -- the way to
+# give the dilute end more time if it has not ignited.
+steps = 200000        # 100 ps at 0.5 fs
+interval = 50         # a frame every 25 fs -> 4000 frames per run

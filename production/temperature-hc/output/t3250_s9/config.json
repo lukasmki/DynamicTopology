@@ -1,0 +1,14 @@
+{
+  "run_id": "t3250_s9",
+  "temperature": 3250.0,
+  "seed": 9,
+  "input": "/pscratch/sd/l/lkim/dt/DynamicTopology/production/temperature-hc/inputs/2_1_d175.xyz",
+  "timestep": 0.5,
+  "friction": 0.005,
+  "steps": 200000,
+  "interval": 50,
+  "rnet": "datasets/HCombustion/HCombustion.json",
+  "ratio": "2:1",
+  "density": 175.0,
+  "molecules": 100
+}

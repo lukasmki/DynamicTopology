@@ -82,8 +82,10 @@ def main() -> int:
         print(f"no runs with frames under {args.directory}")
         return 1
 
+    # Wide enough for the key's name, so `--group-by temperature` stays aligned.
+    width = max(8, len(args.group_by) + 2)
     print(
-        f"{args.group_by:<8}{'runs':>5}{'ps':>8}{'products':>10}"
+        f"{args.group_by:<{width}}{'runs':>5}{'ps':>8}{'products':>10}"
         f"{'H2O max':>9}{'t_first (ps)':>14}{'capped':>8}{'unfitted':>9}"
     )
     for key in sorted(runs, key=lambda k: (len(k), k)):
@@ -114,7 +116,7 @@ def main() -> int:
         )
         onset = f"{statistics.mean(onsets) / 1000:.2f}" if onsets else "-"
         print(
-            f"{key:<8}{len(group):>5}{statistics.mean(simulated):>8.1f}"
+            f"{key:<{width}}{len(group):>5}{statistics.mean(simulated):>8.1f}"
             f"{statistics.mean(peaks):>10.1f}{statistics.mean(water):>9.1f}"
             f"{onset:>14}{capped:>8}{len(unfitted):>9}"
         )

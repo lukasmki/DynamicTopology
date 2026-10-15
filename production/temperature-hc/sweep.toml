@@ -1,0 +1,52 @@
+# Stoichiometric H2/O2 temperature sweep at fixed density.
+#
+# The one variable is the thermostat temperature.  Everything else is pinned
+# here so that a run is fully described by its index into this file, and
+# `run_one.py` writes the resolved parameters into each output directory as
+# `config.json`.
+
+[sweep]
+name = "temperature-hc"
+# K, evenly spaced: over a 1.33x range the Arrhenius 1/T axis is linear to
+# within a few percent, so even spacing in T is already even in 1/T.  4000 K is
+# the anchor -- the temperature `../density-hc` runs at and the one
+# `../stoichiometry-3000K/sweep.toml` actually ran its 2:1 boxes at.
+temperatures = [3000.0, 3250.0, 3500.0, 3750.0, 4000.0]
+# Replicates.  Reaction onset is stochastic, so a single trajectory per
+# temperature would not distinguish a temperature effect from a lucky start.
+#
+# 6-10 rather than 1-5, deliberately.  This box is byte-identical to
+# `../density-hc/inputs/d175.xyz` (same composition, density and packing seed),
+# so with seeds 1-5 the 4000 K column would be `density-hc`'s 175 column re-run
+# step for step.  Disjoint seeds make it five more independent replicates of the
+# shared state point instead -- ten across the two directories.
+seeds = [6, 7, 8, 9, 10]
+
+[system]
+# Stoichiometric for 2 H2 + O2 -> 2 H2O.  `scripts/mixture.py` rounds each
+# species down, so 100 molecules at 2:1 is 66 H2 + 33 O2 = 198 atoms.
+ratio = "2:1"
+molecules = 100
+# kg/m^3, a 22.43 A box.  The stoichiometry sweep's 2:1 box is 174.7 (99
+# molecules in 22.44 A) and `../density-hc` includes 175, so this sweep crosses
+# both of the others at one state point and its 4000 K column is directly
+# comparable with theirs.
+density = 175.0
+rnet = "datasets/HCombustion/HCombustion.json"
+
+[md]
+# 0.5 fs, as `../stoichiometry-3000K/sweep.toml` measured on this force field.
+# The step is set by the fastest bond stretch, not by temperature, but hotter
+# runs sample further up the anharmonic wall and integrate it less accurately:
+# that file's open item -- the Langevin temperature bias at 0.5 fs, measured at
+# 49 K cool before the last refit and not re-measured since -- matters most at
+# the 4000 K end.  Read each run's mean `temperature_K` from its log rather than
+# assuming the setpoint.
+timestep = 0.5        # fs
+friction = 0.005      # 1/fs
+# 100 ps, matching the other two sweeps.  At 4000 K the 2:1 box forms its first
+# H2O at 8-45 ps; nothing has been measured at 3000 K beyond a 2 ps probe that
+# did not react, so the cold end may need extending.  `steps` is a run's *total*
+# length: `run_one.py <i> --restart --steps 400000` extends a run to 200 ps.
+steps = 200000        # 100 ps at 0.5 fs
+interval = 50         # a frame every 25 fs -> 4000 frames per run
